@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>FauxRRT</title>
+    <script>
+      window.CESIUM_BASE_URL =
+        "https://cesium.com/downloads/cesiumjs/releases/1.144/Build/Cesium/";
+    </script>
+    <link
+      rel="stylesheet"
+      href="https://cesium.com/downloads/cesiumjs/releases/1.144/Build/Cesium/Widgets/widgets.css"
+    />
+    <link rel="stylesheet" href="/src/styles.css" />
+  </head>
+  <body>
+    <div id="app">
+      <aside id="sidebar">
+        <header class="brand">
+          <div class="mark">F</div>
+          <div>
+            <h1>FauxRRT</h1>
+            <p>RCC-321 risk</p>
+          </div>
+        </header>
+
+        <section class="mission-bar">
+          <div class="mission-title">
+            <input id="mission-name" type="text" value="Untitled mission" title="Mission name" />
+            <span id="mission-dirty" class="mission-dirty hidden" title="Unsaved changes">•</span>
+          </div>
+          <div class="muted mission-path" id="mission-path"></div>
+          <div class="mission-actions">
+            <button id="btn-mission-new" class="ghost compact">New</button>
+            <button id="btn-mission-open" class="ghost compact">Open</button>
+            <button id="btn-mission-save" class="primary compact">Save</button>
+          </div>
+        </section>
+
+        <section class="stats" id="stats">
+          <div><span>Tracks</span><strong id="stat-tracks">0</strong></div>
+          <div><span>States</span><strong id="stat-points">0</strong></div>
+          <div><span>Load</span><strong id="stat-time">—</strong></div>
+        </section>
+
+        <div class="sidebar-scroll" id="sidebar-scroll">
+        <section class="wind-bar" id="wind-panel">
+          <button type="button" class="section-head" id="toggle-wind" aria-expanded="true">
+            <span class="muted method-label">Mission wind</span>
+            <span class="chevron" aria-hidden="true">▾</span>
+          </button>
+          <div class="section-body">
+            <div class="method-toggle wind-toggle" role="group" aria-label="Mission wind">
+              <button type="button" data-wind="off" class="compact">Off</button>
+              <button type="button" data-wind="constant" class="ghost compact">Constant</button>
+              <button type="button" data-wind="historical" class="ghost compact">Historical</button>
+            </div>
+            <div id="wind-fields"></div>
+          </div>
+        </section>
+
+        <section class="panel boats-panel" id="boats-panel">
+          <div class="panel-head">
+            <button type="button" class="section-head" id="toggle-boats" aria-expanded="true">
+              <h2>Boats</h2>
+              <span class="chevron" aria-hidden="true">▾</span>
+            </button>
+            <div class="boat-actions">
+              <button id="btn-load-boats" class="primary compact">Load KML</button>
+              <button id="btn-sample-boats" class="ghost compact">Samples</button>
+              <button id="btn-clear-boats" class="ghost compact">Clear</button>
+            </div>
+          </div>
+          <input id="boat-kml-input" type="file" accept=".kml,application/vnd.google-earth.kml+xml" multiple hidden />
+          <div class="section-body">
+            <p class="muted risk-hint">
+              Load AIS-style boat reports. Hover or select a boat for people on board, age, and the
+              predicted-track score against the debris KDE.
+            </p>
+            <div id="boat-risk" class="muted boat-risk"></div>
+            <div id="boat-list" class="boat-list">
+              <div class="empty">No boats loaded.</div>
+            </div>
+            <div id="boat-detail" class="boat-detail hidden"></div>
+          </div>
+        </section>
+
+        <section class="panel risk-panel">
+          <div class="panel-head">
+            <h2>Risk model</h2>
+            <button id="btn-add-object" class="primary compact">+ Object</button>
+          </div>
+          <div class="risk-body">
+          <p class="muted risk-hint">
+            Add an object, name a mode, then put trajectories in that mode:
+            load CSVs, generate a flight, or branch from a state on an existing trajectory.
+            Modes on an object are exclusive and must sum to 1. Separate objects count together.
+          </p>
+          <div id="kde-status" class="muted"></div>
+          <div id="object-list" class="object-list"></div>
+          <div id="unassigned" class="unassigned"></div>
+          </div>
+        </section>
+        </div>
+      </aside>
+
+      <div id="splitter" title="Drag to resize"></div>
+
+      <main id="globe-panel">
+        <header class="globe-bar">
+          <span>Globe</span>
+          <div class="globe-bar-right">
+            <label class="inline muted"><input type="checkbox" id="show-impacts" checked /> Impacts</label>
+            <label class="inline muted"><input type="checkbox" id="show-kde" checked /> KDE</label>
+            <label class="inline muted"><input type="checkbox" id="show-boats" checked /> Boats</label>
+            <label class="inline muted" title="Convex hull on the ellipsoid around impact points"><input type="checkbox" id="show-iip-boundary" /> IIP boundary</label>
+            <label class="inline muted" title="Convex hull on the ellipsoid around nav-failure FTS fire positions"><input type="checkbox" id="show-terminate-boundary" /> Terminate boundary</label>
+            <select id="imagery-kind" title="Basemap">
+              <option value="satellite">Satellite</option>
+              <option value="streets">Streets</option>
+            </select>
+            <button id="btn-fit" class="ghost compact">Fit all</button>
+            <span id="progress" class="muted"></span>
+          </div>
+        </header>
+        <div id="globe"></div>
+        <aside id="rocketpy-overlay" class="rp-overlay" hidden></aside>
+        <div id="boat-tooltip" class="boat-tooltip hidden"></div>
+      </main>
+    </div>
+
+    <script src="https://cesium.com/downloads/cesiumjs/releases/1.144/Build/Cesium/Cesium.js"></script>
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>

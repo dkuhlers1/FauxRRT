@@ -1,0 +1,84 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<kml xmlns="http://www.opengis.net/kml/2.2">
+  <Document>
+    <name>Gulf of America recreational boats</name>
+    <description>Sample sport-fisher and charter reports. Description fields are also accepted.</description>
+    <Placemark>
+      <name>Sportfisher Destin</name>
+      <ExtendedData>
+        <Data name="speed_kn"><value>18.5</value></Data>
+        <Data name="heading_deg"><value>188</value></Data>
+        <Data name="people_on_board"><value>8</value></Data>
+        <Data name="length_m"><value>16</value></Data>
+        <Data name="age_s"><value>25</value></Data>
+      </ExtendedData>
+      <Point><coordinates>-86.52,30.12,0</coordinates></Point>
+    </Placemark>
+    <Placemark>
+      <name>Charter Orange Beach</name>
+      <ExtendedData>
+        <Data name="speed_kn"><value>22.0</value></Data>
+        <Data name="heading_deg"><value>210</value></Data>
+        <Data name="people_on_board"><value>10</value></Data>
+        <Data name="length_ft"><value>42</value></Data>
+        <Data name="age_s"><value>14</value></Data>
+      </ExtendedData>
+      <Point><coordinates>-87.58,30.08,0</coordinates></Point>
+    </Placemark>
+    <Placemark>
+      <name>Rec Clearwater</name>
+      <description>
+        speed: 9.2 kn
+        heading: 265
+        people: 4
+        length: 8 m
+        age: 70 s
+      </description>
+      <Point><coordinates>-83.02,27.88,0</coordinates></Point>
+    </Placemark>
+    <Placemark>
+      <name>Rec South Padre</name>
+      <ExtendedData>
+        <Data name="speed_kn"><value>14.8</value></Data>
+        <Data name="heading_deg"><value>95</value></Data>
+        <Data name="people_on_board"><value>5</value></Data>
+        <Data name="length_m"><value>11</value></Data>
+        <Data name="age_s"><value>33</value></Data>
+      </ExtendedData>
+      <Point><coordinates>-97.05,26.08,0</coordinates></Point>
+    </Placemark>
+    <Placemark>
+      <name>Rec Naples</name>
+      <ExtendedData>
+        <Data name="speed_kn"><value>16.1</value></Data>
+        <Data name="heading_deg"><value>285</value></Data>
+        <Data name="people_on_board"><value>3</value></Data>
+        <Data name="length_m"><value>9</value></Data>
+        <Data name="age_s"><value>48</value></Data>
+      </ExtendedData>
+      <Point><coordinates>-82.05,26.02,0</coordinates></Point>
+    </Placemark>
+    <Placemark>
+      <name>Charter Key West West</name>
+      <ExtendedData>
+        <Data name="speed_kn"><value>20.4</value></Data>
+        <Data name="heading_deg"><value>300</value></Data>
+        <Data name="people_on_board"><value>6</value></Data>
+        <Data name="length_m"><value>14</value></Data>
+        <Data name="age_s"><value>21</value></Data>
+      </ExtendedData>
+      <Point><coordinates>-82.48,24.52,0</coordinates></Point>
+    </Placemark>
+    <Placemark>
+      <name>Rec Galveston Jetty</name>
+      <ExtendedData>
+        <Data name="speed_kn"><value>7.3</value></Data>
+        <Data name="heading_deg"><value>145</value></Data>
+        <Data name="people_on_board"><value>2</value></Data>
+        <Data name="length_m"><value>7</value></Data>
+        <Data name="age_s"><value>120</value></Data>
+      </ExtendedData>
+      <Point><coordinates>-94.72,29.28,0</coordinates></Point>
+    </Placemark>
+  </Document>
+</kml>

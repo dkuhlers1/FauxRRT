@@ -1,0 +1,112 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<kml xmlns="http://www.opengis.net/kml/2.2">
+  <Document>
+    <name>Gulf of America fishing fleet</name>
+    <description>Sample shrimp and longline reports for debris-risk receptors.</description>
+    <Schema id="BoatSchema" name="Boat">
+      <SimpleField type="double" name="speed_kn"><displayName>Speed (kn)</displayName></SimpleField>
+      <SimpleField type="double" name="heading_deg"><displayName>Heading (deg true)</displayName></SimpleField>
+      <SimpleField type="int" name="people_on_board"><displayName>People on board</displayName></SimpleField>
+      <SimpleField type="double" name="length_m"><displayName>Boat length (m)</displayName></SimpleField>
+      <SimpleField type="double" name="age_s"><displayName>Seconds since last position</displayName></SimpleField>
+    </Schema>
+    <Placemark>
+      <name>FV Gulf Star</name>
+      <description>Steel shrimp trawler south of Grand Isle</description>
+      <ExtendedData>
+        <SchemaData schemaUrl="#BoatSchema">
+          <SimpleData name="speed_kn">7.8</SimpleData>
+          <SimpleData name="heading_deg">248</SimpleData>
+          <SimpleData name="people_on_board">5</SimpleData>
+          <SimpleData name="length_m">23</SimpleData>
+          <SimpleData name="age_s">42</SimpleData>
+        </SchemaData>
+      </ExtendedData>
+      <Point><coordinates>-90.05,28.85,0</coordinates></Point>
+    </Placemark>
+    <Placemark>
+      <name>FV Cajun Moon</name>
+      <description>Stern trawler on the Louisiana shelf</description>
+      <ExtendedData>
+        <SchemaData schemaUrl="#BoatSchema">
+          <SimpleData name="speed_kn">4.2</SimpleData>
+          <SimpleData name="heading_deg">112</SimpleData>
+          <SimpleData name="people_on_board">4</SimpleData>
+          <SimpleData name="length_m">21</SimpleData>
+          <SimpleData name="age_s">95</SimpleData>
+        </SchemaData>
+      </ExtendedData>
+      <Point><coordinates>-91.38,28.18,0</coordinates></Point>
+    </Placemark>
+    <Placemark>
+      <name>FV Bayou Belle</name>
+      <description>Skimmer near the Mississippi birdfoot</description>
+      <ExtendedData>
+        <SchemaData schemaUrl="#BoatSchema">
+          <SimpleData name="speed_kn">6.1</SimpleData>
+          <SimpleData name="heading_deg">195</SimpleData>
+          <SimpleData name="people_on_board">3</SimpleData>
+          <SimpleData name="length_m">17</SimpleData>
+          <SimpleData name="age_s">28</SimpleData>
+        </SchemaData>
+      </ExtendedData>
+      <Point><coordinates>-89.41,29.08,0</coordinates></Point>
+    </Placemark>
+    <Placemark>
+      <name>FV Port Isabel</name>
+      <description>Texas snapper boat east of South Padre</description>
+      <ExtendedData>
+        <SchemaData schemaUrl="#BoatSchema">
+          <SimpleData name="speed_kn">8.9</SimpleData>
+          <SimpleData name="heading_deg">135</SimpleData>
+          <SimpleData name="people_on_board">6</SimpleData>
+          <SimpleData name="length_m">19</SimpleData>
+          <SimpleData name="age_s">180</SimpleData>
+        </SchemaData>
+      </ExtendedData>
+      <Point><coordinates>-96.82,26.42,0</coordinates></Point>
+    </Placemark>
+    <Placemark>
+      <name>FV Campeche Pride</name>
+      <description>Campeche Bay longliner</description>
+      <ExtendedData>
+        <SchemaData schemaUrl="#BoatSchema">
+          <SimpleData name="speed_kn">5.4</SimpleData>
+          <SimpleData name="heading_deg">310</SimpleData>
+          <SimpleData name="people_on_board">8</SimpleData>
+          <SimpleData name="length_m">26</SimpleData>
+          <SimpleData name="age_s">310</SimpleData>
+        </SchemaData>
+      </ExtendedData>
+      <Point><coordinates>-92.15,20.48,0</coordinates></Point>
+    </Placemark>
+    <Placemark>
+      <name>FV Yucatan Dawn</name>
+      <description>Yucatan shelf grouper boat</description>
+      <ExtendedData>
+        <SchemaData schemaUrl="#BoatSchema">
+          <SimpleData name="speed_kn">9.3</SimpleData>
+          <SimpleData name="heading_deg">80</SimpleData>
+          <SimpleData name="people_on_board">7</SimpleData>
+          <SimpleData name="length_m">24</SimpleData>
+          <SimpleData name="age_s">64</SimpleData>
+        </SchemaData>
+      </ExtendedData>
+      <Point><coordinates>-87.05,21.82,0</coordinates></Point>
+    </Placemark>
+    <Placemark>
+      <name>FV Fourchon Light</name>
+      <description>Oil-field utility / fishing hybrid off Port Fourchon</description>
+      <ExtendedData>
+        <SchemaData schemaUrl="#BoatSchema">
+          <SimpleData name="speed_kn">11.5</SimpleData>
+          <SimpleData name="heading_deg">168</SimpleData>
+          <SimpleData name="people_on_board">6</SimpleData>
+          <SimpleData name="length_m">28</SimpleData>
+          <SimpleData name="age_s">19</SimpleData>
+        </SchemaData>
+      </ExtendedData>
+      <Point><coordinates>-90.22,28.72,0</coordinates></Point>
+    </Placemark>
+  </Document>
+</kml>

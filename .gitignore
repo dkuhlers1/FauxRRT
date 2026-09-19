@@ -1,0 +1,9 @@
+/target
+/src-tauri/target
+/src-tauri/gen
+/node_modules
+/dist
+/rocketpy_backend/.venv
+.DS_Store
+Thumbs.db
+*.pdb

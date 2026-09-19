@@ -1,0 +1,21 @@
+FauxRRT 0.1.0 — tester build (Windows x64)
+
+Install
+- Run FauxRRT_0.1.0_x64-setup.exe
+- Windows may say “Unknown publisher” / SmartScreen. Choose More info → Run anyway.
+- Needs Windows 10/11 with WebView2 (already on most PCs).
+- The globe loads Cesium from the internet. Stay online the first time you open it.
+
+What to try
+1. + Object — should create a card with a Nominal group at probability 1.
+2. Load files — pick the included samples (or any folder of csv/txt/tsv/dat).
+   The dropdown says which probability group the files go into (default Nominal).
+3. Generate — pick Launch and Aim on the globe, then Run generate.
+   1 design trajectory goes to Nominal; the rest go to Failure (created if missing).
+4. Set Failure to 0.1 — Nominal should become 0.9.
+5. Impacts + KDE on the selected object.
+6. Save a .fauxrrt mission, quit, reopen it.
+
+Known limits
+- Generate is a 3DOF ballistic family (US-1976 atmosphere, J2), not a high-fidelity boost model.
+- Unsigned installer. Globe will be blank without network.

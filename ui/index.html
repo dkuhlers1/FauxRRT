@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>FauxRRT</title>
+    <script>
+      window.CESIUM_BASE_URL =
+        "https://cesium.com/downloads/cesiumjs/releases/1.144/Build/Cesium/";
+    </script>
+    <script src="https://cesium.com/downloads/cesiumjs/releases/1.144/Build/Cesium/Cesium.js"></script>
+    <link
+      rel="stylesheet"
+      href="https://cesium.com/downloads/cesiumjs/releases/1.144/Build/Cesium/Widgets/widgets.css"
+    />
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div class="app">
+      <aside class="panel" id="sidebar">
+        <header class="brand">
+          <div>
+            <h1>FauxRRT</h1>
+            <p>Trajectory globe</p>
+          </div>
+        </header>
+
+        <div class="actions">
+          <button id="btn-files">Load files</button>
+          <button id="btn-folder">Load folder</button>
+          <button id="btn-demo" class="ghost">Demo tracks</button>
+        </div>
+
+        <div class="hint">
+          Columnar text is parsed in Rust. Delimiter, headers, and lat/lon or ECEF
+          columns are detected automatically.
+        </div>
+
+        <section class="block">
+          <div class="block-head">
+            <h2>Tracks</h2>
+            <div class="row-actions">
+              <button id="btn-fit" class="tiny">Fit all</button>
+              <button id="btn-clear" class="tiny danger">Clear</button>
+            </div>
+          </div>
+          <div id="track-list" class="track-list">
+            <div class="empty">No trajectories loaded.</div>
+          </div>
+        </section>
+
+        <section class="block" id="schema-block" hidden>
+          <div class="block-head">
+            <h2>Detected schema</h2>
+            <span id="schema-confidence" class="pill"></span>
+          </div>
+          <div id="schema-summary" class="schema-summary"></div>
+          <div id="schema-notes" class="notes"></div>
+          <div id="schema-map" class="schema-map"></div>
+          <button id="btn-remap" class="ghost">Apply mapping</button>
+        </section>
+      </aside>
+
+      <div class="splitter" id="splitter" title="Resize panel"></div>
+
+      <main class="globe-wrap">
+        <div id="globe"></div>
+        <div class="overlay">
+          <div id="status">Ready</div>
+          <div id="stats"></div>
+        </div>
+      </main>
+    </div>
+    <script src="app.js"></script>
+  </body>
+</html>

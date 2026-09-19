@@ -1,0 +1,4 @@
+# Keep Rust build output off OneDrive. The in-repo `target/` folder is
+# often marked read-only by sync, which breaks crate build scripts.
+[build]
+target-dir = "C:\\Users\\dkuhl\\AppData\\Local\\fauxrrt-cargo-target"

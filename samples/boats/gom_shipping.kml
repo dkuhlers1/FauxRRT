@@ -1,0 +1,103 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<kml xmlns="http://www.opengis.net/kml/2.2">
+  <Document>
+    <name>Gulf of America commercial shipping</name>
+    <description>Sample tanker and cargo reports on major Gulf approaches.</description>
+    <Placemark>
+      <name>MT Houston Endeavor</name>
+      <description>Product tanker inbound to Galveston</description>
+      <ExtendedData>
+        <Data name="speed_kn"><value>12.4</value></Data>
+        <Data name="heading_deg"><value>322</value></Data>
+        <Data name="people_on_board"><value>22</value></Data>
+        <Data name="length_m"><value>183</value></Data>
+        <Data name="age_s"><value>18</value></Data>
+      </ExtendedData>
+      <Point><coordinates>-94.68,28.92,0</coordinates></Point>
+    </Placemark>
+    <Placemark>
+      <name>MV Mississippi Pilot</name>
+      <description>Container feeder at SW Pass approach</description>
+      <ExtendedData>
+        <Data name="sog_kn"><value>14.1</value></Data>
+        <Data name="cog_deg"><value>8</value></Data>
+        <Data name="pob"><value>16</value></Data>
+        <Data name="loa_m"><value>212</value></Data>
+        <Data name="age_s"><value>11</value></Data>
+      </ExtendedData>
+      <Point><coordinates>-89.12,28.68,0</coordinates></Point>
+    </Placemark>
+    <Placemark>
+      <name>MT Corpus Christi Trader</name>
+      <description>VLCC lightering area off Corpus Christi</description>
+      <ExtendedData>
+        <Data name="speed_kn"><value>6.8</value></Data>
+        <Data name="heading_deg"><value>275</value></Data>
+        <Data name="people_on_board"><value>28</value></Data>
+        <Data name="length_m"><value>274</value></Data>
+        <Data name="age_s"><value>36</value></Data>
+      </ExtendedData>
+      <Point><coordinates>-96.78,27.48,0</coordinates></Point>
+    </Placemark>
+    <Placemark>
+      <name>MT LOOP Tanker</name>
+      <description>Offshore oil port tanker south of Louisiana</description>
+      <ExtendedData>
+        <Data name="speed_kn"><value>3.2</value></Data>
+        <Data name="heading_deg"><value>40</value></Data>
+        <Data name="people_on_board"><value>30</value></Data>
+        <Data name="length_m"><value>330</value></Data>
+        <Data name="age_s"><value>54</value></Data>
+      </ExtendedData>
+      <Point><coordinates>-90.02,28.86,0</coordinates></Point>
+    </Placemark>
+    <Placemark>
+      <name>MV Tampa Bound</name>
+      <description>Ro-ro west of Tampa Bay</description>
+      <ExtendedData>
+        <Data name="speed_kn"><value>16.6</value></Data>
+        <Data name="heading_deg"><value>55</value></Data>
+        <Data name="people_on_board"><value>19</value></Data>
+        <Data name="length_m"><value>198</value></Data>
+        <Data name="age_s"><value>22</value></Data>
+      </ExtendedData>
+      <Point><coordinates>-83.48,27.42,0</coordinates></Point>
+    </Placemark>
+    <Placemark>
+      <name>MT Yucatan Transit</name>
+      <description>Crude tanker in the Yucatan Channel</description>
+      <ExtendedData>
+        <Data name="speed_kn"><value>13.0</value></Data>
+        <Data name="heading_deg"><value>18</value></Data>
+        <Data name="people_on_board"><value>24</value></Data>
+        <Data name="length_m"><value>248</value></Data>
+        <Data name="age_min"><value>3</value></Data>
+      </ExtendedData>
+      <Point><coordinates>-85.62,21.95,0</coordinates></Point>
+    </Placemark>
+    <Placemark>
+      <name>OSV Garden Banks</name>
+      <description>Platform supply vessel in the western Gulf oil fields</description>
+      <ExtendedData>
+        <Data name="speed_kn"><value>10.7</value></Data>
+        <Data name="heading_deg"><value>205</value></Data>
+        <Data name="people_on_board"><value>12</value></Data>
+        <Data name="length_m"><value>86</value></Data>
+        <Data name="age_s"><value>9</value></Data>
+      </ExtendedData>
+      <Point><coordinates>-93.55,27.72,0</coordinates></Point>
+    </Placemark>
+    <Placemark>
+      <name>MV Mobile Arrow</name>
+      <description>Bulk carrier outbound from Mobile Bay</description>
+      <ExtendedData>
+        <Data name="speed_kn"><value>11.9</value></Data>
+        <Data name="heading_deg"><value>168</value></Data>
+        <Data name="people_on_board"><value>21</value></Data>
+        <Data name="length_m"><value>225</value></Data>
+        <Data name="age_s"><value>41</value></Data>
+      </ExtendedData>
+      <Point><coordinates>-88.02,30.05,0</coordinates></Point>
+    </Placemark>
+  </Document>
+</kml>
