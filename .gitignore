@@ -4,6 +4,12 @@
 /node_modules
 /dist
 /rocketpy_backend/.venv
+**/__pycache__/
+*.pyc
+.cargo/config.toml
+src-tauri/tauri.dev.local.json
+/release/**/*.exe
+/release/**/*.zip
 .DS_Store
 Thumbs.db
 *.pdb
