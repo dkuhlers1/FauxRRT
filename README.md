@@ -25,7 +25,7 @@ See also the [Tauri 2 prerequisites](https://v2.tauri.app/start/prerequisites/).
 ### Clone and start
 
 ```powershell
-git clone https://github.com/YOUR_GITHUB_USERNAME/FauxRRT.git
+git clone https://github.com/dkuhlers1/FauxRRT.git
 cd FauxRRT
 npm install
 npm run tauri dev
