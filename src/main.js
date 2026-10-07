@@ -1008,7 +1008,7 @@ function renderRisk() {
         <span class="card-summary muted">${escapeHtml(objectCardSummary(obj))}</span>
         <button data-act="del-obj" class="ghost compact">✕</button>
       </div>
-      <div class="card-body">
+      ${expanded ? `<div class="card-body">
       <div class="prob-sum ${sumClass}">
         Inclusive object · modes Σ ${formatProb(obj.failure_mode_sum)} · traj Σ ${formatProb(obj.trajectory_prob_sum)}
         ${obj.valid ? "✓" : obj.modes.length ? "— need 1" : "— add a mode and trajectories"}
@@ -1016,7 +1016,8 @@ function renderRisk() {
       </div>
       <div class="method-choice"></div>
       <div class="modes"></div>
-      </div>`;
+      </div>` : ""}`;
+    if (expanded) {
     fillMethodChoice(card.querySelector(".method-choice"), obj);
     const loadMode = loadModeFor(obj);
     const method = methodFor(obj);
@@ -1066,6 +1067,7 @@ function renderRisk() {
         mutateRisk("remove_failure_mode", { id: mode.id });
       });
       modesEl.appendChild(block);
+    }
     }
     card.querySelector('[data-role="obj-name"]').addEventListener("change", (ev) => {
       mutateRisk("rename_object", { id: obj.id, name: ev.target.value });

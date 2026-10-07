@@ -5,6 +5,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -339,6 +340,7 @@ fn spawn_python(
     interp: &PyInterp,
     args: &[&str],
     stdin: Option<&[u8]>,
+    limit: Duration,
 ) -> Result<(String, String, i32), String> {
     let mut cmd = Command::new(&interp.bin);
     cmd.args(&interp.prefix)
@@ -364,14 +366,35 @@ fn spawn_python(
                 .map_err(|e| format!("write RocketPy stdin: {e}"))?;
         }
     }
-    let output = child
-        .wait_with_output()
-        .map_err(|e| format!("wait for Python: {e}"))?;
+    let output = wait_python(child, limit)?;
     Ok((
         String::from_utf8_lossy(&output.stdout).into_owned(),
         String::from_utf8_lossy(&output.stderr).into_owned(),
         output.status.code().unwrap_or(-1),
     ))
+}
+
+fn wait_python(mut child: std::process::Child, limit: Duration) -> Result<std::process::Output, String> {
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                return child
+                    .wait_with_output()
+                    .map_err(|e| format!("wait for Python: {e}"));
+            }
+            Ok(None) if started.elapsed() > limit => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!(
+                    "Python did not finish within {}s",
+                    limit.as_secs()
+                ));
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(40)),
+            Err(err) => return Err(format!("wait for Python: {err}")),
+        }
+    }
 }
 
 fn system_interps() -> Vec<PyInterp> {
@@ -446,7 +469,12 @@ fn parse_probe(stdout: &str, stderr: &str) -> Result<String, String> {
 fn probe_rocketpy(interp: &PyInterp) -> Result<String, String> {
     let script = prepare_script()?;
     let script_s = script.to_string_lossy().into_owned();
-    let result = spawn_python(interp, &["-u", &script_s, "--check"], None);
+    let result = spawn_python(
+        interp,
+        &["-u", &script_s, "--check"],
+        None,
+        Duration::from_secs(25),
+    );
     let _ = fs::remove_file(&script);
     let (stdout, stderr, _) = result?;
     parse_probe(&stdout, &stderr)
@@ -464,7 +492,7 @@ fn interp_from_venv() -> Option<PyInterp> {
 fn first_working_system() -> Result<PyInterp, String> {
     let mut last = "no Python interpreter found".to_string();
     for interp in system_interps() {
-        match spawn_python(&interp, &["-c", "print(1)"], None) {
+        match spawn_python(&interp, &["-c", "print(1)"], None, Duration::from_secs(15)) {
             Ok((stdout, _, 0)) if stdout.contains('1') => return Ok(interp),
             Ok((_, stderr, _)) => {
                 last = stderr.lines().last().unwrap_or(&last).to_string();
@@ -493,7 +521,7 @@ fn pip_install(interp: &PyInterp) -> Result<(), String> {
     } else {
         args.push("rocketpy");
     }
-    let (stdout, stderr, code) = spawn_python(interp, &args, None)?;
+    let (stdout, stderr, code) = spawn_python(interp, &args, None, Duration::from_secs(180))?;
     if code == 0 {
         return Ok(());
     }
@@ -515,7 +543,8 @@ fn bootstrap_venv() -> Result<PyInterp, String> {
     let py = venv_python(&venv);
     if !py.is_file() {
         let venv_s = venv.to_string_lossy().into_owned();
-        let (stdout, stderr, code) = spawn_python(&creator, &["-m", "venv", &venv_s], None)?;
+        let (stdout, stderr, code) =
+            spawn_python(&creator, &["-m", "venv", &venv_s], None, Duration::from_secs(60))?;
         if !py.is_file() || code != 0 {
             let hint = stderr
                 .lines()
@@ -590,7 +619,12 @@ pub fn fly_rocketpy(spec: &RocketPySpec) -> Result<RocketPyFlight, String> {
     let script = prepare_script()?;
     let payload = serde_json::to_vec(spec).map_err(|e| format!("encode RocketPy spec: {e}"))?;
     let script_s = script.to_string_lossy().into_owned();
-    let (stdout, stderr, _) = spawn_python(&interp, &["-u", &script_s], Some(&payload))?;
+    let (stdout, stderr, _) = spawn_python(
+        &interp,
+        &["-u", &script_s],
+        Some(&payload),
+        Duration::from_secs(180),
+    )?;
     let _ = fs::remove_file(&script);
     let line = stdout
         .lines()
