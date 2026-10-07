@@ -9,9 +9,11 @@
  */
 
 export const GFS_SURFACE_ENDPOINT = "https://api.open-meteo.com/v1/gfs";
-export const GFS_GRID_STEP_DEG = 5;
-const BATCH_SIZE = 200;
-const FETCH_CONCURRENCY = 2;
+/** 17×24 = 408 samples. Fine enough for globe-scale flow, small enough for one Open-Meteo minute. */
+export const GFS_GRID_LAT_STEP_DEG = 10;
+export const GFS_GRID_LON_STEP_DEG = 15;
+const BATCH_SIZE = 80;
+const FETCH_CONCURRENCY = 1;
 const CACHE_MS = 10 * 60 * 1000;
 
 const SPEED_STOPS = [
@@ -29,17 +31,18 @@ const EARTH_RADIUS_M = 6378137;
 
 let cachedField = null;
 let cachedAt = 0;
+let inflight = null;
 
-export function gridSpec(step = GFS_GRID_STEP_DEG) {
+export function gridSpec(latStep = GFS_GRID_LAT_STEP_DEG, lonStep = GFS_GRID_LON_STEP_DEG) {
   const lats = [];
-  for (let lat = -80; lat <= 80; lat += step) lats.push(lat);
+  for (let lat = -80; lat <= 80; lat += latStep) lats.push(lat);
   const lons = [];
-  for (let lon = -180; lon < 180; lon += step) lons.push(lon);
-  return { lats, lons, step };
+  for (let lon = -180; lon < 180; lon += lonStep) lons.push(lon);
+  return { lats, lons, latStep, lonStep, step: latStep };
 }
 
-export function gridPointCount(step = GFS_GRID_STEP_DEG) {
-  const spec = gridSpec(step);
+export function gridPointCount(latStep = GFS_GRID_LAT_STEP_DEG, lonStep = GFS_GRID_LON_STEP_DEG) {
+  const spec = gridSpec(latStep, lonStep);
   return spec.lats.length * spec.lons.length;
 }
 
@@ -203,16 +206,17 @@ function abortError(signal) {
 
 async function fetchBatch(points, signal, attempt = 0) {
   const response = await fetch(gfsSurfaceBatchUrl(points), { signal });
-  if (response.status === 429 && attempt < 5) {
-    await sleep(700 * 2 ** attempt, signal);
-    return fetchBatch(points, signal, attempt + 1);
-  }
   if (!response.ok) {
     let reason = "";
     try {
       reason = (await response.json())?.reason || "";
     } catch {
       /* body was not JSON */
+    }
+    const retryable = response.status === 429 || response.status >= 500 || /limit|rate|overload/i.test(reason);
+    if (retryable && attempt < 1) {
+      await sleep(2000, signal);
+      return fetchBatch(points, signal, attempt + 1);
     }
     throw new Error(reason || `GFS wind request failed (${response.status})`);
   }
@@ -254,6 +258,7 @@ export async function fetchGfsSurfaceField(signal) {
       const slice = points.slice(offset, offset + BATCH_SIZE);
       const rows = await fetchBatch(slice, signal);
       for (let i = 0; i < rows.length; i++) samples[offset + i] = rows[i];
+      if (cursor < offsets.length) await sleep(200, signal);
     }
   }
   const workers = [];
@@ -262,12 +267,25 @@ export async function fetchGfsSurfaceField(signal) {
   return fieldFromSamples(spec, samples);
 }
 
-export async function loadGfsSurfaceField(signal) {
+export function peekGfsSurfaceField() {
   if (cachedField && Date.now() - cachedAt < CACHE_MS) return cachedField;
-  const field = await fetchGfsSurfaceField(signal);
-  cachedField = field;
-  cachedAt = Date.now();
-  return field;
+  return null;
+}
+
+export async function loadGfsSurfaceField(signal) {
+  const cached = peekGfsSurfaceField();
+  if (cached) return cached;
+  if (inflight) return inflight;
+  inflight = fetchGfsSurfaceField(signal)
+    .then((field) => {
+      cachedField = field;
+      cachedAt = Date.now();
+      return field;
+    })
+    .finally(() => {
+      inflight = null;
+    });
+  return inflight;
 }
 
 /** Drop the cached grid. The animation layer also drops its own particles. */

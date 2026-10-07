@@ -17,6 +17,8 @@ import {
 } from "./wind-field.js";
 
 export const MAX_WIND_PARTICLES = 1000;
+/** Default streak opacity. Low enough to read the map, trajectories, and impacts. */
+export const DEFAULT_WIND_ALPHA = 0.4;
 const SPEED_BINS = 24;
 const BIN_MAX_MPS = 42;
 const POLE_LIMIT = 79.5;
@@ -28,6 +30,19 @@ let running = false;
 let canvas = null;
 let legend = null;
 let particles = null;
+let layerAlpha = DEFAULT_WIND_ALPHA;
+
+export function setSurfaceWindAlpha(alpha) {
+  const value = Number(alpha);
+  if (!Number.isFinite(value)) return layerAlpha;
+  layerAlpha = Math.min(1, Math.max(0, value));
+  if (canvas) canvas.style.opacity = String(layerAlpha);
+  return layerAlpha;
+}
+
+export function surfaceWindAlpha() {
+  return layerAlpha;
+}
 
 export function setSurfaceWindEnabled(viewer, enabled, onStatus) {
   generation += 1;
@@ -90,6 +105,7 @@ function startLayer(viewer, field, gen) {
   canvas.style.height = "100%";
   canvas.style.pointerEvents = "none";
   canvas.style.zIndex = "1";
+  canvas.style.opacity = String(layerAlpha);
   parent.appendChild(canvas);
   legend = buildLegend(field);
   parent.appendChild(legend);
@@ -187,7 +203,7 @@ function startLayer(viewer, field, gen) {
 
     ctx.lineWidth = 1.35;
     ctx.lineCap = "round";
-    ctx.globalAlpha = 0.9;
+    ctx.globalAlpha = 1;
     for (let b = 0; b < buckets.length; b++) {
       const bucket = buckets[b];
       if (!bucket.length) continue;

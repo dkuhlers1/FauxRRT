@@ -488,7 +488,8 @@ input[type="number"], input[type="text"] {
 .gen-grid input { width: 100%; }
 .gen-sites { display: flex; flex-direction: column; gap: 4px; }
 .gen-sites button { text-align: left; }
-.wind-toggle { grid-template-columns: 1fr 1fr 1fr; }
+.wind-toggle { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+#surface-wind-alpha { width: 72px; accent-color: var(--accent); }
 .wind-hint { font-size: 11px; line-height: 1.35; }
 .gen-grid select { width: 100%; }
 

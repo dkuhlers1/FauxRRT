@@ -1,4 +1,6 @@
-import { setSurfaceWindEnabled } from "./wind-layer.js";
+import { setSurfaceWindAlpha, setSurfaceWindEnabled } from "./wind-layer.js";
+
+export { setSurfaceWindAlpha };
 
 const tracks = new Map();
 let viewer;

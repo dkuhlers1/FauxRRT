@@ -24,6 +24,22 @@ pub enum WindSpec {
         #[serde(default)]
         source: String,
     },
+    /// Current GFS 10 m wind on the same 10°×15° grid as the globe surface-wind layer.
+    /// East/north components are sampled by latitude and longitude at every height.
+    Surface {
+        #[serde(default)]
+        time: String,
+        #[serde(default)]
+        source: String,
+        #[serde(default)]
+        lats: Vec<f64>,
+        #[serde(default)]
+        lons: Vec<f64>,
+        #[serde(default)]
+        east_mps: Vec<f64>,
+        #[serde(default)]
+        north_mps: Vec<f64>,
+    },
 }
 
 fn default_hour() -> u8 {
@@ -58,6 +74,7 @@ impl WindSpec {
     fn needs_fetch(&self) -> bool {
         match self {
             Self::Historical { profiles, .. } => profiles.is_empty(),
+            Self::Surface { east_mps, .. } => east_mps.is_empty(),
             _ => false,
         }
     }
@@ -76,6 +93,8 @@ impl WindSpec {
                 profiles: Vec::new(),
                 source: source.clone(),
             },
+            // The surface grid is the mission wind itself, not a site sounding.
+            Self::Surface { .. } => self.clone(),
             other => other.clone(),
         }
     }
@@ -98,6 +117,13 @@ pub fn wind_enu(wind: &WindSpec, lat: f64, lon: f64, alt_m: f64) -> (f64, f64) {
             }
         }
         WindSpec::Historical { profiles, .. } => interpolate_stations(profiles, lat, lon, alt_m),
+        WindSpec::Surface {
+            lats,
+            lons,
+            east_mps,
+            north_mps,
+            ..
+        } => sample_surface_grid(lats, lons, east_mps, north_mps, lat, lon),
     }
 }
 
@@ -128,7 +154,13 @@ pub fn resolve_wind_spec(
 ) -> Result<WindSpec, String> {
     validate_wind(&wind)?;
     if wind.needs_fetch() {
-        wind = fetch_historical(&wind, launch_lat, launch_lon, aim_lat, aim_lon)?;
+        wind = match &wind {
+            WindSpec::Historical { .. } => {
+                fetch_historical(&wind, launch_lat, launch_lon, aim_lat, aim_lon)?
+            }
+            WindSpec::Surface { .. } => fetch_surface()?,
+            other => other.clone(),
+        };
     }
     Ok(wind)
 }
@@ -151,6 +183,22 @@ fn validate_wind(wind: &WindSpec) -> Result<(), String> {
             }
             if *hour_utc > 23 {
                 return Err("wind hour must be 0–23 UTC".into());
+            }
+            Ok(())
+        }
+        WindSpec::Surface {
+            lats,
+            lons,
+            east_mps,
+            north_mps,
+            ..
+        } => {
+            if east_mps.is_empty() && north_mps.is_empty() && lats.is_empty() && lons.is_empty() {
+                return Ok(());
+            }
+            if lats.len() < 2 || lons.len() < 2 || east_mps.len() != lats.len() * lons.len() || north_mps.len() != east_mps.len()
+            {
+                return Err("surface wind grid is incomplete".into());
             }
             Ok(())
         }
@@ -229,6 +277,178 @@ fn geographic_mid(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> (f64, f64) {
         lon += 360.0;
     }
     ((lat1 + lat2) * 0.5, lon)
+}
+
+fn wrap_lon(lon: f64) -> f64 {
+    let x = ((lon + 180.0) % 360.0 + 360.0) % 360.0 - 180.0;
+    if x == 0.0 { 0.0 } else { x }
+}
+
+fn sample_surface_grid(
+    lats: &[f64],
+    lons: &[f64],
+    east: &[f64],
+    north: &[f64],
+    lat: f64,
+    lon: f64,
+) -> (f64, f64) {
+    let ny = lats.len();
+    let nx = lons.len();
+    if ny < 2 || nx < 2 || east.len() != nx * ny || north.len() != east.len() {
+        return (0.0, 0.0);
+    }
+    let dlat = lats[1] - lats[0];
+    let dlon = lons[1] - lons[0];
+    if dlat <= 0.0 || dlon <= 0.0 {
+        return (0.0, 0.0);
+    }
+    let fy = ((lat - lats[0]) / dlat).clamp(0.0, (ny - 1) as f64);
+    let j0 = (fy.floor() as usize).min(ny - 1);
+    let j1 = (j0 + 1).min(ny - 1);
+    let ty = fy - j0 as f64;
+    let global = (nx as f64 * dlon - 360.0).abs() < 1e-3;
+    let mut fx = (wrap_lon(lon) - lons[0]) / dlon;
+    if global {
+        let n = nx as f64;
+        fx = ((fx % n) + n) % n;
+    } else if fx < 0.0 {
+        fx = 0.0;
+    } else if fx > (nx - 1) as f64 {
+        fx = (nx - 1) as f64;
+    }
+    let i0 = (fx.floor() as usize).min(nx - 1);
+    let tx = fx - i0 as f64;
+    let i1 = if i0 + 1 >= nx { 0 } else { i0 + 1 };
+    let sy = 1.0 - ty;
+    let sx = 1.0 - tx;
+    let at = |j: usize, i: usize| j * nx + i;
+    let blend = |values: &[f64]| {
+        values[at(j0, i0)] * sx * sy
+            + values[at(j0, i1)] * tx * sy
+            + values[at(j1, i0)] * sx * ty
+            + values[at(j1, i1)] * tx * ty
+    };
+    (blend(east), blend(north))
+}
+
+const GFS_SURFACE_LAT_STEP: usize = 10;
+const GFS_SURFACE_LON_STEP: usize = 15;
+
+fn fetch_surface() -> Result<WindSpec, String> {
+    let lats = (-80..=80).step_by(GFS_SURFACE_LAT_STEP).map(|v| v as f64).collect::<Vec<_>>();
+    let lons = (-180..180).step_by(GFS_SURFACE_LON_STEP).map(|v| v as f64).collect::<Vec<_>>();
+    let mut points = Vec::with_capacity(lats.len() * lons.len());
+    for lat in &lats {
+        for lon in &lons {
+            points.push((*lat, *lon));
+        }
+    }
+    let mut east = vec![0.0; points.len()];
+    let mut north = vec![0.0; points.len()];
+    let mut time = String::new();
+    let mut missing = 0usize;
+    let mut offset = 0;
+    while offset < points.len() {
+        let end = (offset + 80).min(points.len());
+        let batch = &points[offset..end];
+        let rows = fetch_surface_batch(batch)?;
+        if rows.len() != batch.len() {
+            return Err("GFS surface wind batch size mismatch".into());
+        }
+        for (i, row) in rows.into_iter().enumerate() {
+            match row {
+                Some((e, n, stamp)) => {
+                    east[offset + i] = e;
+                    north[offset + i] = n;
+                    if time.is_empty() {
+                        time = stamp;
+                    }
+                }
+                None => missing += 1,
+            }
+        }
+        offset = end;
+    }
+    if missing * 4 > points.len() {
+        return Err("GFS response was missing most of the 10 m wind grid".into());
+    }
+    Ok(WindSpec::Surface {
+        time,
+        source: "Open-Meteo GFS 10 m".into(),
+        lats,
+        lons,
+        east_mps: east,
+        north_mps: north,
+    })
+}
+
+fn fetch_surface_batch(points: &[(f64, f64)]) -> Result<Vec<Option<(f64, f64, String)>>, String> {
+    let lats = points.iter().map(|(lat, _)| format!("{lat:.4}")).collect::<Vec<_>>().join(",");
+    let lons = points.iter().map(|(_, lon)| format!("{lon:.4}")).collect::<Vec<_>>().join(",");
+    let url = format!(
+        "https://api.open-meteo.com/v1/gfs?latitude={lats}&longitude={lons}&current=wind_speed_10m,wind_direction_10m&wind_speed_unit=ms&timezone=GMT"
+    );
+    let body = http_get_retry(&url)?;
+    parse_gfs_current_batch(&body)
+}
+
+fn http_get_retry(url: &str) -> Result<String, String> {
+    let agent = ureq::AgentBuilder::new()
+        .timeout(std::time::Duration::from_secs(30))
+        .build();
+    let mut last_err = "wind request failed".to_string();
+    for attempt in 0u32..6 {
+        match agent.get(url).set("User-Agent", "fauxrrt-trajectory-generator").call() {
+            Ok(resp) => {
+                return resp.into_string().map_err(|e| format!("wind response: {e}"));
+            }
+            Err(ureq::Error::Status(code, resp)) if attempt < 1 => {
+                let body = resp.into_string().unwrap_or_default();
+                let lower = body.to_lowercase();
+                if code == 429 || code >= 500 || lower.contains("limit") || lower.contains("overload") {
+                    last_err = "GFS wind request was rate limited".into();
+                    let pause = 800u64.saturating_mul(u64::from(attempt) + 1);
+                    std::thread::sleep(std::time::Duration::from_millis(pause));
+                    continue;
+                }
+                let reason = serde_json::from_str::<Value>(&body)
+                    .ok()
+                    .and_then(|json| json.get("reason").and_then(Value::as_str).map(str::to_string))
+                    .unwrap_or_else(|| format!("GFS wind request failed ({code})"));
+                return Err(reason);
+            }
+            Err(err) => return Err(format!("wind request failed: {err}")),
+        }
+    }
+    Err(last_err)
+}
+
+fn parse_gfs_current_batch(body: &str) -> Result<Vec<Option<(f64, f64, String)>>, String> {
+    let json: Value = serde_json::from_str(body).map_err(|e| format!("wind JSON: {e}"))?;
+    if json.get("error").and_then(Value::as_bool) == Some(true) {
+        let reason = json.get("reason").and_then(Value::as_str).unwrap_or("Open-Meteo error");
+        return Err(reason.to_string());
+    }
+    let rows = json.as_array().ok_or("GFS wind response was not a location grid")?;
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        let current = row.get("current");
+        let speed = current.and_then(|c| c.get("wind_speed_10m")).and_then(Value::as_f64);
+        let direction = current.and_then(|c| c.get("wind_direction_10m")).and_then(Value::as_f64);
+        let stamp = current
+            .and_then(|c| c.get("time"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        match (speed, direction) {
+            (Some(speed), Some(direction)) if speed.is_finite() && direction.is_finite() && speed >= 0.0 => {
+                let (east, north) = meteo_to_enu(speed, direction);
+                out.push(Some((east, north, stamp)));
+            }
+            _ => out.push(None),
+        }
+    }
+    Ok(out)
 }
 
 const SURFACE: &[(&str, &str, f64)] = &[
@@ -488,5 +708,56 @@ mod tests {
         let top = station.levels.last().unwrap();
         assert!((top.east_mps - 15.0).abs() < 1e-9);
         assert!((top.alt_m - 1500.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn surface_grid_is_the_mission_wind_field() {
+        let wind = WindSpec::Surface {
+            time: "2026-10-07T00:00".into(),
+            source: "Open-Meteo GFS 10 m".into(),
+            lats: vec![0.0, 10.0],
+            lons: vec![-10.0, 0.0],
+            east_mps: vec![10.0, 0.0, 0.0, 0.0],
+            north_mps: vec![0.0, 0.0, 0.0, 0.0],
+        };
+        let (e, n) = wind_enu(&wind, 0.0, -10.0, 40_000.0);
+        assert!((e - 10.0).abs() < 1e-6, "{e}");
+        assert!(n.abs() < 1e-6, "{n}");
+        let (mid, _) = wind_enu(&wind, 5.0, -5.0, 1_000.0);
+        assert!((mid - 2.5).abs() < 1e-6, "{mid}");
+        let kept = wind.without_site_profiles();
+        assert!(!kept.needs_fetch());
+        let (e2, _) = wind_enu(&kept, 0.0, -10.0, 0.0);
+        assert!((e2 - 10.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn surface_grid_wraps_longitude() {
+        let wind = WindSpec::Surface {
+            time: String::new(),
+            source: String::new(),
+            lats: vec![0.0, 10.0],
+            lons: vec![-180.0, 0.0],
+            east_mps: vec![0.0, 10.0, 0.0, 0.0],
+            north_mps: vec![0.0, 0.0, 0.0, 0.0],
+        };
+        let (e, _) = wind_enu(&wind, 0.0, 90.0, 0.0);
+        assert!((e - 5.0).abs() < 1e-6, "{e}");
+    }
+
+    #[test]
+    fn parses_gfs_current_batch() {
+        let body = r#"[{
+            "current": {"time": "2026-10-07T00:00", "wind_speed_10m": 10.0, "wind_direction_10m": 270}
+        }, {
+            "current": {"time": "2026-10-07T00:00", "wind_speed_10m": null, "wind_direction_10m": null}
+        }]"#;
+        let rows = parse_gfs_current_batch(body).unwrap();
+        assert_eq!(rows.len(), 2);
+        let (e, n, stamp) = rows[0].clone().unwrap();
+        assert!((e - 10.0).abs() < 1e-9);
+        assert!(n.abs() < 1e-9);
+        assert_eq!(stamp, "2026-10-07T00:00");
+        assert!(rows[1].is_none());
     }
 }

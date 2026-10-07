@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { MAX_WIND_PARTICLES } from "./wind-layer.js";
+import { DEFAULT_WIND_ALPHA, MAX_WIND_PARTICLES, setSurfaceWindAlpha, surfaceWindAlpha } from "./wind-layer.js";
 import {
   GFS_SURFACE_ENDPOINT,
   advectInto,
@@ -14,9 +14,15 @@ import {
   wrapLon,
 } from "./wind-field.js";
 
-test("particle simulation is capped", () => {
+test("particle simulation is capped and see-through by default", () => {
   assert.equal(MAX_WIND_PARTICLES, 1000);
   assert.ok(MAX_WIND_PARTICLES <= 1500);
+  assert.ok(DEFAULT_WIND_ALPHA <= 0.5);
+  assert.ok(DEFAULT_WIND_ALPHA >= 0.2);
+  assert.equal(setSurfaceWindAlpha(0.25), 0.25);
+  assert.equal(surfaceWindAlpha(), 0.25);
+  assert.equal(setSurfaceWindAlpha(4), 1);
+  setSurfaceWindAlpha(DEFAULT_WIND_ALPHA);
 });
 
 test("west wind blows east and north wind blows south", () => {
@@ -28,15 +34,16 @@ test("west wind blows east and north wind blows south", () => {
   assert.ok(Math.abs(vn + 8) < 1e-9);
 });
 
-test("global grid is a 5 degree GFS lattice", () => {
+test("global grid is a 10 by 15 degree GFS lattice", () => {
   const spec = gridSpec();
   assert.equal(spec.lats[0], -80);
   assert.equal(spec.lats.at(-1), 80);
   assert.equal(spec.lons[0], -180);
-  assert.equal(spec.lons.at(-1), 175);
-  assert.equal(spec.lats.length, 33);
-  assert.equal(spec.lons.length, 72);
-  assert.equal(gridPointCount(), 2376);
+  assert.equal(spec.lons.at(-1), 165);
+  assert.equal(spec.lats.length, 17);
+  assert.equal(spec.lons.length, 24);
+  assert.equal(spec.lons.length * spec.lonStep, 360);
+  assert.equal(gridPointCount(), 408);
 });
 
 test("samples a grid node and bilinearly blends neighbors", () => {

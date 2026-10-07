@@ -28,12 +28,14 @@ import {
   setSiteChangeHandler,
   setSiteMarkers,
   setStateMarker,
+  setSurfaceWindAlpha,
   setSurfaceWindVisible,
   setTerminateHull,
   setTerminateHullVisible,
   setVisible,
 } from "./globe.js";
 import { enrichBoat, parseBoatKml, scoreBoatsAgainstGrid } from "./boats-kml.js";
+import { peekGfsSurfaceField } from "./wind-field.js";
 
 const tracks = new Map();
 let boats = [];
@@ -58,6 +60,7 @@ let missionWind = {
   date: "",
   hour_utc: 12,
   source: "",
+  time: "",
 };
 const objectLoadName = new Map();
 /** @type {number | null | undefined} undefined = expand first object */
@@ -115,6 +118,8 @@ const els = {
   showKde: document.getElementById("show-kde"),
   showBoats: document.getElementById("show-boats"),
   showSurfaceWind: document.getElementById("show-surface-wind"),
+  surfaceWindAlpha: document.getElementById("surface-wind-alpha"),
+  surfaceWindAlphaReadout: document.getElementById("surface-wind-alpha-readout"),
   showIipBoundary: document.getElementById("show-iip-boundary"),
   showTerminateBoundary: document.getElementById("show-terminate-boundary"),
   imagery: document.getElementById("imagery-kind"),
@@ -152,20 +157,11 @@ els.showBoats?.addEventListener("change", () => {
   persistMissionUi();
 });
 els.showSurfaceWind?.addEventListener("change", () => {
-  const on = Boolean(els.showSurfaceWind.checked);
-  setSurfaceWindVisible(on, (status) => {
-    const loading = els.progress.textContent.startsWith("Loading GFS");
-    if (!status || status.phase === "off" || status.phase === "ready") {
-      if (loading) els.progress.textContent = "";
-      return;
-    }
-    if (status.phase === "loading") els.progress.textContent = "Loading GFS 10 m surface wind…";
-    else if (status.phase === "error") els.progress.textContent = `Surface wind unavailable: ${status.message}`;
-  }).then((result) => {
-    if (on && result && result.ok === false && !result.aborted && els.showSurfaceWind) {
-      els.showSurfaceWind.checked = false;
-    }
-  });
+  applySurfaceWind(Boolean(els.showSurfaceWind.checked));
+});
+els.surfaceWindAlpha?.addEventListener("input", () => {
+  const alpha = setSurfaceWindAlpha(els.surfaceWindAlpha.value);
+  if (els.surfaceWindAlphaReadout) els.surfaceWindAlphaReadout.textContent = `${Math.round(alpha * 100)}%`;
 });
 els.showIipBoundary?.addEventListener("change", () => {
   setIipHullVisible(els.showIipBoundary.checked);
@@ -1708,6 +1704,23 @@ function requireModeNameFor(objectId) {
   return modeName;
 }
 
+function applySurfaceWind(on) {
+  return setSurfaceWindVisible(on, (status) => {
+    const loading = els.progress.textContent.startsWith("Loading GFS");
+    if (!status || status.phase === "off" || status.phase === "ready") {
+      if (loading) els.progress.textContent = "";
+      return;
+    }
+    if (status.phase === "loading") els.progress.textContent = "Loading GFS 10 m surface wind…";
+    else if (status.phase === "error") els.progress.textContent = `Surface wind unavailable: ${status.message}`;
+  }).then((result) => {
+    if (on && result && result.ok === false && !result.aborted && els.showSurfaceWind) {
+      els.showSurfaceWind.checked = false;
+    }
+    return result;
+  });
+}
+
 function windSpecFromMission() {
   if (missionWind.type === "constant") {
     return {
@@ -1723,6 +1736,19 @@ function windSpecFromMission() {
       hour_utc: Number(missionWind.hour_utc) || 0,
     };
   }
+  if (missionWind.type === "surface") {
+    const field = peekGfsSurfaceField();
+    if (!field) return { type: "surface" };
+    return {
+      type: "surface",
+      time: field.time || "",
+      source: field.source ? `${field.source} 10 m` : "Open-Meteo GFS 10 m",
+      lats: Array.from(field.lats),
+      lons: Array.from(field.lons),
+      east_mps: Array.from(field.u),
+      north_mps: Array.from(field.v),
+    };
+  }
   return { type: "off" };
 }
 
@@ -1733,6 +1759,10 @@ function missionWindSummary() {
   if (missionWind.type === "historical") {
     const src = missionWind.source ? ` ${missionWind.source}.` : "";
     return `Uses mission wind: GFS ${missionWind.date || defaultWindDate()} ${String(missionWind.hour_utc).padStart(2, "0")}Z.${src}`;
+  }
+  if (missionWind.type === "surface") {
+    const when = missionWind.time ? ` ${String(missionWind.time).replace("T", " ")} UTC` : "";
+    return `Uses mission wind: GFS 10 m surface field${when}.`;
   }
   return "Uses mission wind: off (set above).";
 }
@@ -1747,6 +1777,10 @@ function applyMissionWind(wind) {
   if (w.type === "historical") {
     missionWind.date = w.date || missionWind.date || defaultWindDate();
     missionWind.hour_utc = w.hour_utc ?? 12;
+    missionWind.source = w.source || "";
+  }
+  if (w.type === "surface") {
+    missionWind.time = w.time || "";
     missionWind.source = w.source || "";
   }
   if (!missionWind.date) missionWind.date = defaultWindDate();
@@ -1779,6 +1813,12 @@ function renderWindPanel() {
       <label>Date UTC <input type="date" data-mw="date" value="${escapeHtml(missionWind.date || defaultWindDate())}" /></label>
       <label>Hour <select data-mw="hour_utc">${hours}</select></label>
     </div>${src}`;
+  } else if (missionWind.type === "surface") {
+    const when = missionWind.time
+      ? `${escapeHtml(String(missionWind.time).replace("T", " "))} UTC`
+      : "the current GFS hour";
+    const src = missionWind.source ? `${escapeHtml(missionWind.source)} · ` : "";
+    els.windFields.innerHTML = `<div class="muted wind-hint">${src}${when}. This is the same 10°×15° GFS 10 m field as the globe Surface wind layer. Trajectories sample it by latitude and longitude, not only as a map overlay. Switching away regenerates generated trajectories.</div>`;
   } else {
     els.windFields.innerHTML = `<div class="muted wind-hint">No added wind. Atmosphere co-rotates with Earth. Switching away from this regenerates generated trajectories.</div>`;
   }
@@ -1794,12 +1834,16 @@ function renderWindPanel() {
 function bindWindPanel() {
   if (!missionWind.date) missionWind.date = defaultWindDate();
   document.querySelectorAll("#wind-panel [data-wind]").forEach((btn) => {
-    btn.addEventListener("click", () => {
+    btn.addEventListener("click", async () => {
       missionWind.type = btn.dataset.wind;
       if (missionWind.type === "historical" && !missionWind.date) {
         missionWind.date = defaultWindDate();
       }
       renderWindPanel();
+      if (missionWind.type === "surface" && els.showSurfaceWind && !els.showSurfaceWind.checked) {
+        els.showSurfaceWind.checked = true;
+        await applySurfaceWind(true);
+      }
       persistMissionWind();
     });
   });
@@ -1808,7 +1852,7 @@ function bindWindPanel() {
 
 async function persistMissionWind() {
   setBusy(true);
-  els.progress.textContent = missionWind.type === "historical"
+  els.progress.textContent = missionWind.type === "historical" || missionWind.type === "surface"
     ? "Fetching winds and regenerating…"
     : "Updating wind…";
   try {
