@@ -28,6 +28,7 @@ import {
   setSiteChangeHandler,
   setSiteMarkers,
   setStateMarker,
+  setSurfaceWindVisible,
   setTerminateHull,
   setTerminateHullVisible,
   setVisible,
@@ -113,6 +114,7 @@ const els = {
   showImpacts: document.getElementById("show-impacts"),
   showKde: document.getElementById("show-kde"),
   showBoats: document.getElementById("show-boats"),
+  showSurfaceWind: document.getElementById("show-surface-wind"),
   showIipBoundary: document.getElementById("show-iip-boundary"),
   showTerminateBoundary: document.getElementById("show-terminate-boundary"),
   imagery: document.getElementById("imagery-kind"),
@@ -148,6 +150,22 @@ els.showKde?.addEventListener("change", () => {
 els.showBoats?.addEventListener("change", () => {
   setBoatsVisible(els.showBoats.checked);
   persistMissionUi();
+});
+els.showSurfaceWind?.addEventListener("change", () => {
+  const on = Boolean(els.showSurfaceWind.checked);
+  setSurfaceWindVisible(on, (status) => {
+    const loading = els.progress.textContent.startsWith("Loading GFS");
+    if (!status || status.phase === "off" || status.phase === "ready") {
+      if (loading) els.progress.textContent = "";
+      return;
+    }
+    if (status.phase === "loading") els.progress.textContent = "Loading GFS 10 m surface wind…";
+    else if (status.phase === "error") els.progress.textContent = `Surface wind unavailable: ${status.message}`;
+  }).then((result) => {
+    if (on && result && result.ok === false && !result.aborted && els.showSurfaceWind) {
+      els.showSurfaceWind.checked = false;
+    }
+  });
 });
 els.showIipBoundary?.addEventListener("change", () => {
   setIipHullVisible(els.showIipBoundary.checked);

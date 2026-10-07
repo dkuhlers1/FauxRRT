@@ -1,3 +1,5 @@
+import { setSurfaceWindEnabled } from "./wind-layer.js";
+
 const tracks = new Map();
 let viewer;
 let polylines;
@@ -443,6 +445,14 @@ export function setSiteMarkers(launch, aim) {
   add(lastLaunchSite, Cesium.Color.fromCssColorString("#3d9eff"), "launch");
   add(lastAimSite, Cesium.Color.fromCssColorString("#e35d6a"), "aim");
   requestRender();
+}
+
+export function setSurfaceWindVisible(enabled, onStatus) {
+  if (!viewer) {
+    onStatus?.({ phase: "error", message: "Globe is not ready" });
+    return Promise.resolve({ ok: false, message: "Globe is not ready" });
+  }
+  return setSurfaceWindEnabled(viewer, enabled, onStatus);
 }
 
 export function setImagery(kind) {
