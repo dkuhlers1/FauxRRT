@@ -1,4 +1,5 @@
-use std::collections::HashMap;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -79,6 +80,48 @@ pub struct Trajectory {
     pub rocketpy: Option<RocketPySpec>,
 }
 
+/// What the Fly 6DOF builder needs from the failure model: the vehicle spec
+/// plus a linear tally of nav turns and FTS fragments already in the store.
+#[derive(Debug, Clone, Serialize)]
+pub struct RocketPyBuilder {
+    pub object_id: u64,
+    pub name: String,
+    pub spec: RocketPySpec,
+    pub object_count: usize,
+    pub nav_tracks: usize,
+    pub fts_tracks: usize,
+    pub failure_tracks: usize,
+}
+
+struct TrackSnap {
+    id: u64,
+    name: String,
+    weight: f64,
+    object_id: Option<u64>,
+    failure_mode_id: Option<u64>,
+}
+
+impl TrackSnap {
+    fn from_track(track: &Trajectory) -> Self {
+        Self {
+            id: track.id,
+            name: track.name.clone(),
+            weight: track.weight,
+            object_id: track.object_id,
+            failure_mode_id: track.failure_mode_id,
+        }
+    }
+}
+
+#[derive(Default)]
+struct ModelCache {
+    weights_valid: bool,
+    mode_weight: HashMap<u64, f64>,
+    views: HashMap<u64, ObjectView>,
+    dirty: HashSet<u64>,
+    view_builds: u64,
+}
+
 pub struct Store {
     pub tracks: HashMap<u64, Trajectory>,
     pub objects: HashMap<u64, RiskObject>,
@@ -86,6 +129,7 @@ pub struct Store {
     pub boats: HashMap<u64, Boat>,
     pub catalogs: HashMap<u64, DebrisCatalog>,
     pub wind: WindSpec,
+    cache: RefCell<ModelCache>,
 }
 
 impl Store {
@@ -97,6 +141,7 @@ impl Store {
             boats: HashMap::new(),
             catalogs: default_catalogs(),
             wind: WindSpec::Off,
+            cache: RefCell::new(ModelCache::default()),
         }
     }
 
@@ -107,6 +152,30 @@ impl Store {
         self.boats.clear();
         self.catalogs = default_catalogs();
         self.wind = WindSpec::Off;
+        self.reset_model_cache();
+    }
+
+    fn reset_model_cache(&self) {
+        *self.cache.borrow_mut() = ModelCache::default();
+    }
+
+    fn mark_object(&self, id: u64) {
+        self.cache.borrow_mut().dirty.insert(id);
+    }
+
+    fn mark_weights(&self) {
+        self.cache.borrow_mut().weights_valid = false;
+    }
+
+    fn forget_object(&self, id: u64) {
+        let mut cache = self.cache.borrow_mut();
+        cache.views.remove(&id);
+        cache.dirty.remove(&id);
+    }
+
+    /// How many object views were actually assembled. Cache hits do not count.
+    pub fn view_builds(&self) -> u64 {
+        self.cache.borrow().view_builds
     }
 
     pub fn set_wind(&mut self, wind: WindSpec) {
@@ -338,6 +407,7 @@ impl Store {
             "rocketpy" => "rocketpy".into(),
             _ => "files".into(),
         };
+        self.mark_object(id);
         self.object_view(id).ok_or_else(|| "unknown object".into())
     }
 
@@ -345,6 +415,7 @@ impl Store {
         let obj = self.objects.get_mut(&id).ok_or_else(|| "unknown object".to_string())?;
         obj.source = "generated".into();
         obj.generate = Some(spec.without_wind());
+        self.mark_object(id);
         Ok(())
     }
 
@@ -358,6 +429,7 @@ impl Store {
         let obj = self.objects.get_mut(&id).ok_or_else(|| "unknown object".to_string())?;
         obj.source = "rocketpy".into();
         obj.rocketpy = Some(spec);
+        self.mark_object(id);
         Ok(())
     }
 
@@ -487,6 +559,7 @@ impl Store {
                 if let Some(mode) = self.modes.get_mut(&mid) {
                     mode.probability = 1.0;
                 }
+                self.mark_object(oid);
             } else {
                 self.rebalance_modes(oid, mid, 0.25);
             }
@@ -510,10 +583,23 @@ impl Store {
             .filter(|t| t.object_id == Some(object_id))
             .map(|t| t.id)
             .collect();
-        for id in &ids {
-            self.tracks.remove(id);
-        }
+        self.delete_tracks(&ids);
         ids
+    }
+
+    pub fn delete_tracks(&mut self, ids: &[u64]) {
+        let mut touched = HashSet::new();
+        for id in ids {
+            if let Some(track) = self.tracks.remove(id) {
+                if let Some(object_id) = track.object_id {
+                    touched.insert(object_id);
+                }
+            }
+        }
+        for object_id in touched {
+            self.mark_object(object_id);
+        }
+        self.mark_weights();
     }
 
     pub fn next_track_name(&self, object_id: u64, prefix: &str) -> String {
@@ -550,13 +636,16 @@ impl Store {
     pub fn rename_object(&mut self, id: u64, name: String) -> Result<ObjectView, String> {
         let obj = self.objects.get_mut(&id).ok_or_else(|| "unknown object".to_string())?;
         obj.name = name;
+        self.mark_object(id);
         self.object_view(id).ok_or_else(|| "unknown object".into())
     }
 
     pub fn remove_object(&mut self, id: u64) -> Result<Vec<u64>, String> {
         self.objects.remove(&id).ok_or_else(|| "unknown object".to_string())?;
         self.modes.retain(|_, m| m.object_id != id);
-        Ok(self.remove_object_tracks(id))
+        let removed = self.remove_object_tracks(id);
+        self.forget_object(id);
+        Ok(removed)
     }
 
     pub fn add_mode(&mut self, object_id: u64, name: String, probability: f64) -> Result<u64, String> {
@@ -573,6 +662,7 @@ impl Store {
                 probability: probability.max(0.0),
             },
         );
+        self.mark_object(object_id);
         Ok(id)
     }
 
@@ -591,9 +681,11 @@ impl Store {
         weight: Option<f64>,
     ) -> Result<(), String> {
         let track = self.tracks.get_mut(&id).ok_or_else(|| "unknown track".to_string())?;
+        let mut dirty = false;
         if let Some(name) = name {
             if !name.trim().is_empty() {
                 track.name = name;
+                dirty = true;
             }
         }
         if let Some(color) = color {
@@ -604,8 +696,20 @@ impl Store {
         if let Some(visible) = visible {
             track.visible = visible;
         }
+        let mut weights = false;
         if let Some(weight) = weight {
             track.weight = weight.max(0.0);
+            weights = true;
+            dirty = true;
+        }
+        let object_id = track.object_id;
+        if dirty {
+            if let Some(object_id) = object_id {
+                self.mark_object(object_id);
+            }
+        }
+        if weights {
+            self.mark_weights();
         }
         Ok(())
     }
@@ -623,6 +727,7 @@ impl Store {
             }
             mode.object_id
         };
+        self.mark_object(object_id);
         if let Some(p) = probability {
             self.rebalance_modes(object_id, id, p);
         }
@@ -637,9 +742,8 @@ impl Store {
             .filter(|t| t.failure_mode_id == Some(id))
             .map(|t| t.id)
             .collect();
-        for track_id in ids {
-            self.tracks.remove(&track_id);
-        }
+        self.delete_tracks(&ids);
+        self.mark_object(mode.object_id);
         if let Some(nominal) = self.nominal_mode_id(mode.object_id) {
             if let Some(n) = self.modes.get_mut(&nominal) {
                 n.probability = (n.probability + mode.probability).clamp(0.0, 1.0);
@@ -680,6 +784,7 @@ impl Store {
             if let Some(mode) = self.modes.get_mut(&ids[0]) {
                 mode.probability = 1.0;
             }
+            self.mark_object(object_id);
             return;
         }
         if let Some(mode) = self.modes.get_mut(&edited_id) {
@@ -709,6 +814,7 @@ impl Store {
                 }
             }
         }
+        self.mark_object(object_id);
     }
 
     pub fn ensure_object_mode_sum(&mut self, object_id: u64) {
@@ -720,6 +826,7 @@ impl Store {
             if let Some(mode) = self.modes.get_mut(&ids[0]) {
                 mode.probability = 1.0;
             }
+            self.mark_object(object_id);
             return;
         }
         let sum: f64 = ids
@@ -736,6 +843,7 @@ impl Store {
                     mode.probability /= sum;
                 }
             }
+            self.mark_object(object_id);
             return;
         }
         if let Some(nominal) = self.nominal_mode_id(object_id) {
@@ -751,31 +859,56 @@ impl Store {
                 }
             }
         }
+        self.mark_object(object_id);
     }
 
     pub fn assign_tracks(&mut self, track_ids: &[u64], object_id: u64, failure_mode_id: u64) -> Result<(), String> {
         self.validate_assignment(object_id, failure_mode_id)?;
+        let mut touched = HashSet::new();
+        touched.insert(object_id);
         for id in track_ids {
             if let Some(track) = self.tracks.get_mut(id) {
+                if let Some(prev) = track.object_id {
+                    touched.insert(prev);
+                }
                 track.object_id = Some(object_id);
                 track.failure_mode_id = Some(failure_mode_id);
             }
         }
+        for id in touched {
+            self.mark_object(id);
+        }
+        self.mark_weights();
         Ok(())
     }
 
     pub fn unassign_tracks(&mut self, track_ids: &[u64]) {
+        let mut touched = HashSet::new();
         for id in track_ids {
             if let Some(track) = self.tracks.get_mut(id) {
+                if let Some(prev) = track.object_id {
+                    touched.insert(prev);
+                }
                 track.object_id = None;
                 track.failure_mode_id = None;
             }
         }
+        for id in touched {
+            self.mark_object(id);
+        }
+        self.mark_weights();
     }
 
     pub fn set_track_weight(&mut self, id: u64, weight: f64) -> Result<(), String> {
-        let track = self.tracks.get_mut(&id).ok_or_else(|| "unknown track".to_string())?;
-        track.weight = weight.max(0.0);
+        let object_id = {
+            let track = self.tracks.get_mut(&id).ok_or_else(|| "unknown track".to_string())?;
+            track.weight = weight.max(0.0);
+            track.object_id
+        };
+        if let Some(object_id) = object_id {
+            self.mark_object(object_id);
+        }
+        self.mark_weights();
         Ok(())
     }
 
@@ -788,11 +921,28 @@ impl Store {
     }
 
     pub fn mode_weight_sum(&self, mode_id: u64) -> f64 {
-        self.tracks
-            .values()
-            .filter(|t| t.failure_mode_id == Some(mode_id))
-            .map(|t| t.weight.max(0.0))
-            .sum()
+        self.ensure_weights();
+        self.cache
+            .borrow()
+            .mode_weight
+            .get(&mode_id)
+            .copied()
+            .unwrap_or(0.0)
+    }
+
+    fn ensure_weights(&self) {
+        if self.cache.borrow().weights_valid {
+            return;
+        }
+        let mut mode_weight = HashMap::new();
+        for track in self.tracks.values() {
+            if let Some(mode_id) = track.failure_mode_id {
+                *mode_weight.entry(mode_id).or_insert(0.0) += track.weight.max(0.0);
+            }
+        }
+        let mut cache = self.cache.borrow_mut();
+        cache.mode_weight = mode_weight;
+        cache.weights_valid = true;
     }
 
     pub fn track_probability(&self, track: &Trajectory) -> f64 {
@@ -832,28 +982,129 @@ impl Store {
     }
 
     pub fn object_view(&self, id: u64) -> Option<ObjectView> {
+        if !self.objects.contains_key(&id) {
+            return None;
+        }
+        {
+            let cache = self.cache.borrow();
+            if !cache.dirty.contains(&id) {
+                if let Some(view) = cache.views.get(&id) {
+                    return Some(view.clone());
+                }
+            }
+        }
+        self.rebuild_views(&[id]);
+        self.cache.borrow().views.get(&id).cloned()
+    }
+
+    /// Open the Fly 6DOF builder for one object. Counts nav turns and FTS
+    /// fragments in one pass and does not rebuild unchanged object views.
+    pub fn enter_rocketpy_builder(&self, object_id: u64) -> Result<RocketPyBuilder, String> {
+        let obj = self
+            .objects
+            .get(&object_id)
+            .ok_or_else(|| "unknown object".to_string())?;
+        let spec = obj.rocketpy.clone().unwrap_or_else(RocketPySpec::calisto);
+        spec.validate()?;
+        let mut nav_tracks = 0usize;
+        let mut fts_tracks = 0usize;
+        for track in self.tracks.values() {
+            let Some(sim) = track.simulate.as_ref() else {
+                continue;
+            };
+            if sim.delta_v_ecef.is_some() {
+                fts_tracks += 1;
+            } else if sim.turn.is_some() {
+                nav_tracks += 1;
+            }
+        }
+        Ok(RocketPyBuilder {
+            object_id,
+            name: obj.name.clone(),
+            spec,
+            object_count: self.objects.len(),
+            nav_tracks,
+            fts_tracks,
+            failure_tracks: nav_tracks + fts_tracks,
+        })
+    }
+
+    fn rebuild_views(&self, ids: &[u64]) {
+        if ids.is_empty() {
+            return;
+        }
+        let wanted: HashSet<u64> = ids
+            .iter()
+            .copied()
+            .filter(|id| self.objects.contains_key(id))
+            .collect();
+        let built = {
+            let mut grouped: HashMap<u64, Vec<TrackSnap>> = HashMap::new();
+            for id in &wanted {
+                grouped.insert(*id, Vec::new());
+            }
+            if !wanted.is_empty() {
+                for track in self.tracks.values() {
+                    if let Some(object_id) = track.object_id {
+                        if let Some(bucket) = grouped.get_mut(&object_id) {
+                            bucket.push(TrackSnap::from_track(track));
+                        }
+                    }
+                }
+            }
+            let mut built = Vec::with_capacity(wanted.len());
+            for id in ids {
+                if !wanted.contains(id) {
+                    continue;
+                }
+                let tracks = grouped.remove(id).unwrap_or_default();
+                if let Some(view) = self.assemble_view(*id, tracks) {
+                    built.push(view);
+                }
+            }
+            built
+        };
+        let mut cache = self.cache.borrow_mut();
+        for id in ids {
+            if !wanted.contains(id) {
+                cache.views.remove(id);
+                cache.dirty.remove(id);
+            }
+        }
+        cache.view_builds += built.len() as u64;
+        for view in built {
+            cache.dirty.remove(&view.id);
+            cache.views.insert(view.id, view);
+        }
+    }
+
+    fn assemble_view(&self, id: u64, tracks: Vec<TrackSnap>) -> Option<ObjectView> {
         let obj = self.objects.get(&id)?;
         let mut modes: Vec<&FailureMode> = self.modes.values().filter(|m| m.object_id == id).collect();
         modes.sort_by_key(|m| m.id);
+        let mut by_mode: HashMap<u64, Vec<TrackSnap>> = HashMap::new();
+        for track in tracks {
+            if let Some(mode_id) = track.failure_mode_id {
+                by_mode.entry(mode_id).or_default().push(track);
+            }
+        }
+        for list in by_mode.values_mut() {
+            list.sort_by_key(|t| t.id);
+        }
         let mut mode_views = Vec::new();
         let mut empty_modes = 0usize;
         let mut failure_mode_sum = 0.0;
         let mut trajectory_prob_sum = 0.0;
 
         for mode in modes {
-            let mut tracks: Vec<&Trajectory> = self
-                .tracks
-                .values()
-                .filter(|t| t.failure_mode_id == Some(mode.id))
-                .collect();
-            tracks.sort_by_key(|t| t.id);
-            let wsum = tracks.iter().map(|t| t.weight.max(0.0)).sum::<f64>();
-            if tracks.is_empty() {
+            let mode_tracks = by_mode.remove(&mode.id).unwrap_or_default();
+            let wsum = mode_tracks.iter().map(|t| t.weight.max(0.0)).sum::<f64>();
+            if mode_tracks.is_empty() {
                 empty_modes += 1;
             }
             let mut view_tracks = Vec::new();
             let mut mode_prob_sum = 0.0;
-            for t in tracks {
+            for t in mode_tracks {
                 let p = trajectory_probability(mode.probability, t.weight, wsum);
                 mode_prob_sum += p;
                 view_tracks.push(TrackProb {
@@ -913,7 +1164,27 @@ impl Store {
     }
 
     pub fn risk_model(&self) -> RiskModelView {
-        let mut objects: Vec<ObjectView> = self.objects.keys().filter_map(|id| self.object_view(*id)).collect();
+        let missing: Vec<u64> = {
+            let cache = self.cache.borrow();
+            let mut ids: Vec<u64> = self
+                .objects
+                .keys()
+                .copied()
+                .filter(|id| cache.dirty.contains(id) || !cache.views.contains_key(id))
+                .collect();
+            ids.sort_unstable();
+            ids
+        };
+        if !missing.is_empty() {
+            self.rebuild_views(&missing);
+        }
+        let mut objects: Vec<ObjectView> = {
+            let cache = self.cache.borrow();
+            self.objects
+                .keys()
+                .filter_map(|id| cache.views.get(id).cloned())
+                .collect()
+        };
         objects.sort_by_key(|o| o.id);
         let mut unassigned: Vec<TrackProb> = self
             .tracks
@@ -1413,5 +1684,153 @@ mod tests {
 
         let parent = dummy_track(vec![-86.0, 30.0, 1000.0], None);
         assert_eq!(fts_fire_lla(&parent), (None, None));
+    }
+
+    #[test]
+    fn six_dof_builder_finishes_with_nav_and_fts() {
+        use std::time::{Duration, Instant};
+
+        use crate::parse::ParsedTrack;
+        use crate::schema::DetectedSchema;
+        use crate::simulate::{
+            build_fts_debris, build_nav_failure, sample_track_state, BuiltTrack, DebrisCatalog,
+            DebrisPiece, NavFailSpec, SimulateOrigin, TurnSide,
+        };
+
+        let mut store = Store::new();
+        let vehicle = store.create_object("Vehicle".into());
+        store.ensure_named_mode(vehicle.id, "Nominal").unwrap();
+        let failed = store.create_object("With failures".into());
+        let mode = store.ensure_named_mode(failed.id, "Nav + FTS").unwrap();
+
+        let mut lla = Vec::new();
+        let mut times = Vec::new();
+        for i in 0..11 {
+            let t = i as f64;
+            times.push(t);
+            lla.push((-106.4 + t * 0.01) as f32);
+            lla.push(32.4);
+            lla.push((80_000.0 - t * 1_000.0) as f32);
+        }
+        let sample = sample_track_state(1, &lla, Some(&times), 1.0).unwrap();
+        let nav_cat = DebrisCatalog {
+            id: 9,
+            name: "tiny".into(),
+            pieces: vec![DebrisPiece {
+                name: "Tank".into(),
+                ballistic_coeff: 400.0,
+                delta_v_mps: 30.0,
+                count: 1,
+            }],
+        };
+        let nav_spec = NavFailSpec {
+            source_track_id: 1,
+            times_s: vec![1.0],
+            catalog_id: 9,
+            object_id: Some(failed.id),
+            object_name: None,
+            mode_name: "Nav + FTS".into(),
+            max_g: 5.0,
+            turn_duration_s: 5.0,
+            turn_side: TurnSide::Both,
+            sustain_speed: true,
+            seed: 1,
+        };
+        let nav = build_nav_failure(&sample, &nav_spec, &nav_cat, &WindSpec::Off, 0.0).unwrap();
+        let nav_turns = nav
+            .iter()
+            .filter(|t| t.origin.turn.is_some() && t.origin.delta_v_ecef.is_none())
+            .count();
+        let nav_debris = nav.iter().filter(|t| t.origin.delta_v_ecef.is_some()).count();
+        let fts_cat = DebrisCatalog {
+            id: 9,
+            name: "tiny fts".into(),
+            pieces: vec![
+                DebrisPiece {
+                    name: "Tank".into(),
+                    ballistic_coeff: 400.0,
+                    delta_v_mps: 50.0,
+                    count: 2,
+                },
+                DebrisPiece {
+                    name: "Skin".into(),
+                    ballistic_coeff: 40.0,
+                    delta_v_mps: 80.0,
+                    count: 3,
+                },
+            ],
+        };
+        let fts = build_fts_debris(&sample, &fts_cat, 1, &WindSpec::Off, "", 0.0).unwrap();
+        let fts_n = fts.len();
+        store.insert_built_tracks(failed.id, mode, nav).unwrap();
+        store.insert_built_tracks(failed.id, mode, fts).unwrap();
+
+        let extra = 400usize;
+        let synthetic: Vec<BuiltTrack> = (0..extra)
+            .map(|i| BuiltTrack {
+                name: format!("frag-{i}"),
+                parsed: ParsedTrack {
+                    schema: DetectedSchema::generated(),
+                    times: Some(vec![0.0, 1.0]),
+                    lla: vec![-106.0, 32.0, 1000.0, -106.0, 32.0, 0.0],
+                },
+                origin: SimulateOrigin {
+                    r_ecef: [0.0, 0.0, 0.0],
+                    v_ecef: [0.0, 0.0, 0.0],
+                    ballistic_coeff: 20.0,
+                    time_offset: 0.0,
+                    turn: None,
+                    source_track_id: None,
+                    source_time_s: None,
+                    delta_v_ecef: Some([1.0, 0.0, 0.0]),
+                    ground_alt_m: 0.0,
+                },
+                weight: 1.0,
+            })
+            .collect();
+        store.insert_built_tracks(failed.id, mode, synthetic).unwrap();
+
+        let model = store.risk_model();
+        assert_eq!(model.objects.len(), 2);
+        let failed_view = model.objects.iter().find(|o| o.id == failed.id).unwrap();
+        assert!(
+            (failed_view.trajectory_prob_sum - 1.0).abs() < 1e-6,
+            "trajectory probabilities {}",
+            failed_view.trajectory_prob_sum
+        );
+        let track_n: usize = failed_view.modes.iter().map(|m| m.track_count).sum();
+        assert_eq!(track_n, nav_turns + nav_debris + fts_n + extra);
+        let builds = store.view_builds();
+
+        let started = Instant::now();
+        let entered = store.enter_rocketpy_builder(vehicle.id).unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "6DOF builder entry took {:?}",
+            started.elapsed()
+        );
+        assert_eq!(entered.object_count, 2);
+        assert_eq!(entered.name, "Vehicle");
+        assert_eq!(entered.nav_tracks, nav_turns);
+        assert!(entered.nav_tracks >= 1);
+        assert_eq!(entered.fts_tracks, nav_debris + fts_n + extra);
+        assert_eq!(entered.failure_tracks, entered.nav_tracks + entered.fts_tracks);
+        entered.spec.validate().unwrap();
+        assert_eq!(store.view_builds(), builds, "opening the builder rebuilt object views");
+
+        let again = store.enter_rocketpy_builder(vehicle.id).unwrap();
+        assert_eq!(again.nav_tracks, entered.nav_tracks);
+        assert_eq!(again.fts_tracks, entered.fts_tracks);
+        assert_eq!(store.view_builds(), builds);
+
+        store.create_object("Another".into());
+        let after_create = store.view_builds();
+        assert_eq!(after_create, builds + 1);
+        let _ = store.risk_model();
+        assert_eq!(
+            store.view_builds(),
+            after_create,
+            "unchanged nav/FTS object was rebuilt"
+        );
     }
 }
