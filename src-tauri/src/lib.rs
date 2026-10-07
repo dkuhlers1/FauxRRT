@@ -686,6 +686,10 @@ fn generate_trajectories(
             source: source.clone(),
         });
     }
+    if let WindSpec::Surface { .. } = &spec.wind {
+        let mut store = state.store.lock().map_err(|e| e.to_string())?;
+        store.set_wind(spec.wind.clone());
+    }
     let parsed = generate_track(&spec)?;
     let tracks = {
         let mut store = state.store.lock().map_err(|e| e.to_string())?;
@@ -1663,6 +1667,9 @@ fn regenerate_generated_with_wind(
                 source: source.clone(),
             };
         }
+        if let WindSpec::Surface { .. } = &spec.wind {
+            resolved_wind = spec.wind.clone();
+        }
         prepared.push((*id, spec));
     }
     let parsed = prepared
@@ -1704,6 +1711,21 @@ fn resolve_wind_for_simulate(
     wind: &WindSpec,
     jobs: &[(u64, simulate::SimulateOrigin)],
 ) -> Result<WindSpec, String> {
+    if matches!(wind, WindSpec::Surface { .. }) {
+        return Ok(resolve_winds(GenerateSpec {
+            launch_lat: 0.0,
+            launch_lon: 0.0,
+            launch_alt_m: 0.0,
+            aim_lat: 0.0,
+            aim_lon: 1.0,
+            aim_alt_m: 0.0,
+            ballistic_coeff: 1000.0,
+            burnout_alt_m: 80_000.0,
+            failure_count: 0,
+            wind: wind.clone(),
+        })?
+        .wind);
+    }
     if jobs.is_empty() || !matches!(wind, WindSpec::Historical { .. }) {
         return Ok(wind.without_site_profiles());
     }
@@ -1736,6 +1758,7 @@ fn wind_resolve_key(spec: &GenerateSpec) -> String {
             "h:{date}:{hour_utc}:{:.5}:{:.5}:{:.5}:{:.5}",
             spec.launch_lat, spec.launch_lon, spec.aim_lat, spec.aim_lon
         ),
+        WindSpec::Surface { .. } => "gfs-surface".into(),
     }
 }
 

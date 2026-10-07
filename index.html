@@ -55,6 +55,7 @@
               <button type="button" data-wind="off" class="compact">Off</button>
               <button type="button" data-wind="constant" class="ghost compact">Constant</button>
               <button type="button" data-wind="historical" class="ghost compact">Historical</button>
+              <button type="button" data-wind="surface" class="ghost compact" title="Current GFS 10 m wind, the same field as the globe Surface wind layer">Surface</button>
             </div>
             <div id="wind-fields"></div>
           </div>
@@ -114,6 +115,11 @@
             <label class="inline muted"><input type="checkbox" id="show-impacts" checked /> Impacts</label>
             <label class="inline muted"><input type="checkbox" id="show-kde" checked /> KDE</label>
             <label class="inline muted"><input type="checkbox" id="show-boats" checked /> Boats</label>
+            <label class="inline muted" title="Animated GFS 10 m surface wind. Uncheck to remove it."><input type="checkbox" id="show-surface-wind" /> Surface wind</label>
+            <label class="inline muted" title="Opacity of the surface wind streaks. Lower values keep the map, trajectories, and impacts visible.">
+              α <input type="range" id="surface-wind-alpha" min="0.05" max="1" step="0.05" value="0.4" aria-label="Surface wind opacity" />
+              <span id="surface-wind-alpha-readout">40%</span>
+            </label>
             <label class="inline muted" title="Convex hull on the ellipsoid around impact points"><input type="checkbox" id="show-iip-boundary" /> IIP boundary</label>
             <label class="inline muted" title="Convex hull on the ellipsoid around nav-failure FTS fire positions"><input type="checkbox" id="show-terminate-boundary" /> Terminate boundary</label>
             <select id="imagery-kind" title="Basemap">

@@ -109,7 +109,49 @@ body {
   text-transform: none;
 }
 
-#globe { flex: 1; min-height: 0; }
+#globe { flex: 1; min-height: 0; position: relative; }
+
+.surface-wind-canvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+  z-index: 1;
+}
+.wind-legend {
+  position: absolute;
+  top: 10px;
+  left: 10px;
+  z-index: 2;
+  pointer-events: none;
+  width: 196px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  background: rgba(12, 16, 22, 0.86);
+  box-shadow: var(--shadow);
+}
+.wind-legend-title {
+  font-size: 12px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+.wind-legend-meta, .wind-legend-scale {
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 10px;
+  letter-spacing: 0.01em;
+}
+.wind-legend-bar {
+  margin-top: 6px;
+  height: 8px;
+  border-radius: 99px;
+}
+.wind-legend-scale {
+  display: flex;
+  justify-content: space-between;
+}
 
 .brand { display: flex; gap: 12px; align-items: center; flex-shrink: 0; }
 .mark {
@@ -446,7 +488,8 @@ input[type="number"], input[type="text"] {
 .gen-grid input { width: 100%; }
 .gen-sites { display: flex; flex-direction: column; gap: 4px; }
 .gen-sites button { text-align: left; }
-.wind-toggle { grid-template-columns: 1fr 1fr 1fr; }
+.wind-toggle { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+#surface-wind-alpha { width: 72px; accent-color: var(--accent); }
 .wind-hint { font-size: 11px; line-height: 1.35; }
 .gen-grid select { width: 100%; }
 
