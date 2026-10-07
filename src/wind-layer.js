@@ -93,22 +93,20 @@ function startLayer(viewer, field, gen) {
   if (!project) throw new Error("Cesium cannot project wind particles");
 
   const hostCanvas = viewer.scene.canvas;
-  const parent = hostCanvas.parentElement || viewer.container;
+  // A 2D canvas inside .cesium-widget is covered by the WebGL canvas, so the
+  // streaks never reach the screen. The legend is a normal element and still
+  // shows. Host the overlay on the globe panel, aligned to the Cesium canvas.
+  const parent = hostCanvas.closest("#globe") || viewer.container || hostCanvas.parentElement;
   if (getComputedStyle(parent).position === "static") parent.style.position = "relative";
   canvas = document.createElement("canvas");
   canvas.className = "surface-wind-canvas";
   canvas.dataset.windLayer = "on";
   canvas.setAttribute("aria-hidden", "true");
-  canvas.style.position = "absolute";
-  canvas.style.inset = "0";
-  canvas.style.width = "100%";
-  canvas.style.height = "100%";
-  canvas.style.pointerEvents = "none";
-  canvas.style.zIndex = "1";
   canvas.style.opacity = String(layerAlpha);
   parent.appendChild(canvas);
   legend = buildLegend(field);
   parent.appendChild(legend);
+  placeOverlay(canvas, legend, hostCanvas, parent);
 
   const ctx = canvas.getContext("2d", { alpha: true });
   const lat = new Float32Array(MAX_WIND_PARTICLES);
@@ -146,6 +144,7 @@ function startLayer(viewer, field, gen) {
   const frame = (now) => {
     if (!running || gen !== generation) return;
     const host = viewer.scene.canvas;
+    placeOverlay(canvas, legend, host, parent);
     const cssW = host.clientWidth || parent.clientWidth;
     const cssH = host.clientHeight || parent.clientHeight;
     if (cssW < 2 || cssH < 2) {
@@ -201,22 +200,25 @@ function startLayer(viewer, field, gen) {
       buckets[bin].push(headXy.x, headXy.y, tailXy.x, tailXy.y);
     }
 
-    ctx.lineWidth = 1.35;
     ctx.lineCap = "round";
     ctx.globalAlpha = 1;
     for (let b = 0; b < buckets.length; b++) {
       const bucket = buckets[b];
       if (!bucket.length) continue;
-      ctx.strokeStyle = binColors[b];
-      ctx.fillStyle = binColors[b];
       ctx.beginPath();
       for (let k = 0; k < bucket.length; k += 4) {
         ctx.moveTo(bucket[k + 2], bucket[k + 3]);
         ctx.lineTo(bucket[k], bucket[k + 1]);
       }
+      ctx.strokeStyle = "rgba(8, 12, 18, 0.72)";
+      ctx.lineWidth = 3.4;
       ctx.stroke();
+      ctx.strokeStyle = binColors[b];
+      ctx.lineWidth = 1.9;
+      ctx.stroke();
+      ctx.fillStyle = binColors[b];
       for (let k = 0; k < bucket.length; k += 4) {
-        ctx.fillRect(bucket[k] - 1.15, bucket[k + 1] - 1.15, 2.3, 2.3);
+        ctx.fillRect(bucket[k] - 1.5, bucket[k + 1] - 1.5, 3, 3);
       }
     }
 
@@ -233,6 +235,19 @@ function startLayer(viewer, field, gen) {
   }
   viewer.scene.requestRender();
   raf = requestAnimationFrame(frame);
+}
+
+function placeOverlay(overlay, legendEl, host, parent) {
+  const parentRect = parent.getBoundingClientRect();
+  const hostRect = host.getBoundingClientRect();
+  overlay.style.left = `${hostRect.left - parentRect.left}px`;
+  overlay.style.top = `${hostRect.top - parentRect.top}px`;
+  overlay.style.width = `${hostRect.width}px`;
+  overlay.style.height = `${hostRect.height}px`;
+  if (legendEl) {
+    legendEl.style.left = `${hostRect.left - parentRect.left + 10}px`;
+    legendEl.style.top = `${hostRect.top - parentRect.top + 10}px`;
+  }
 }
 
 function streakSeconds(speed, mpp) {
