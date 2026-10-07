@@ -113,17 +113,12 @@ body {
 
 .surface-wind-canvas {
   position: absolute;
-  inset: 0;
-  width: 100%;
-  height: 100%;
   pointer-events: none;
-  z-index: 1;
+  z-index: 5;
 }
 .wind-legend {
   position: absolute;
-  top: 10px;
-  left: 10px;
-  z-index: 2;
+  z-index: 6;
   pointer-events: none;
   width: 196px;
   padding: 8px 10px;
