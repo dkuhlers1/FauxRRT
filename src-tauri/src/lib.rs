@@ -725,14 +725,22 @@ struct RocketPyLoad {
 }
 
 #[tauri::command]
-fn rocketpy_status() -> RocketPyStatus {
-    check_rocketpy()
+async fn rocketpy_status() -> RocketPyStatus {
+    match tauri::async_runtime::spawn_blocking(check_rocketpy).await {
+        Ok(status) => status,
+        Err(err) => RocketPyStatus {
+            available: false,
+            version: None,
+            python: None,
+            error: Some(format!("6DOF status failed: {err}")),
+        },
+    }
 }
 
 #[tauri::command]
-fn generate_rocketpy(
+async fn generate_rocketpy(
     app: AppHandle,
-    state: State<AppState>,
+    state: State<'_, AppState>,
     object_id: u64,
     spec: RocketPySpec,
     mode_name: Option<String>,
@@ -743,7 +751,10 @@ fn generate_rocketpy(
         let store = state.store.lock().map_err(|e| e.to_string())?;
         store.wind.without_site_profiles()
     };
-    let flown = fly_rocketpy(&spec.clone().with_mission_wind(&wind))?;
+    let spec_for_fly = spec.clone().with_mission_wind(&wind);
+    let flown = tauri::async_runtime::spawn_blocking(move || fly_rocketpy(&spec_for_fly))
+        .await
+        .map_err(|err| format!("6DOF task failed: {err}"))??;
     let tracks = {
         let mut store = state.store.lock().map_err(|e| e.to_string())?;
         store.set_rocketpy_spec(object_id, spec.clone())?;
@@ -1073,9 +1084,7 @@ fn remove_track(app: AppHandle, state: State<AppState>, id: u64) -> Result<(), S
 fn remove_tracks(app: AppHandle, state: State<AppState>, ids: Vec<u64>) -> Result<(), String> {
     {
         let mut store = state.store.lock().map_err(|e| e.to_string())?;
-        for id in ids {
-            store.tracks.remove(&id);
-        }
+        store.delete_tracks(&ids);
     }
     after_store_change(&app, &state);
     Ok(())
