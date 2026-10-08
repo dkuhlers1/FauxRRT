@@ -44,23 +44,12 @@
           <div><span>Load</span><strong id="stat-time">—</strong></div>
         </section>
 
-        <div class="sidebar-scroll" id="sidebar-scroll">
-        <section class="wind-bar" id="wind-panel">
-          <button type="button" class="section-head" id="toggle-wind" aria-expanded="true">
-            <span class="muted method-label">Mission wind</span>
-            <span class="chevron" aria-hidden="true">▾</span>
-          </button>
-          <div class="section-body">
-            <div class="method-toggle wind-toggle" role="group" aria-label="Mission wind">
-              <button type="button" data-wind="off" class="compact">Off</button>
-              <button type="button" data-wind="constant" class="ghost compact">Constant</button>
-              <button type="button" data-wind="historical" class="ghost compact">Historical</button>
-              <button type="button" data-wind="surface" class="ghost compact" title="Current GFS 10 m wind, the same field as the globe Surface wind layer">Surface</button>
-            </div>
-            <div id="wind-fields"></div>
-          </div>
-        </section>
+        <div class="tool-row">
+          <button type="button" id="btn-open-trajectories" class="ghost compact">Trajectories</button>
+          <button type="button" id="btn-open-environment" class="ghost compact">Environment</button>
+        </div>
 
+        <div class="sidebar-scroll" id="sidebar-scroll">
         <section class="panel boats-panel" id="boats-panel">
           <div class="panel-head">
             <button type="button" class="section-head" id="toggle-boats" aria-expanded="true">
@@ -94,9 +83,9 @@
           </div>
           <div class="risk-body">
           <p class="muted risk-hint">
-            Add an object, name a mode, then put trajectories in that mode:
-            load CSVs, generate a flight, or branch from a state on an existing trajectory.
+            Objects hold failure modes and the trajectories already in those modes.
             Modes on an object are exclusive and must sum to 1. Separate objects count together.
+            Open Trajectories to load or create flights.
           </p>
           <div id="kde-status" class="muted"></div>
           <div id="object-list" class="object-list"></div>
@@ -115,11 +104,6 @@
             <label class="inline muted"><input type="checkbox" id="show-impacts" checked /> Impacts</label>
             <label class="inline muted"><input type="checkbox" id="show-kde" checked /> KDE</label>
             <label class="inline muted"><input type="checkbox" id="show-boats" checked /> Boats</label>
-            <label class="inline muted" title="Animated GFS 10 m surface wind. Uncheck to remove it."><input type="checkbox" id="show-surface-wind" /> Surface wind</label>
-            <label class="inline muted" title="Opacity of the surface wind streaks. Lower values keep the map, trajectories, and impacts visible.">
-              α <input type="range" id="surface-wind-alpha" min="0.05" max="1" step="0.05" value="0.4" aria-label="Surface wind opacity" />
-              <span id="surface-wind-alpha-readout">40%</span>
-            </label>
             <label class="inline muted" title="Convex hull on the ellipsoid around impact points"><input type="checkbox" id="show-iip-boundary" /> IIP boundary</label>
             <label class="inline muted" title="Convex hull on the ellipsoid around nav-failure FTS fire positions"><input type="checkbox" id="show-terminate-boundary" /> Terminate boundary</label>
             <select id="imagery-kind" title="Basemap">
@@ -131,6 +115,52 @@
           </div>
         </header>
         <div id="globe"></div>
+        <aside id="side-drawer" class="side-drawer" hidden>
+          <header class="drawer-head">
+            <h2 id="drawer-title">Trajectories</h2>
+            <button type="button" id="drawer-close" class="ghost compact" title="Close">✕</button>
+          </header>
+          <div id="drawer-trajectories" class="drawer-scroll"></div>
+          <div id="drawer-environment" class="drawer-scroll" hidden>
+            <section class="wind-bar" id="wind-panel">
+              <div class="muted method-label">Mission wind</div>
+              <div class="method-toggle wind-toggle" role="group" aria-label="Mission wind">
+                <button type="button" data-wind="off" class="compact">Off</button>
+                <button type="button" data-wind="constant" class="ghost compact">Constant</button>
+                <button type="button" data-wind="historical" class="ghost compact">Historical</button>
+                <button type="button" data-wind="surface" class="ghost compact" title="Current GFS 10 m wind, the same field as the globe Surface wind layer">Surface</button>
+              </div>
+              <div id="wind-fields"></div>
+            </section>
+            <section class="env-block" id="surface-wind-block">
+              <div class="muted method-label">Surface wind map</div>
+              <label class="inline" title="Animated GFS 10 m surface wind. Uncheck to remove it.">
+                <input type="checkbox" id="show-surface-wind" /> Show GFS 10 m layer
+              </label>
+              <label class="inline" title="Opacity of the surface wind streaks. Lower values keep the map, trajectories, and impacts visible.">
+                Opacity
+                <input type="range" id="surface-wind-alpha" min="0.05" max="1" step="0.05" value="0.4" aria-label="Surface wind opacity" />
+                <span id="surface-wind-alpha-readout">40%</span>
+              </label>
+              <p class="muted wind-hint">Same 10°×15° GFS 10 m field as mission wind Surface. The layer draws it on the map; Surface mission wind samples it along trajectories.</p>
+            </section>
+            <section class="env-block" id="dof6-env">
+              <div class="muted method-label">6DOF atmosphere</div>
+              <p class="muted wind-hint">Atmosphere model and wind for 6DOF flights. Launch latitude, longitude, and elevation stay in the 6DOF builder. 3DOF flights use mission wind and a US-1976 atmosphere.</p>
+              <div class="gen-grid">
+                <label>Atmosphere
+                  <select id="dof6-atmosphere" aria-label="6DOF atmosphere model">
+                    <option value="standard_atmosphere">Standard</option>
+                    <option value="isa">ISA</option>
+                  </select>
+                </label>
+                <label>Wind m/s <input id="dof6-wind-speed" type="number" min="0" step="0.5" value="0" aria-label="6DOF wind speed" /></label>
+                <label title="Meteorological direction the wind is coming from">Wind from ° <input id="dof6-wind-from" type="number" min="0" max="360" step="1" value="270" aria-label="6DOF wind direction" /></label>
+              </div>
+              <div class="muted wind-hint" id="dof6-env-target"></div>
+            </section>
+          </div>
+        </aside>
         <aside id="rocketpy-overlay" class="rp-overlay" hidden></aside>
         <div id="boat-tooltip" class="boat-tooltip hidden"></div>
       </main>

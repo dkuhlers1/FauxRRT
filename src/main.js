@@ -66,7 +66,18 @@ const objectLoadName = new Map();
 /** @type {number | null | undefined} undefined = expand first object */
 let expandedObjectId = undefined;
 let pendingExpandLast = false;
-const sectionCollapsed = { wind: false, boats: false };
+const sectionCollapsed = { boats: false };
+/** @type {null | "trajectories" | "environment"} */
+let drawerView = null;
+/** @type {null | "files" | "generate" | "from-state"} */
+let drawerLoadMethod = null;
+/** @type {number | null} */
+let trajObjectId = null;
+const sixDofEnv = {
+  atmosphere: "standard_atmosphere",
+  wind_speed_mps: 0,
+  wind_from_deg: 270,
+};
 let catalogs = [];
 const simDraft = {
   destObjectId: null,
@@ -190,10 +201,17 @@ els.missionName?.addEventListener("change", async () => {
 setupSplitter();
 bindWindPanel();
 bindSectionToggles();
+bindDrawer();
+bindDof6Env();
 bindSimActions();
 bindBoatListHover();
 document.addEventListener("keydown", (ev) => {
-  if (ev.key === "Escape" && rocketpyOpenId != null) closeRocketPyBuilder();
+  if (ev.key !== "Escape") return;
+  if (rocketpyOpenId != null) {
+    closeRocketPyBuilder();
+    return;
+  }
+  if (drawerView) closeDrawer();
 });
 try {
   await createGlobe(document.getElementById("globe"));
@@ -278,7 +296,7 @@ function setBusy(busy) {
   els.objectList?.querySelectorAll("button").forEach((btn) => {
     btn.disabled = busy;
   });
-  document.querySelectorAll(".method-choice [data-act], .method-choice button").forEach((btn) => {
+  document.querySelectorAll("#drawer-trajectories button").forEach((btn) => {
     btn.disabled = busy;
   });
   els.rocketpyOverlay?.querySelectorAll("button").forEach((btn) => {
@@ -294,6 +312,8 @@ function render() {
   try {
     renderRisk();
     renderBoats();
+    if (drawerView === "trajectories") renderTrajectoryDrawer();
+    syncDof6EnvFields();
   } catch (err) {
     console.error(err);
     if (els.progress) els.progress.textContent = String(err);
@@ -740,7 +760,7 @@ function objectCardSummary(obj) {
 }
 
 function bindSimActions() {
-  const host = els.objectList;
+  const host = document.getElementById("drawer-trajectories");
   if (!host || host.dataset.boundSim) return;
   host.dataset.boundSim = "1";
   host.addEventListener("click", (ev) => {
@@ -798,10 +818,6 @@ async function addNavTime() {
 }
 
 function bindSectionToggles() {
-  document.getElementById("toggle-wind")?.addEventListener("click", () => {
-    sectionCollapsed.wind = !sectionCollapsed.wind;
-    applySectionCollapsed();
-  });
   document.getElementById("toggle-boats")?.addEventListener("click", () => {
     sectionCollapsed.boats = !sectionCollapsed.boats;
     applySectionCollapsed();
@@ -810,13 +826,9 @@ function bindSectionToggles() {
 }
 
 function applySectionCollapsed() {
-  const wind = document.getElementById("wind-panel");
   const boats = document.getElementById("boats-panel");
-  const tw = document.getElementById("toggle-wind");
   const tb = document.getElementById("toggle-boats");
-  wind?.classList.toggle("collapsed", sectionCollapsed.wind);
   boats?.classList.toggle("collapsed", sectionCollapsed.boats);
-  tw?.setAttribute("aria-expanded", String(!sectionCollapsed.wind));
   tb?.setAttribute("aria-expanded", String(!sectionCollapsed.boats));
 }
 
@@ -1003,7 +1015,7 @@ function renderRisk() {
       )
       .join("");
     els.objectList.innerHTML = `
-      <div class="empty">Add an object, name a mode, then add trajectories: load CSVs, generate a flight, or branch from an existing state.</div>
+      <div class="empty">Add an object, then open Trajectories to load CSVs, generate a flight, or branch from an existing state.</div>
       ${recent ? `<div class="recent-missions"><div class="muted">Recent missions</div>${recent}</div>` : ""}`;
     els.objectList.querySelectorAll("[data-recent-path]").forEach((btn) => {
       btn.addEventListener("click", () => openRecent(btn.dataset.recentPath));
@@ -1028,46 +1040,23 @@ function renderRisk() {
         ${obj.valid ? "✓" : obj.modes.length ? "— need 1" : "— add a mode and trajectories"}
         ${obj.issues.length ? `<br>${escapeHtml(obj.issues.join(" · "))}` : ""}
       </div>
-      <div class="method-choice"></div>
       <div class="modes"></div>
       </div>` : ""}`;
     if (expanded) {
-    fillMethodChoice(card.querySelector(".method-choice"), obj);
-    const loadMode = loadModeFor(obj);
-    const method = methodFor(obj);
     const modesEl = card.querySelector(".modes");
     if (!obj.modes.length) {
-      modesEl.innerHTML = `<div class="empty">No modes yet. Name a mode above and add trajectories with Load, Generate, or From state.</div>`;
+      modesEl.innerHTML = `<div class="empty">No modes yet. Name a mode in Trajectories, then load or generate flights.</div>`;
     }
     for (const mode of obj.modes) {
       const block = document.createElement("div");
-      const isLoadTarget = method === "files" && loadMode?.id === mode.id;
-      const isGenTarget = method === "generate" && loadMode?.id === mode.id;
-      const isSimTarget = method === "from-state" && loadMode?.id === mode.id;
-      const isTarget = isLoadTarget || isGenTarget || isSimTarget;
-      const destBadge = isLoadTarget
-        ? '<span class="badge dest-badge">Load target</span>'
-        : isGenTarget
-          ? '<span class="badge dest-badge">Generate target</span>'
-          : isSimTarget
-            ? '<span class="badge dest-badge">From-state target</span>'
-            : "";
-      const destNote = isLoadTarget
-        ? " · loaded files go here"
-        : isGenTarget
-          ? " · generate adds 1 traj here"
-          : isSimTarget
-            ? " · branched traj go here"
-            : "";
-      block.className = `mode${isTarget ? " mode-target" : ""}`;
+      block.className = "mode";
       block.innerHTML = `
         <div class="mode-head">
           <input type="text" data-role="mode-name" value="${escapeHtml(mode.name)}" />
           <input type="number" data-role="mode-p" min="0" max="1" step="0.001" value="${mode.probability}" title="Mode probability" />
-          ${destBadge}
           <button data-act="del-mode" class="ghost compact">✕</button>
         </div>
-        <div class="muted">${mode.track_count} exclusive traj · Σ p = ${formatProb(mode.trajectory_prob_sum)}${destNote}</div>
+        <div class="muted">${mode.track_count} exclusive traj · Σ p = ${formatProb(mode.trajectory_prob_sum)}</div>
         <div class="mode-tracks"></div>`;
       const list = block.querySelector(".mode-tracks");
       list.appendChild(trackGroup(mode.tracks, `${mode.track_count} exclusive traj`));
@@ -1093,6 +1082,7 @@ function renderRisk() {
       rocketpyDrafts.delete(obj.id);
       objectMethod.delete(obj.id);
       objectLoadName.delete(obj.id);
+      if (trajObjectId === obj.id) trajObjectId = null;
       if (rocketpyOpenId === obj.id) closeRocketPyBuilder({ render: false });
     });
     card.querySelector('[data-act="toggle-card"]').addEventListener("click", (ev) => {
@@ -1430,7 +1420,13 @@ function mergeRocketPySpec(saved) {
 
 function rocketpyDraftFor(obj) {
   if (!rocketpyDrafts.has(obj.id)) {
-    rocketpyDrafts.set(obj.id, mergeRocketPySpec(obj.rocketpy));
+    const draft = mergeRocketPySpec(obj.rocketpy);
+    if (!obj.rocketpy) {
+      draft.env.atmosphere = sixDofEnv.atmosphere;
+      draft.env.wind_speed_mps = sixDofEnv.wind_speed_mps;
+      draft.env.wind_from_deg = sixDofEnv.wind_from_deg;
+    }
+    rocketpyDrafts.set(obj.id, draft);
   }
   return rocketpyDrafts.get(obj.id);
 }
@@ -1537,14 +1533,11 @@ function rocketpyTabHtml(tab) {
       </div>`;
   }
   return `
-    <div class="rp-note">Launch site for the 6DOF environment. Atmosphere is US Standard unless you add wind.</div>
+    <div class="rp-note">Launch site for the 6DOF flight. Atmosphere model and wind are in Environment, with mission wind.</div>
     <div class="rp-grid">
       ${rpField("env.latitude", "Latitude", { min: -90, max: 90, step: 0.0001 })}
       ${rpField("env.longitude", "Longitude", { min: -180, max: 180, step: 0.0001 })}
       ${rpField("env.elevation_m", "Elevation m", { step: 1 })}
-      ${rpField("env.atmosphere", "Atmosphere", { select: [["standard_atmosphere", "Standard"], ["isa", "ISA"]] })}
-      ${rpField("env.wind_speed_mps", "Wind m/s", { min: 0, step: 0.5 })}
-      ${rpField("env.wind_from_deg", "Wind from °", { min: 0, max: 360, step: 1 })}
     </div>
     <button type="button" data-act="rp-pick-launch" class="ghost compact">Pick launch on globe · ${fmtSite(rocketpyDrafts.get(rocketpyOpenId)?.env?.latitude, rocketpyDrafts.get(rocketpyOpenId)?.env?.longitude)}</button>`;
 }
@@ -1667,6 +1660,7 @@ function openRocketPyBuilder(objectId) {
   const obj = riskModel.objects.find((o) => o.id === objectId);
   if (!obj) return;
   generateEngine.set(objectId, "rocketpy");
+  drawerLoadMethod = "generate";
   objectMethod.set(objectId, "generate");
   rocketpyDraftFor(obj);
   rocketpyOpenId = objectId;
@@ -1693,13 +1687,14 @@ function closeRocketPyBuilder(opts = {}) {
 }
 
 function requireModeNameFor(objectId) {
-  const card = document.querySelector(`[data-object-id="${objectId}"]`);
-  const modeName = fieldText(card?.querySelector("[data-role='load-mode-name']"))
+  const host = trajHost();
+  const modeName = fieldText(host?.querySelector("[data-role='load-mode-name']"))
     || objectLoadName.get(objectId)
     || "";
   if (!modeName) {
     els.progress.textContent = "Enter a mode name, then fly 6DOF.";
-    card?.querySelector("[data-role='load-mode-name']")?.focus();
+    openDrawer("trajectories");
+    trajHost()?.querySelector("[data-role='load-mode-name']")?.focus();
     return "";
   }
   objectLoadName.set(objectId, modeName);
@@ -1766,7 +1761,7 @@ function missionWindSummary() {
     const when = missionWind.time ? ` ${String(missionWind.time).replace("T", " ")} UTC` : "";
     return `Uses mission wind: GFS 10 m surface field${when}.`;
   }
-  return "Uses mission wind: off (set above).";
+  return "Uses mission wind: off (set in Environment).";
 }
 
 function applyMissionWind(wind) {
@@ -1892,14 +1887,6 @@ function fmtSite(lat, lon) {
   return `${Number(lat).toFixed(3)}°, ${Number(lon).toFixed(3)}°`;
 }
 
-function methodFor(obj) {
-  if (objectMethod.has(obj.id)) return objectMethod.get(obj.id);
-  if (obj.source === "generated" || obj.generate) return "generate";
-  if (obj.source === "rocketpy" || obj.rocketpy) return "generate";
-  if ((obj.modes || []).some((mode) => mode.track_count > 0)) return "files";
-  return null;
-}
-
 function engineFor(obj) {
   if (generateEngine.has(obj.id)) return generateEngine.get(obj.id);
   if (obj.source === "rocketpy" || obj.rocketpy) return "rocketpy";
@@ -1907,6 +1894,7 @@ function engineFor(obj) {
 }
 
 function setObjectMethod(objectId, method) {
+  drawerLoadMethod = method;
   objectMethod.set(objectId, method);
   if (method !== "generate") {
     cancelGlobePick();
@@ -1937,101 +1925,310 @@ function requireModeName(host, obj) {
   return name;
 }
 
-function fillMethodChoice(host, obj) {
-  if (!host) return;
-  const method = methodFor(obj);
-  const destMode = loadModeFor(obj);
-  const modeName = objectLoadName.get(obj.id) || destMode?.name || suggestedModeName(obj);
-  const destLabel = escapeHtml(modeName);
-  const hasTracks = tracks.size > 0;
-  const listId = `mode-names-${obj.id}`;
-  const destOptions = (obj.modes || [])
+function trajHost() {
+  return document.getElementById("drawer-trajectories");
+}
+
+function activeLoadObject() {
+  const objects = riskModel.objects || [];
+  if (!objects.length) return null;
+  if (trajObjectId != null && objects.some((o) => o.id === trajObjectId)) {
+    return objects.find((o) => o.id === trajObjectId);
+  }
+  if (expandedObjectId != null && objects.some((o) => o.id === expandedObjectId)) {
+    return objects.find((o) => o.id === expandedObjectId);
+  }
+  return objects[0];
+}
+
+function dof6EnvObject() {
+  if (rocketpyOpenId != null) {
+    const open = riskModel.objects?.find((o) => o.id === rocketpyOpenId);
+    if (open) return open;
+  }
+  return activeLoadObject();
+}
+
+function dof6EnvSource() {
+  const obj = dof6EnvObject();
+  if (!obj) return sixDofEnv;
+  const existing = rocketpyDrafts.get(obj.id);
+  if (existing?.env) return existing.env;
+  if (obj.rocketpy?.env) return obj.rocketpy.env;
+  return sixDofEnv;
+}
+
+function syncDof6EnvFields() {
+  const atm = document.getElementById("dof6-atmosphere");
+  const speed = document.getElementById("dof6-wind-speed");
+  const from = document.getElementById("dof6-wind-from");
+  const target = document.getElementById("dof6-env-target");
+  if (!atm || !speed || !from) return;
+  const obj = dof6EnvObject();
+  const env = dof6EnvSource();
+  if (document.activeElement !== atm) atm.value = env.atmosphere || "standard_atmosphere";
+  if (document.activeElement !== speed) speed.value = env.wind_speed_mps ?? 0;
+  if (document.activeElement !== from) from.value = env.wind_from_deg ?? 270;
+  if (target) {
+    target.textContent = obj
+      ? `Stored with ${obj.name}. Changing these updates that 6DOF flight.`
+      : "Applies to the next 6DOF flight. Add an object to keep them with a vehicle.";
+  }
+}
+
+function applyDof6EnvFromFields() {
+  const atm = document.getElementById("dof6-atmosphere");
+  const speedEl = document.getElementById("dof6-wind-speed");
+  const fromEl = document.getElementById("dof6-wind-from");
+  if (!atm || !speedEl || !fromEl) return;
+  const speed = Number(speedEl.value);
+  const from = Number(fromEl.value);
+  sixDofEnv.atmosphere = atm.value || "standard_atmosphere";
+  sixDofEnv.wind_speed_mps = Number.isFinite(speed) ? speed : 0;
+  sixDofEnv.wind_from_deg = Number.isFinite(from) ? from : 270;
+  const obj = dof6EnvObject();
+  if (!obj) return;
+  const draft = rocketpyDraftFor(obj);
+  draft.env.atmosphere = sixDofEnv.atmosphere;
+  draft.env.wind_speed_mps = sixDofEnv.wind_speed_mps;
+  draft.env.wind_from_deg = sixDofEnv.wind_from_deg;
+}
+
+function bindDof6Env() {
+  for (const id of ["dof6-atmosphere", "dof6-wind-speed", "dof6-wind-from"]) {
+    const el = document.getElementById(id);
+    el?.addEventListener("input", applyDof6EnvFromFields);
+    el?.addEventListener("change", applyDof6EnvFromFields);
+  }
+}
+
+function setToolButton(id, on) {
+  const btn = document.getElementById(id);
+  if (!btn) return;
+  btn.classList.toggle("primary", on);
+  btn.classList.toggle("ghost", !on);
+}
+
+function openDrawer(view, opts = {}) {
+  if (drawerView === view) {
+    if (opts.toggle) closeDrawer();
+    return;
+  }
+  drawerView = view;
+  const drawer = document.getElementById("side-drawer");
+  if (!drawer) return;
+  drawer.hidden = false;
+  const title = document.getElementById("drawer-title");
+  if (title) title.textContent = view === "trajectories" ? "Trajectories" : "Environment";
+  const traj = document.getElementById("drawer-trajectories");
+  const env = document.getElementById("drawer-environment");
+  if (traj) traj.hidden = view !== "trajectories";
+  if (env) env.hidden = view !== "environment";
+  document.getElementById("globe-panel")?.classList.add("drawer-open");
+  setToolButton("btn-open-trajectories", view === "trajectories");
+  setToolButton("btn-open-environment", view === "environment");
+  if (view === "trajectories") renderTrajectoryDrawer();
+  syncDof6EnvFields();
+  resizeGlobe();
+}
+
+function closeDrawer() {
+  drawerView = null;
+  const drawer = document.getElementById("side-drawer");
+  if (drawer) drawer.hidden = true;
+  document.getElementById("globe-panel")?.classList.remove("drawer-open");
+  setToolButton("btn-open-trajectories", false);
+  setToolButton("btn-open-environment", false);
+  setStateMarker(null);
+  refreshSiteMarkers();
+  resizeGlobe();
+}
+
+function bindDrawer() {
+  document.getElementById("btn-open-trajectories")?.addEventListener("click", () => openDrawer("trajectories", { toggle: true }));
+  document.getElementById("btn-open-environment")?.addEventListener("click", () => openDrawer("environment", { toggle: true }));
+  document.getElementById("drawer-close")?.addEventListener("click", () => closeDrawer());
+}
+
+function captureFieldFocus(root) {
+  const active = root?.contains(document.activeElement) ? document.activeElement : null;
+  if (!active) return null;
+  return {
+    role: active.dataset?.role || "",
+    gen: active.dataset?.gen || "",
+    sim: active.dataset?.sim || "",
+    id: active.id || "",
+    start: active.selectionStart,
+  };
+}
+
+function restoreFieldFocus(root, focus) {
+  if (!root || !focus) return;
+  let next = null;
+  if (focus.gen) next = root.querySelector(`[data-gen="${focus.gen}"]`);
+  else if (focus.sim) next = root.querySelector(`[data-sim="${focus.sim}"]`);
+  else if (focus.role) next = root.querySelector(`[data-role="${focus.role}"]`);
+  else if (focus.id) next = root.querySelector(`#${focus.id}`);
+  if (!next || typeof next.focus !== "function") return;
+  next.focus();
+  if (focus.start != null && typeof next.setSelectionRange === "function") {
+    try { next.setSelectionRange(focus.start, focus.start); } catch { /* number inputs */ }
+  }
+}
+
+function renderTrajectoryDrawer() {
+  const root = trajHost();
+  if (!root || drawerView !== "trajectories") return;
+  const focus = captureFieldFocus(root);
+  const obj = activeLoadObject();
+  const method = drawerLoadMethod;
+  const objects = riskModel.objects || [];
+  const modeName = obj
+    ? (objectLoadName.get(obj.id) || loadModeFor(obj)?.name || suggestedModeName(obj))
+    : "";
+  const destLabel = escapeHtml(modeName || "the mode");
+  const objectOptions = objects
+    .map((o) => `<option value="${o.id}"${obj && o.id === obj.id ? " selected" : ""}>${escapeHtml(o.name)}</option>`)
+    .join("");
+  const modeOptions = (obj?.modes || [])
     .map((mode) => `<option value="${escapeHtml(mode.name)}"></option>`)
     .join("");
-  host.innerHTML = `
-    <div class="muted method-label">Add trajectories to a mode</div>
-    <label class="dest-row">Mode
-      <input type="text" data-role="load-mode-name" list="${listId}" value="${escapeHtml(modeName)}" placeholder="e.g. Nominal" aria-label="Mode that receives new trajectories" />
-    </label>
-    <datalist id="${listId}">${destOptions}</datalist>
-    <div class="method-toggle" role="group" aria-label="How to add trajectories">
-      <button type="button" data-method="files" class="${method === "files" ? "compact" : "ghost compact"}">Load CSV</button>
-      <button type="button" data-method="generate" class="${method === "generate" ? "compact" : "ghost compact"}">Generate</button>
-      <button type="button" data-method="from-state" class="${method === "from-state" ? "compact" : "ghost compact"}" ${hasTracks ? "" : "disabled"} title="${hasTracks ? "Branch from a state on an existing trajectory" : "Need an existing trajectory first"}">From state</button>
+  const paths = [
+    ["files", "From file", "Load recorded flights from CSV or text files, or from a folder."],
+    ["generate", "Generate", "Build a 3DOF ballistic flight or a 6DOF flight."],
+    ["from-state", "From state vector", "Branch a spent stage, FTS debris, or a nav failure from a state on an existing trajectory."],
+  ];
+  root.innerHTML = `
+    <div class="drawer-dest">
+      ${objects.length ? `
+        <label class="dest-row">Object
+          <select data-role="traj-object" aria-label="Object that receives new trajectories">${objectOptions}</select>
+        </label>
+        <label class="dest-row">Mode
+          <input type="text" data-role="load-mode-name" list="traj-mode-names" value="${escapeHtml(modeName)}" placeholder="e.g. Nominal" aria-label="Mode that receives new trajectories" />
+        </label>
+        <datalist id="traj-mode-names">${modeOptions}</datalist>
+        <p class="muted wind-hint">New trajectories go into this object and mode. A new mode name creates the mode.</p>
+      ` : `<div class="dest-hint">Add an object in the risk model first. Each load path below is how flights get into a mode.</div>`}
     </div>
-    <div class="method-body"></div>`;
-  host.querySelector("[data-role='load-mode-name']")?.addEventListener("input", (ev) => {
-    objectLoadName.set(obj.id, ev.target.value.trim());
+    ${paths.map(([id, title, blurb]) => `
+      <section class="load-path${method === id ? "" : " collapsed"}" data-load-path="${id}">
+        <button type="button" class="load-path-head" data-load-path-btn="${id}" aria-expanded="${method === id}">
+          <span><strong>${title}</strong><span class="muted path-blurb">${blurb}</span></span>
+          <span class="chevron" aria-hidden="true">${method === id ? "▾" : "▸"}</span>
+        </button>
+        <div class="load-path-body" data-load-body="${id}"></div>
+      </section>`).join("")}`;
+  root.querySelector("[data-role='traj-object']")?.addEventListener("change", (ev) => {
+    trajObjectId = Number(ev.target.value);
+    render();
   });
-  host.querySelector("[data-method='files']").addEventListener("click", () => {
-    const name = fieldText(host.querySelector("[data-role='load-mode-name']"));
-    if (name) objectLoadName.set(obj.id, name);
-    setObjectMethod(obj.id, "files");
+  root.querySelector("[data-role='load-mode-name']")?.addEventListener("input", (ev) => {
+    if (obj) objectLoadName.set(obj.id, ev.target.value.trim());
   });
-  host.querySelector("[data-method='generate']").addEventListener("click", () => {
-    const name = fieldText(host.querySelector("[data-role='load-mode-name']"));
-    if (name) objectLoadName.set(obj.id, name);
-    setObjectMethod(obj.id, "generate");
+  root.querySelectorAll("[data-load-path-btn]").forEach((btn) => {
+    btn.addEventListener("click", () => selectLoadPath(btn.dataset.loadPathBtn, obj));
   });
-  host.querySelector("[data-method='from-state']").addEventListener("click", () => {
-    if (!tracks.size) {
-      els.progress.textContent = "Load or generate a trajectory first — From state needs initial conditions.";
-      return;
-    }
-    const name = fieldText(host.querySelector("[data-role='load-mode-name']"));
-    if (name) objectLoadName.set(obj.id, name);
-    setObjectMethod(obj.id, "from-state");
-  });
-  const body = host.querySelector(".method-body");
-  if (isObjectExpanded(obj.id) && method !== "from-state") {
+  if (method === "files") fillFileLoad(root.querySelector("[data-load-body='files']"), obj, destLabel);
+  if (method === "generate") fillGenerateEntry(root.querySelector("[data-load-body='generate']"), obj, destLabel);
+  if (method === "from-state") fillStateEntry(root.querySelector("[data-load-body='from-state']"), obj, destLabel);
+  if (method !== "from-state") setStateMarker(null);
+  restoreFieldFocus(root, focus);
+  refreshSiteMarkers();
+}
+
+function selectLoadPath(method, obj) {
+  if (drawerLoadMethod === method) {
+    drawerLoadMethod = null;
+    if (obj) objectMethod.delete(obj.id);
+    cancelGlobePick();
+    pickKind = null;
+    if (obj && rocketpyOpenId === obj.id) closeRocketPyBuilder({ render: false });
     setStateMarker(null);
-  }
-  if (method === "files") {
-    body.innerHTML = `
-      <div class="dest-hint">Import recorded flights into <strong>${destLabel}</strong>. A new name creates another mode. Trajectories in a mode are exclusive.</div>
-      <div class="gen-sites">
-        <button type="button" data-act="load-files" class="primary compact">Choose files…</button>
-        <button type="button" data-act="load-folder" class="ghost compact">Choose folder…</button>
-      </div>
-      <div class="muted wind-hint">CSV / text with time, lat, lon, alt. Folder import walks for matching files.</div>`;
-    body.querySelector("[data-act='load-files']").addEventListener("click", () => {
-      const name = requireModeName(host, obj);
-      if (!name) return;
-      runLoad("load_files", { object_id: obj.id, mode_name: name });
-    });
-    body.querySelector("[data-act='load-folder']").addEventListener("click", () => {
-      const name = requireModeName(host, obj);
-      if (!name) return;
-      runLoad("load_folder", { object_id: obj.id, mode_name: name });
-    });
+    render();
     return;
   }
-  if (method === "generate") {
-    fillGenerateForm(body, obj, destLabel);
-    return;
-  }
-  if (method === "from-state") {
-    if (!hasTracks) {
-      body.innerHTML = `<div class="dest-hint">From state needs an existing trajectory for initial conditions. Load CSVs or generate a flight first — usually on the vehicle object.</div>`;
-      setStateMarker(null);
-      return;
+  if (!obj) {
+    drawerLoadMethod = method;
+    if (method === "from-state" && !tracks.size) {
+      els.progress.textContent = "Load or generate a trajectory first — From state needs initial conditions.";
     }
-    if (!isObjectExpanded(obj.id)) {
-      body.innerHTML = `<div class="muted wind-hint">Expand this object to pick a source state.</div>`;
-      return;
-    }
-    fillFromState(body, obj, destLabel);
+    render();
     return;
   }
+  const name = fieldText(trajHost()?.querySelector("[data-role='load-mode-name']"));
+  if (name) objectLoadName.set(obj.id, name);
+  if (method === "from-state" && !tracks.size) {
+    drawerLoadMethod = method;
+    objectMethod.set(obj.id, method);
+    els.progress.textContent = "Load or generate a trajectory first — From state needs initial conditions.";
+    render();
+    return;
+  }
+  setObjectMethod(obj.id, method);
+}
+
+function fillFileLoad(body, obj, destLabel) {
+  if (!body) return;
   body.innerHTML = `
-    <div class="dest-hint">
-      Trajectories go into <strong>${destLabel}</strong> on this object.
-      <ol class="how-list">
-        <li><strong>Load CSV</strong> — recorded flights from files or a folder.</li>
-        <li><strong>Generate</strong> — 3DOF ballistic, or 6DOF in a builder beside the globe.</li>
-        <li><strong>From state</strong> — spent stage, FTS, or nav-fail from a point on an existing traj.</li>
-      </ol>
-    </div>`;
+    <div class="dest-hint">${obj
+      ? `Import recorded flights into <strong>${destLabel}</strong>. A new name creates another mode. Trajectories in a mode are exclusive.`
+      : "Add an object and a mode name, then import recorded flights."}</div>
+    <div class="gen-sites">
+      <button type="button" data-act="load-files" class="primary compact">Choose files…</button>
+      <button type="button" data-act="load-folder" class="ghost compact">Choose folder…</button>
+    </div>
+    <div class="muted wind-hint">CSV / text with time, lat, lon, alt. Folder import walks for matching files.</div>`;
+  const needObject = () => {
+    els.progress.textContent = "Add an object, name a mode, then Load files or Generate.";
+  };
+  body.querySelector("[data-act='load-files']").addEventListener("click", () => {
+    if (!obj) return needObject();
+    const name = requireModeName(trajHost(), obj);
+    if (!name) return;
+    runLoad("load_files", { object_id: obj.id, mode_name: name });
+  });
+  body.querySelector("[data-act='load-folder']").addEventListener("click", () => {
+    if (!obj) return needObject();
+    const name = requireModeName(trajHost(), obj);
+    if (!name) return;
+    runLoad("load_folder", { object_id: obj.id, mode_name: name });
+  });
+}
+
+function fillGenerateEntry(body, obj, destLabel) {
+  if (!body) return;
+  if (!obj) {
+    body.innerHTML = `
+      <div class="method-toggle engine-toggle" role="group" aria-label="Trajectory engine">
+        <button type="button" data-engine="3dof" class="compact" disabled>3DOF ballistic</button>
+        <button type="button" data-engine="rocketpy" class="ghost compact" disabled>6DOF</button>
+      </div>
+      <div class="dest-hint">Add an object, then generate a 3DOF ballistic flight or open the 6DOF builder.</div>`;
+    return;
+  }
+  fillGenerateForm(body, obj, destLabel);
+}
+
+function fillStateEntry(body, obj, destLabel) {
+  if (!body) return;
+  if (!obj) {
+    body.innerHTML = `<div class="dest-hint">Add an object, then branch a spent stage, FTS debris, or a nav failure into one of its modes.</div>`;
+    setStateMarker(null);
+    return;
+  }
+  if (!tracks.size) {
+    body.innerHTML = `
+      <div class="dest-hint">From state needs an existing trajectory for initial conditions. Load CSVs or generate a flight first — usually on the vehicle object.</div>
+      <div class="method-toggle sim-kinds" role="group" aria-label="Branch kind">
+        <button type="button" data-kind="stage" class="ghost compact" disabled>Spent stage</button>
+        <button type="button" data-kind="fts" class="ghost compact" disabled>FTS</button>
+        <button type="button" data-kind="nav" class="ghost compact" disabled>Nav + FTS</button>
+      </div>`;
+    setStateMarker(null);
+    return;
+  }
+  fillFromState(body, obj, destLabel);
 }
 
 function fillGenerateForm(body, obj, destLabel) {
@@ -2058,7 +2255,7 @@ function fillRocketPyEntry(body, obj, destLabel) {
   const draft = rocketpyDraftFor(obj);
   const open = rocketpyOpenId === obj.id;
   body.innerHTML = `
-    <div class="dest-hint">6DOF flies a vehicle into <strong>${destLabel}</strong>. Inputs live in a builder beside the globe so this card stays small.</div>
+    <div class="dest-hint">6DOF flies a vehicle into <strong>${destLabel}</strong>. Motor, rocket, and flight inputs live in a builder beside the globe. Atmosphere and wind are in Environment.</div>
     <div class="rp-card-summary">${escapeHtml(rocketpySummary(draft))}</div>
     <div class="rp-card-actions">
       <button type="button" data-act="open-rocketpy" class="${open ? "ghost compact" : "primary compact"}">${open ? "Builder is open →" : "Open 6DOF builder"}</button>
@@ -2166,8 +2363,7 @@ function refreshSiteMarkers() {
     );
     return;
   }
-  const expanded = riskModel.objects.find((o) => isObjectExpanded(o.id));
-  const focus = expanded && methodFor(expanded) === "generate" ? expanded : null;
+  const focus = drawerView === "trajectories" && drawerLoadMethod === "generate" ? activeLoadObject() : null;
   if (!focus) {
     setSiteMarkers(null, null);
     return;
@@ -2198,7 +2394,7 @@ function refreshSiteMarkers() {
 }
 
 function syncGenerateSiteFields(objectId) {
-  const card = document.querySelector(`[data-object-id="${objectId}"]`);
+  const card = trajHost();
   const draft = generateDrafts.get(objectId);
   if (!card || !draft) return;
   const set = (key, value) => {
@@ -2256,14 +2452,13 @@ function onGlobeSiteChange({ kind, lat, lon, alt }) {
     applySiteLla(rocketpyOpenId, "launch", { lat, lon, alt }, { rocketpy: true });
     return;
   }
-  const expanded = riskModel.objects.find((o) => isObjectExpanded(o.id));
-  if (!expanded || methodFor(expanded) !== "generate" || engineFor(expanded) === "rocketpy") {
-    if (expanded && engineFor(expanded) === "rocketpy") {
-      applySiteLla(expanded.id, "launch", { lat, lon, alt }, { rocketpy: true });
-    }
+  const obj = activeLoadObject();
+  if (!obj || drawerLoadMethod !== "generate") return;
+  if (engineFor(obj) === "rocketpy") {
+    applySiteLla(obj.id, "launch", { lat, lon, alt }, { rocketpy: true });
     return;
   }
-  applySiteLla(expanded.id, kind, { lat, lon, alt });
+  applySiteLla(obj.id, kind, { lat, lon, alt });
 }
 
 function syncCatalogs(model) {
@@ -2337,7 +2532,7 @@ function normalStageWindow(mean, t0, t1) {
 }
 
 function simHost() {
-  return document.querySelector(".object-card:not(.collapsed) .method-body");
+  return document.querySelector("#drawer-trajectories [data-load-body='from-state']");
 }
 
 function ensureStageWindow(t0, t1, t) {
