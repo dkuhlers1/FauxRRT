@@ -1533,7 +1533,7 @@ function rocketpyTabHtml(tab) {
       </div>`;
   }
   return `
-    <div class="rp-note">Launch site for the 6DOF flight. Atmosphere model and wind are in Environment, with mission wind.</div>
+    <div class="rp-note">Launch site for the 6DOF flight. The mission wind in Environment is the wind this flight uses. The atmosphere model is there too.</div>
     <div class="rp-grid">
       ${rpField("env.latitude", "Latitude", { min: -90, max: 90, step: 0.0001 })}
       ${rpField("env.longitude", "Longitude", { min: -180, max: 180, step: 0.0001 })}

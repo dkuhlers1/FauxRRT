@@ -146,7 +146,7 @@
             </section>
             <section class="env-block" id="dof6-env">
               <div class="muted method-label">6DOF atmosphere</div>
-              <p class="muted wind-hint">Atmosphere model and wind for 6DOF flights. Launch latitude, longitude, and elevation stay in the 6DOF builder. 3DOF flights use mission wind and a US-1976 atmosphere.</p>
+              <p class="muted wind-hint">The mission wind selected above is the wind for every new trajectory, including 6DOF and flights from a state vector. Wind speed and direction here do not override that selection; this block sets the 6DOF atmosphere model. Launch latitude, longitude, and elevation stay in the 6DOF builder. 3DOF flights use a US-1976 atmosphere.</p>
               <div class="gen-grid">
                 <label>Atmosphere
                   <select id="dof6-atmosphere" aria-label="6DOF atmosphere model">

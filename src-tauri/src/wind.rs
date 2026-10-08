@@ -106,6 +106,29 @@ pub fn meteo_to_enu(speed_mps: f64, from_deg: f64) -> (f64, f64) {
     (-speed_mps * rad.sin(), -speed_mps * rad.cos())
 }
 
+/// Eastward / northward components → meteorological speed and FROM direction.
+pub fn enu_to_meteo(east_mps: f64, north_mps: f64) -> (f64, f64) {
+    let speed = east_mps.hypot(north_mps);
+    if speed < 1e-9 {
+        return (0.0, 0.0);
+    }
+    let mut from_deg = (-east_mps).atan2(-north_mps).to_degrees();
+    if from_deg < 0.0 {
+        from_deg += 360.0;
+    }
+    (speed, from_deg)
+}
+
+/// Mission wind for a new trajectory that has one site: a state sample or a 6DOF launch.
+///
+/// Off and constant wind are used as stored. Historical soundings and the Surface
+/// GFS grid are fetched only when that selection has no profiles or grid yet.
+/// Generated 3DOF flights resolve the same selection along launch and aim.
+pub fn prepare_flight_wind(wind: &WindSpec, lat: f64, lon: f64) -> Result<WindSpec, String> {
+    let aim_lon = if lon <= 179.6 { lon + 0.4 } else { lon - 0.4 };
+    resolve_wind_spec(wind.clone(), lat, lon, lat, aim_lon)
+}
+
 pub fn wind_enu(wind: &WindSpec, lat: f64, lon: f64, alt_m: f64) -> (f64, f64) {
     match wind {
         WindSpec::Off => (0.0, 0.0),
@@ -759,5 +782,58 @@ mod tests {
         assert!(n.abs() < 1e-9);
         assert_eq!(stamp, "2026-10-07T00:00");
         assert!(rows[1].is_none());
+    }
+
+    #[test]
+    fn enu_round_trips_a_west_wind() {
+        let (east, north) = meteo_to_enu(12.5, 270.0);
+        let (speed, from) = enu_to_meteo(east, north);
+        assert!((speed - 12.5).abs() < 1e-9, "{speed}");
+        assert!((from - 270.0).abs() < 1e-9, "{from}");
+    }
+
+    #[test]
+    fn prepare_flight_wind_keeps_the_selected_field() {
+        let historical = WindSpec::Historical {
+            date: "2024-06-01".into(),
+            hour_utc: 12,
+            source: "test".into(),
+            profiles: vec![WindStation {
+                lat: 32.4,
+                lon: -106.4,
+                levels: vec![
+                    WindLevel {
+                        alt_m: 0.0,
+                        east_mps: 8.0,
+                        north_mps: 0.0,
+                    },
+                    WindLevel {
+                        alt_m: 10_000.0,
+                        east_mps: 20.0,
+                        north_mps: 0.0,
+                    },
+                ],
+            }],
+        };
+        let prepared = prepare_flight_wind(&historical, 32.4, -106.4).unwrap();
+        let (east, north) = wind_enu(&prepared, 32.4, -106.4, 5_000.0);
+        assert!((east - 14.0).abs() < 1e-6, "{east}");
+        assert!(north.abs() < 1e-6);
+        let stripped = historical.without_site_profiles();
+        assert!(stripped.needs_fetch());
+        let (zero_e, zero_n) = wind_enu(&stripped, 32.4, -106.4, 5_000.0);
+        assert!(zero_e.abs() < 1e-9 && zero_n.abs() < 1e-9);
+
+        let surface = WindSpec::Surface {
+            time: "2026-10-08T00:00".into(),
+            source: "test".into(),
+            lats: vec![30.0, 40.0],
+            lons: vec![-110.0, -100.0],
+            east_mps: vec![16.0, 16.0, 16.0, 16.0],
+            north_mps: vec![0.0, 0.0, 0.0, 0.0],
+        };
+        let prepared = prepare_flight_wind(&surface, 32.4, -106.4).unwrap();
+        let (east, _) = wind_enu(&prepared, 32.4, -106.4, 40_000.0);
+        assert!((east - 16.0).abs() < 1e-6, "{east}");
     }
 }

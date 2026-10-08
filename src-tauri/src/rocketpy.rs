@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::parse::ParsedTrack;
 use crate::schema::DetectedSchema;
-use crate::wind::WindSpec;
+use crate::wind::{enu_to_meteo, wind_enu, WindSpec};
 
 const FLY_PY: &str = include_str!("../../rocketpy_backend/fly.py");
 
@@ -39,6 +39,14 @@ pub struct RpEnv {
     pub wind_speed_mps: f64,
     #[serde(default)]
     pub wind_from_deg: f64,
+    /// Altitude column of the mission wind at the launch site. Empty unless the
+    /// selected wind is a historical sounding. Flight wind comes from mission wind.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub wind_profile_alt_m: Vec<f64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub wind_profile_east_mps: Vec<f64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub wind_profile_north_mps: Vec<f64>,
 }
 
 fn standard_atmosphere() -> String {
@@ -114,6 +122,9 @@ impl Default for RpEnv {
             atmosphere: standard_atmosphere(),
             wind_speed_mps: 0.0,
             wind_from_deg: 270.0,
+            wind_profile_alt_m: Vec::new(),
+            wind_profile_east_mps: Vec::new(),
+            wind_profile_north_mps: Vec::new(),
         }
     }
 }
@@ -224,17 +235,64 @@ impl RocketPySpec {
         Ok(())
     }
 
+    /// Apply the Environment wind selection. The 6DOF scalar boxes are not a second source.
     pub fn with_mission_wind(mut self, wind: &WindSpec) -> Self {
-        if let WindSpec::Constant {
-            speed_mps,
-            from_deg,
-        } = wind
-        {
-            self.env.wind_speed_mps = *speed_mps;
-            self.env.wind_from_deg = *from_deg;
+        self.env.wind_profile_alt_m.clear();
+        self.env.wind_profile_east_mps.clear();
+        self.env.wind_profile_north_mps.clear();
+        match wind {
+            WindSpec::Off => {
+                self.env.wind_speed_mps = 0.0;
+            }
+            WindSpec::Constant { speed_mps, from_deg } => {
+                self.env.wind_speed_mps = *speed_mps;
+                self.env.wind_from_deg = *from_deg;
+            }
+            WindSpec::Historical { .. } => {
+                let column = historical_column(wind, self.env.latitude, self.env.longitude);
+                if column.len() >= 2 {
+                    for (alt, east, north) in column {
+                        self.env.wind_profile_alt_m.push(alt);
+                        self.env.wind_profile_east_mps.push(east);
+                        self.env.wind_profile_north_mps.push(north);
+                    }
+                }
+                let (east, north) = wind_enu(wind, self.env.latitude, self.env.longitude, self.env.elevation_m);
+                let (speed, from) = enu_to_meteo(east, north);
+                self.env.wind_speed_mps = speed;
+                self.env.wind_from_deg = from;
+            }
+            WindSpec::Surface { .. } => {
+                let (east, north) = wind_enu(wind, self.env.latitude, self.env.longitude, self.env.elevation_m);
+                let (speed, from) = enu_to_meteo(east, north);
+                self.env.wind_speed_mps = speed;
+                self.env.wind_from_deg = from;
+            }
         }
         self
     }
+}
+
+fn historical_column(wind: &WindSpec, lat: f64, lon: f64) -> Vec<(f64, f64, f64)> {
+    let WindSpec::Historical { profiles, .. } = wind else {
+        return Vec::new();
+    };
+    let mut alts: Vec<f64> = profiles
+        .iter()
+        .flat_map(|station| station.levels.iter().map(|level| level.alt_m))
+        .filter(|alt| alt.is_finite())
+        .collect();
+    alts.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    alts.dedup_by(|a, b| (*a - *b).abs() < 1.0);
+    if alts.len() == 1 {
+        alts.push(alts[0] + 1_000.0);
+    }
+    alts.into_iter()
+        .map(|alt| {
+            let (east, north) = wind_enu(wind, lat, lon, alt);
+            (alt, east, north)
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -696,12 +754,73 @@ mod tests {
         });
         assert_eq!(spec.env.wind_speed_mps, 12.0);
         assert_eq!(spec.env.wind_from_deg, 90.0);
+        assert!(spec.env.wind_profile_alt_m.is_empty());
+    }
+
+    #[test]
+    fn mission_wind_replaces_the_separate_6dof_wind() {
+        use crate::wind::{wind_enu, WindLevel, WindStation};
+
+        let mut spec = RocketPySpec::calisto();
+        spec.env.wind_speed_mps = 18.0;
+        spec.env.wind_from_deg = 45.0;
+        let off = spec.clone().with_mission_wind(&WindSpec::Off);
+        assert_eq!(off.env.wind_speed_mps, 0.0);
+        assert!(off.env.wind_profile_alt_m.is_empty());
+
+        let historical = WindSpec::Historical {
+            date: "2024-06-01".into(),
+            hour_utc: 12,
+            source: "test".into(),
+            profiles: vec![WindStation {
+                lat: spec.env.latitude,
+                lon: spec.env.longitude,
+                levels: vec![
+                    WindLevel {
+                        alt_m: 0.0,
+                        east_mps: 10.0,
+                        north_mps: 0.0,
+                    },
+                    WindLevel {
+                        alt_m: 12_000.0,
+                        east_mps: 22.0,
+                        north_mps: -3.0,
+                    },
+                ],
+            }],
+        };
+        let flown = spec.clone().with_mission_wind(&historical);
+        assert!(flown.env.wind_profile_alt_m.len() >= 2);
+        assert_eq!(flown.env.wind_profile_alt_m.len(), flown.env.wind_profile_east_mps.len());
+        assert_eq!(flown.env.wind_profile_alt_m.len(), flown.env.wind_profile_north_mps.len());
+        for (i, alt) in flown.env.wind_profile_alt_m.iter().enumerate() {
+            let (east, north) = wind_enu(&historical, spec.env.latitude, spec.env.longitude, *alt);
+            assert!((flown.env.wind_profile_east_mps[i] - east).abs() < 1e-6);
+            assert!((flown.env.wind_profile_north_mps[i] - north).abs() < 1e-6);
+        }
+
+        let surface = WindSpec::Surface {
+            time: "2026-10-08T00:00".into(),
+            source: "test".into(),
+            lats: vec![30.0, 40.0],
+            lons: vec![-110.0, -100.0],
+            east_mps: vec![10.0, 10.0, 10.0, 10.0],
+            north_mps: vec![0.0, 0.0, 0.0, 0.0],
+        };
+        let flown = spec.with_mission_wind(&surface);
+        assert!(flown.env.wind_profile_alt_m.is_empty());
+        let (east, north) = wind_enu(&surface, flown.env.latitude, flown.env.longitude, flown.env.elevation_m);
+        let (speed, from) = crate::wind::enu_to_meteo(east, north);
+        assert!((flown.env.wind_speed_mps - speed).abs() < 1e-6);
+        assert!((flown.env.wind_from_deg - from).abs() < 1e-6);
+        assert!((speed - 10.0).abs() < 1e-6, "{speed}");
     }
 
     #[test]
     fn fly_script_is_embedded() {
         assert!(FLY_PY.contains("def fly("));
         assert!(FLY_PY.contains("GenericMotor"));
+        assert!(FLY_PY.contains("wind_profile_alt_m"));
     }
 
     #[test]
