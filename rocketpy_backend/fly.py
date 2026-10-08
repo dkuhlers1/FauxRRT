@@ -81,6 +81,20 @@ def _build_environment(spec):
     lon = _num(env_spec.get("longitude"))
     elev = _num(env_spec.get("elevation_m"))
     env = Environment(latitude=lat, longitude=lon, elevation=elev)
+    alts = env_spec.get("wind_profile_alt_m") or []
+    easts = env_spec.get("wind_profile_east_mps") or []
+    norths = env_spec.get("wind_profile_north_mps") or []
+    if (
+        isinstance(alts, list)
+        and isinstance(easts, list)
+        and isinstance(norths, list)
+        and len(alts) >= 2
+        and len(alts) == len(easts) == len(norths)
+    ):
+        wind_u = [[float(a), float(e)] for a, e in zip(alts, easts)]
+        wind_v = [[float(a), float(n)] for a, n in zip(alts, norths)]
+        env.set_atmospheric_model(type="custom_atmosphere", wind_u=wind_u, wind_v=wind_v)
+        return env
     wind_speed = max(0.0, _num(env_spec.get("wind_speed_mps")))
     wind_from = _num(env_spec.get("wind_from_deg"))
     if wind_speed > 0:

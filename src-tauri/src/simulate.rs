@@ -1259,4 +1259,180 @@ mod tests {
         let times = sample_stage_times(&spec, 0.0, 80.0).unwrap();
         assert!(times.iter().all(|t| (36.0..=44.0).contains(t)));
     }
+
+    #[test]
+    fn generated_and_from_state_sample_the_selected_wind() {
+        use crate::wind::{prepare_flight_wind, wind_enu, WindLevel, WindStation};
+
+        let (lla, times) = lla_line();
+        let sample = sample_track_state(1, &lla, Some(&times), 2.0).unwrap();
+        let stage = SpentStageSpec {
+            source_track_id: 1,
+            time_s: 2.0,
+            ballistic_coeff: 80.0,
+            object_name: Some("Stage".into()),
+            mode_name: "Staging".into(),
+            ..Default::default()
+        };
+        let calm_stage = build_spent_stage(&sample, &stage, &WindSpec::Off, 0.0).unwrap();
+        let (calm_lon, calm_lat, _) = impact_lla(&calm_stage.parsed.lla);
+
+        let historical = WindSpec::Historical {
+            date: "2024-06-01".into(),
+            hour_utc: 12,
+            source: "test".into(),
+            profiles: vec![WindStation {
+                lat: sample.lat,
+                lon: sample.lon,
+                levels: vec![
+                    WindLevel {
+                        alt_m: 0.0,
+                        east_mps: 18.0,
+                        north_mps: 0.0,
+                    },
+                    WindLevel {
+                        alt_m: 20_000.0,
+                        east_mps: 30.0,
+                        north_mps: 4.0,
+                    },
+                    WindLevel {
+                        alt_m: 90_000.0,
+                        east_mps: 12.0,
+                        north_mps: 0.0,
+                    },
+                ],
+            }],
+        };
+        let surface = WindSpec::Surface {
+            time: "2026-10-08T00:00".into(),
+            source: "test".into(),
+            lats: vec![30.0, 40.0],
+            lons: vec![-110.0, -100.0],
+            east_mps: vec![16.0, 16.0, 16.0, 16.0],
+            north_mps: vec![0.0, 0.0, 0.0, 0.0],
+        };
+        let selected = [
+            (
+                "constant",
+                WindSpec::Constant {
+                    speed_mps: 30.0,
+                    from_deg: 270.0,
+                },
+            ),
+            ("historical", historical),
+            ("surface", surface),
+        ];
+
+        for (name, wind) in selected {
+            let prepared = prepare_flight_wind(&wind, sample.lat, sample.lon).unwrap();
+            for alt in [0.0, 5_000.0, sample.alt_m] {
+                let (want_e, want_n) = wind_enu(&wind, sample.lat, sample.lon, alt);
+                let (got_e, got_n) = wind_enu(&prepared, sample.lat, sample.lon, alt);
+                assert!(
+                    (want_e - got_e).abs() < 1e-6 && (want_n - got_n).abs() < 1e-6,
+                    "{name} prepare drifted at {alt}: ({got_e},{got_n}) vs ({want_e},{want_n})"
+                );
+                assert!(
+                    want_e.hypot(want_n) > 5.0,
+                    "{name} selected wind should be nonzero at {alt}, got {want_e},{want_n}"
+                );
+            }
+            if let WindSpec::Historical { .. } = &wind {
+                let stored = wind.without_site_profiles();
+                let (zero_e, zero_n) = wind_enu(&stored, sample.lat, sample.lon, 10_000.0);
+                assert!(
+                    zero_e.abs() < 1e-9 && zero_n.abs() < 1e-9,
+                    "historical settings stored without profiles sample calm air"
+                );
+            }
+
+            let mut generated = white_sands_spec();
+            generated.ballistic_coeff = 200.0;
+            generated.wind = prepared.clone();
+            let flown = crate::generate::generate_track(&generated).unwrap();
+            let (gen_e, gen_n) = wind_enu(&generated.wind, sample.lat, sample.lon, sample.alt_m);
+            let (state_e, state_n) = wind_enu(&prepared, sample.lat, sample.lon, sample.alt_m);
+            assert!(
+                (gen_e - state_e).abs() < 1e-9 && (gen_n - state_n).abs() < 1e-9,
+                "{name} generate and from-state must read the same wind"
+            );
+            let (gx, gy, gz) = crate::wind::wind_ecef(&generated.wind, sample.lat, sample.lon, sample.alt_m);
+            let (sx, sy, sz) = crate::wind::wind_ecef(&prepared, sample.lat, sample.lon, sample.alt_m);
+            assert!((gx - sx).abs() < 1e-9 && (gy - sy).abs() < 1e-9 && (gz - sz).abs() < 1e-9);
+            assert!(
+                gx.hypot(gy).hypot(gz) > 5.0,
+                "{name} both paths should sample a real wind, ecef=({gx},{gy},{gz})"
+            );
+
+            let mut calm_spec = generated.clone();
+            calm_spec.wind = WindSpec::Off;
+            let calm_track = crate::generate::generate_track(&calm_spec).unwrap();
+            let (wind_lon, wind_lat, _) = impact_lla(&flown.lla);
+            let (off_lon, off_lat, _) = impact_lla(&calm_track.lla);
+            let generated_shift = ground_range_m(off_lon, off_lat, wind_lon, wind_lat);
+            assert!(
+                generated_shift > 1.0,
+                "{name} generated impact should move with the selected wind, shift={generated_shift:.0} m"
+            );
+
+            let windy_stage = build_spent_stage(&sample, &stage, &prepared, 0.0).unwrap();
+            let (stage_lon, stage_lat, _) = impact_lla(&windy_stage.parsed.lla);
+            let stage_shift = ground_range_m(calm_lon, calm_lat, stage_lon, stage_lat);
+            assert!(
+                stage_shift > 500.0,
+                "{name} spent stage should sample the selected wind, shift={stage_shift:.0} m"
+            );
+        }
+
+        let prepared = prepare_flight_wind(
+            &WindSpec::Constant {
+                speed_mps: 30.0,
+                from_deg: 270.0,
+            },
+            sample.lat,
+            sample.lon,
+        )
+        .unwrap();
+        let catalog = DebrisCatalog {
+            id: 1,
+            name: "one".into(),
+            pieces: vec![piece("Tank", 400.0, 0.0, 1)],
+        };
+        let calm_fts = build_fts_debris(&sample, &catalog, 1, &WindSpec::Off, "", 0.0).unwrap();
+        let wind_fts = build_fts_debris(&sample, &catalog, 1, &prepared, "", 0.0).unwrap();
+        let (off_lon, off_lat, _) = impact_lla(&calm_fts[0].parsed.lla);
+        let (on_lon, on_lat, _) = impact_lla(&wind_fts[0].parsed.lla);
+        let fts_shift = ground_range_m(off_lon, off_lat, on_lon, on_lat);
+        assert!(
+            fts_shift > 500.0,
+            "FTS debris should sample the selected wind, shift={fts_shift:.0} m"
+        );
+        let (fts_e, fts_n) = wind_enu(&prepared, sample.lat, sample.lon, sample.alt_m);
+        assert!(fts_e.hypot(fts_n) > 5.0);
+
+        let nav = NavFailSpec {
+            source_track_id: 1,
+            times_s: vec![sample.time_s],
+            catalog_id: 1,
+            object_id: None,
+            object_name: None,
+            mode_name: "Nav + FTS".into(),
+            max_g: 3.0,
+            turn_duration_s: 3.0,
+            turn_side: TurnSide::Left,
+            sustain_speed: true,
+            seed: 1,
+        };
+        let calm_nav = build_nav_failure(&sample, &nav, &catalog, &WindSpec::Off, 0.0).unwrap();
+        let wind_nav = build_nav_failure(&sample, &nav, &catalog, &prepared, 0.0).unwrap();
+        let calm_debris = calm_nav.iter().find(|t| t.weight > 0.0).unwrap();
+        let wind_debris = wind_nav.iter().find(|t| t.weight > 0.0).unwrap();
+        let (off_lon, off_lat, _) = impact_lla(&calm_debris.parsed.lla);
+        let (on_lon, on_lat, _) = impact_lla(&wind_debris.parsed.lla);
+        let nav_shift = ground_range_m(off_lon, off_lat, on_lon, on_lat);
+        assert!(
+            nav_shift > 500.0,
+            "nav + FTS should sample the selected wind, shift={nav_shift:.0} m"
+        );
+    }
 }

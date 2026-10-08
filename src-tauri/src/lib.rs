@@ -25,7 +25,7 @@ use simulate::{
     build_fts_debris, build_nav_failure, build_spent_stage, regenerate_simulated, sample_stage_times,
     sample_track_state, BuiltTrack, DebrisCatalog, FtsSpec, NavFailSpec, SpentStageSpec, StateSample,
 };
-use wind::WindSpec;
+use wind::{prepare_flight_wind, WindSpec};
 use impact::extract_impact;
 use kde::{kde_lonlat, KdeGrid, WeightedPoint};
 use mission::{
@@ -504,6 +504,10 @@ fn simulate_spent_stage(
         }
         (store.wind.clone(), samples, floor_alt_of(&store, spec.source_track_id))
     };
+    let wind = match samples.iter().find(|sample| sample.alt_m >= 20.0) {
+        Some(sample) => prepare_flight_wind(&wind, sample.lat, sample.lon)?,
+        None => wind,
+    };
     let mut built = Vec::new();
     let mut skipped = 0usize;
     for sample in &samples {
@@ -554,6 +558,7 @@ fn simulate_fts(app: AppHandle, state: State<AppState>, spec: FtsSpec) -> Result
             sample.alt_m
         ));
     }
+    let wind = prepare_flight_wind(&wind, sample.lat, sample.lon)?;
     let built = build_fts_debris(&sample, &catalog, spec.seed, &wind, "", floor_alt)?;
     let tracks = {
         let mut store = state.store.lock().map_err(|e| e.to_string())?;
@@ -606,6 +611,10 @@ fn simulate_nav_failure(
     if samples.iter().all(|s| s.alt_m < simulate::MIN_BREAKUP_ALT_M) {
         return Err("all selected times are near the ground — pick in-flight times on the source trajectory".into());
     }
+    let wind = match samples.iter().find(|sample| sample.alt_m >= simulate::MIN_BREAKUP_ALT_M) {
+        Some(sample) => prepare_flight_wind(&wind, sample.lat, sample.lon)?,
+        None => wind,
+    };
     let mut built = Vec::new();
     for (i, sample) in samples.iter().enumerate() {
         if sample.alt_m < simulate::MIN_BREAKUP_ALT_M {
@@ -749,7 +758,7 @@ async fn generate_rocketpy(
     spec.validate()?;
     let wind = {
         let store = state.store.lock().map_err(|e| e.to_string())?;
-        store.wind.without_site_profiles()
+        prepare_flight_wind(&store.wind, spec.env.latitude, spec.env.longitude)?
     };
     let spec_for_fly = spec.clone().with_mission_wind(&wind);
     let flown = tauri::async_runtime::spawn_blocking(move || fly_rocketpy(&spec_for_fly))
