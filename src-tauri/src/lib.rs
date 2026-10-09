@@ -12,6 +12,7 @@ mod rocketpy;
 mod schema;
 mod simulate;
 mod store;
+mod vessel;
 mod wind;
 
 use std::collections::HashMap;
@@ -1015,6 +1016,147 @@ fn score_boats(state: State<AppState>) -> Result<Vec<BoatView>, String> {
     Ok(store.boats_view_scored(grid.as_ref()))
 }
 
+#[tauri::command]
+async fn compute_vessel_risk(state: State<'_, AppState>) -> Result<vessel::VesselRisk, String> {
+    let (objects, boats, params) = {
+        let store = state.store.lock().map_err(|e| e.to_string())?;
+        let (objects, boats) = vessel_inputs(&store);
+        (objects, boats, store.vessel.clone())
+    };
+    tauri::async_runtime::spawn_blocking(move || vessel::compute_vessel_risk(&objects, &params, &boats))
+        .await
+        .map_err(|e| format!("vessel risk: {e}"))?
+}
+
+#[tauri::command]
+fn set_vessel_params(
+    app: AppHandle,
+    state: State<AppState>,
+    params: vessel::VesselParams,
+) -> Result<vessel::VesselParams, String> {
+    let params = params.clamped()?;
+    {
+        let mut store = state.store.lock().map_err(|e| e.to_string())?;
+        store.vessel = params.clone();
+    }
+    after_store_change(&app, &state);
+    Ok(params)
+}
+
+#[tauri::command]
+fn set_boat_people(
+    app: AppHandle,
+    state: State<AppState>,
+    id: u64,
+    people: Option<u32>,
+) -> Result<Vec<BoatView>, String> {
+    let boats = {
+        let mut store = state.store.lock().map_err(|e| e.to_string())?;
+        store.set_boat_people(id, people)?;
+        store.boats_view()
+    };
+    after_store_change(&app, &state);
+    Ok(boats)
+}
+
+fn vessel_inputs(store: &Store) -> (Vec<vessel::ObjectInput>, Vec<vessel::BoatQuery>) {
+    let mut pieces = Vec::new();
+    for track in store.tracks.values() {
+        if !track.visible {
+            continue;
+        }
+        let Some(object_id) = track.object_id else {
+            continue;
+        };
+        let Some(mode_id) = track.failure_mode_id else {
+            continue;
+        };
+        let probability = store.track_probability(track);
+        if probability <= 0.0 {
+            continue;
+        }
+        let Some(hit) = extract_impact(&track.lla, track.times.as_deref(), 0.0) else {
+            continue;
+        };
+        let vel = impact_velocity_enu(&track.lla, track.times.as_deref(), hit.index);
+        let origin = track.simulate.as_ref();
+        let fragment = origin.map(|o| o.delta_v_ecef.is_some()).unwrap_or(false);
+        let mass = origin.map(|o| o.mass_kg).filter(|m| *m > 0.0).unwrap_or(store.vessel.default_mass_kg);
+        let radius = origin
+            .map(|o| o.radius_m)
+            .filter(|r| *r > 0.0)
+            .unwrap_or(store.vessel.default_radius_m);
+        pieces.push(vessel::TrackPiece {
+            object_id,
+            object_name: store
+                .objects
+                .get(&object_id)
+                .map(|o| o.name.clone())
+                .unwrap_or_default(),
+            mode_id,
+            probability,
+            fragment,
+            source_track_id: origin.and_then(|o| o.source_track_id).unwrap_or(0),
+            source_time_bits: origin.and_then(|o| o.source_time_s).map(f64::to_bits).unwrap_or(0),
+            turn_side_bits: origin
+                .and_then(|o| o.turn.as_ref())
+                .map(|t| t.side.to_bits())
+                .unwrap_or(0),
+            trial_id: origin.map(|o| o.trial_id).unwrap_or(track.id),
+            track_id: track.id,
+            piece: vessel::PieceInput {
+                lon: hit.lon,
+                lat: hit.lat,
+                mass_kg: mass,
+                radius_m: radius,
+                v_east: vel[0],
+                v_north: vel[1],
+                v_up: vel[2],
+            },
+        });
+    }
+    let mut boats: Vec<vessel::BoatQuery> = store
+        .boats
+        .values()
+        .map(|b| vessel::BoatQuery {
+            id: b.id,
+            name: b.name.clone(),
+            lon: b.lon,
+            lat: b.lat,
+            people: b.people_on_board,
+        })
+        .collect();
+    boats.sort_by_key(|b| b.id);
+    (vessel::objects_from_tracks(pieces), boats)
+}
+
+fn impact_velocity_enu(lla: &[f32], times: Option<&[f64]>, index: usize) -> [f64; 3] {
+    let n = lla.len() / 3;
+    if n < 2 {
+        return [0.0, 0.0, -1.0];
+    }
+    let i = index.min(n - 2);
+    let j = i + 1;
+    let (x0, y0, z0) = crate::geodesy::lla_to_ecef(lla[i * 3 + 1] as f64, lla[i * 3] as f64, lla[i * 3 + 2] as f64);
+    let (x1, y1, z1) = crate::geodesy::lla_to_ecef(lla[j * 3 + 1] as f64, lla[j * 3] as f64, lla[j * 3 + 2] as f64);
+    let dt = times
+        .filter(|t| t.len() == n)
+        .map(|t| (t[j] - t[i]).abs())
+        .filter(|dt| *dt > 1e-6)
+        .unwrap_or(1.0);
+    let vx = (x1 - x0) / dt;
+    let vy = (y1 - y0) / dt;
+    let vz = (z1 - z0) / dt;
+    let lat = lla[i * 3 + 1] as f64;
+    let lon = lla[i * 3] as f64;
+    let (east, north, up) = crate::generate::enu_basis(lat, lon);
+    [
+        vx * east.x + vy * east.y + vz * east.z,
+        vx * north.x + vy * north.y + vz * north.z,
+        vx * up.x + vy * up.y + vz * up.z,
+    ]
+}
+
 fn gather_impacts(
     store: &Store,
     object_id: Option<u64>,
@@ -1624,6 +1766,9 @@ mod tests {
             source_time_s: None,
             delta_v_ecef: Some([40.0, 0.0, 0.0]),
             ground_alt_m: 0.0,
+            mass_kg: 0.0,
+            radius_m: 0.0,
+            trial_id: 0,
         };
         for meta in &loaded {
             store.set_track_simulate(meta.id, origin.clone());
@@ -2135,6 +2280,9 @@ pub fn run() {
             normalize_object,
             extract_impacts,
             compute_kde,
+            compute_vessel_risk,
+            set_vessel_params,
+            set_boat_people,
             get_mission,
             new_mission,
             open_mission,

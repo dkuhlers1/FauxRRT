@@ -32,6 +32,8 @@ import {
   setSurfaceWindVisible,
   setTerminateHull,
   setTerminateHullVisible,
+  setVesselRiskCells,
+  setVesselRiskVisible,
   setVisible,
 } from "./globe.js";
 import { enrichBoat, parseBoatKml, scoreBoatsAgainstGrid } from "./boats-kml.js";
@@ -122,6 +124,9 @@ let pickKind = null;
 let impactSeq = 0;
 let kdeSeq = 0;
 let kdeTimer = null;
+let vesselSeq = 0;
+let vesselTimer = null;
+let vesselResult = null;
 let lastPointKey = "";
 let lastWeightKey = "";
 let lastImpactSummary = "";
@@ -146,6 +151,12 @@ const els = {
   kdeStatus: document.getElementById("kde-status"),
   showImpacts: document.getElementById("show-impacts"),
   showKde: document.getElementById("show-kde"),
+  showVessel: document.getElementById("show-vessel-risk"),
+  vesselKe: document.getElementById("vessel-ke"),
+  vesselArea: document.getElementById("vessel-area"),
+  vesselPerim: document.getElementById("vessel-perim"),
+  vesselTrials: document.getElementById("vessel-trials"),
+  vesselStatus: document.getElementById("vessel-status"),
   showBoats: document.getElementById("show-boats"),
   showSurfaceWind: document.getElementById("show-surface-wind"),
   surfaceWindAlpha: document.getElementById("surface-wind-alpha"),
@@ -182,6 +193,13 @@ els.showKde?.addEventListener("change", () => {
   setKdeVisible(els.showKde.checked);
   persistMissionUi();
 });
+els.showVessel?.addEventListener("change", () => {
+  setVesselRiskVisible(els.showVessel.checked);
+  persistMissionUi();
+});
+for (const input of [els.vesselKe, els.vesselArea, els.vesselPerim, els.vesselTrials]) {
+  input?.addEventListener("change", () => saveVesselParams());
+}
 els.showBoats?.addEventListener("change", () => {
   setBoatsVisible(els.showBoats.checked);
   persistMissionUi();
@@ -603,6 +621,7 @@ function applyBoatResult(result, fly) {
     if (bounds) flyToBounds(bounds);
   }
   rescoreBoats();
+  scheduleVessel();
 }
 
 function applyScoredBoats(list) {
@@ -655,15 +674,27 @@ function boatRiskClass(boat) {
   return "";
 }
 
+function vesselScore(boat) {
+  return vesselResult?.boats?.find((b) => b.id === boat.id) || null;
+}
+
 function renderBoats() {
   if (els.boatRisk) {
-    const scored = boats.filter((b) => b.p_hit != null);
-    const ec = scored.reduce((n, b) => n + (Number(b.expected_casualties) || 0), 0);
-    els.boatRisk.textContent = scored.length
-      ? `${boats.length} boats · Σ Ec ${fmtRisk(ec)} against debris KDE`
-      : boats.length
-        ? `${boats.length} boats · load trajectories to score against the KDE`
-        : "";
+    if (!boats.length) {
+      els.boatRisk.textContent = "";
+    } else if (vesselResult) {
+      els.boatRisk.textContent = `Collective risk ${fmtRisk(vesselResult.collective)} · mean strike probability of ${vesselResult.boat_count} boats`;
+    } else {
+      els.boatRisk.textContent = `${boats.length} boats · collective risk waits on the vessel-risk run`;
+    }
+  }
+  if (els.vesselStatus && vesselResult) {
+    const bits = [`H3 res ${vesselResult.resolution}`, `A_g ${Math.round(vesselResult.area_m2).toLocaleString()} m²`];
+    if (vesselResult.bandwidth_east_m != null) {
+      bits.push(`Botev ${Math.round(vesselResult.bandwidth_east_m)}×${Math.round(vesselResult.bandwidth_north_m)} m`);
+    }
+    const notes = vesselResult.notes || [];
+    els.vesselStatus.textContent = [...bits, ...notes].join(" · ");
   }
   if (!els.boatList) return;
   if (!boats.length) {
@@ -671,7 +702,7 @@ function renderBoats() {
     updateBoatInspect(null);
     return;
   }
-  const ordered = [...boats].sort((a, b) => (Number(b.expected_casualties) || -1) - (Number(a.expected_casualties) || -1));
+  const ordered = [...boats].sort((a, b) => (Number(vesselScore(b)?.individual) || -1) - (Number(vesselScore(a)?.individual) || -1));
   els.boatList.innerHTML = "";
   for (const boat of ordered) {
     const row = document.createElement("div");
@@ -720,8 +751,11 @@ function boatSummary(boat) {
   if (boat.people_on_board != null) bits.push(`${boat.people_on_board} POB`);
   if (boat.length_m != null) bits.push(`${Number(boat.length_m).toFixed(0)} m`);
   if (boat.age_s != null) bits.push(`${fmtAge(boat.age_s)} stale`);
-  if (boat.p_hit != null) bits.push(`P(hit) ${fmtRisk(boat.p_hit)}`);
-  if (boat.expected_casualties != null) bits.push(`Ec ${fmtRisk(boat.expected_casualties)}`);
+  const score = vesselScore(boat);
+  if (score) {
+    bits.push(`strike ${fmtRisk(score.strike)}`);
+    bits.push(score.individual != null ? `individual risk ${fmtRisk(score.individual)}` : "individual risk —");
+  }
   return bits.join(" · ");
 }
 
@@ -795,12 +829,18 @@ function updateBoatInspect(id) {
       <dt>Est. now</dt><dd>${fmtCoord(boat.estimate_lat)}, ${fmtCoord(boat.estimate_lon)}</dd>
       <dt>Speed</dt><dd>${boat.speed_kn != null ? `${Number(boat.speed_kn).toFixed(1)} kn` : "—"}</dd>
       <dt>Heading</dt><dd>${boat.heading_deg != null ? `${Math.round(Number(boat.heading_deg))}°` : "—"}</dd>
-      <dt>People on board</dt><dd>${boat.people_on_board != null ? boat.people_on_board : "—"}</dd>
+      <dt>People on board</dt><dd><input id="boat-people" type="number" min="0" step="1" value="${boat.people_on_board != null ? boat.people_on_board : ""}" /></dd>
       <dt>Boat size</dt><dd>${boat.length_m != null ? `${Number(boat.length_m).toFixed(1)} m` : "—"}</dd>
       <dt>Age</dt><dd>${boat.age_s != null ? fmtAge(boat.age_s) : "—"}</dd>
-      <dt>P(hit)</dt><dd>${fmtRisk(boat.p_hit)} peak · ${fmtRisk(boat.p_hit_mean)} mean</dd>
-      <dt>Expected casualties</dt><dd>${fmtRisk(boat.expected_casualties)}</dd>
+      <dt>Strike probability</dt><dd>${fmtRisk(vesselScore(boat)?.strike)}</dd>
+      <dt>Individual risk</dt><dd>${fmtRisk(vesselScore(boat)?.individual)}</dd>
     </dl>`;
+  els.boatDetail.querySelector("#boat-people")?.addEventListener("change", (ev) => {
+    const raw = ev.target.value.trim();
+    const people = raw === "" ? null : Math.max(0, Math.round(Number(raw)));
+    if (people != null && !Number.isFinite(people)) return;
+    saveBoatPeople(boat.id, people);
+  });
 }
 
 function placeBoatTooltip(id, position) {
@@ -823,7 +863,7 @@ function placeBoatTooltip(id, position) {
     <span>${fmtCoord(boat.lat)}, ${fmtCoord(boat.lon)}</span>
     <span class="muted">${boat.speed_kn != null ? `${Number(boat.speed_kn).toFixed(1)} kn` : "—"} · ${boat.heading_deg != null ? `${Math.round(Number(boat.heading_deg))}°` : "—"}</span>
     <span class="muted">${boat.people_on_board != null ? `${boat.people_on_board} people` : "POB —"} · ${boat.length_m != null ? `${Number(boat.length_m).toFixed(0)} m` : "size —"} · age ${boat.age_s != null ? fmtAge(boat.age_s) : "—"}</span>
-    <span class="muted">P(hit) ${fmtRisk(boat.p_hit)} · Ec ${fmtRisk(boat.expected_casualties)}</span>`;
+    <span class="muted">strike ${fmtRisk(vesselScore(boat)?.strike)} · individual risk ${fmtRisk(vesselScore(boat)?.individual)}</span>`;
 }
 
 function hideBoatTooltip() {
@@ -908,6 +948,7 @@ async function runClearBoats() {
   hideBoatTooltip();
   applyScoredBoats(boats);
   highlightBoat(null);
+  scheduleVessel();
   await refreshMission();
   render();
   els.progress.textContent = "Boats cleared";
@@ -986,6 +1027,7 @@ async function deleteBoat(id) {
   if (hoveredBoatId === id) hoveredBoatId = selectedBoatId;
   applyScoredBoats(boats);
   highlightBoat(selectedBoatId);
+  scheduleVessel();
   await refreshMission();
   render();
 }
@@ -2754,6 +2796,7 @@ function syncCatalogs(model) {
       simDraft.catalogId = catalogs[0].id;
     }
   }
+  applyVesselParams(model?.vessel);
 }
 
 function preferredSimTrackId() {
@@ -3099,6 +3142,8 @@ function renderCatalogEditor(host, catalog) {
       <tr>
         <td class="cat-name"><input data-cat="${i}" data-field="name" type="text" value="${escapeHtml(p.name)}" /></td>
         <td><input data-cat="${i}" data-field="ballistic_coeff" type="number" min="5" max="50000" step="5" value="${p.ballistic_coeff}" /></td>
+        <td><input data-cat="${i}" data-field="mass_kg" type="number" min="0" step="0.1" value="${p.mass_kg ?? 10}" /></td>
+        <td><input data-cat="${i}" data-field="radius_m" type="number" min="0" step="0.01" value="${p.radius_m ?? 0.2}" /></td>
         <td><input data-cat="${i}" data-field="delta_v_mps" type="number" min="0" max="2000" step="5" value="${p.delta_v_mps}" /></td>
         <td><input data-cat="${i}" data-field="count" type="number" min="1" max="200" step="1" value="${p.count || 1}" /></td>
         <td><button type="button" class="ghost compact" data-del-piece="${i}">✕</button></td>
@@ -3107,13 +3152,13 @@ function renderCatalogEditor(host, catalog) {
   host.innerHTML = `
     <label class="dest-row">Catalogue name <input type="text" data-cat-name value="${escapeHtml(catalog.name)}" /></label>
     <table class="catalog-table">
-      <thead><tr><th>Piece</th><th>BC</th><th>Δv m/s</th><th>n</th><th></th></tr></thead>
+      <thead><tr><th>Piece</th><th>BC</th><th>Mass kg</th><th>Radius m</th><th>Δv m/s</th><th>n</th><th></th></tr></thead>
       <tbody>${rows}</tbody>
     </table>
     <div class="sim-chips">
       <button type="button" data-act="add-piece" class="ghost compact">+ Piece</button>
     </div>
-    <div class="muted wind-hint">BC is kg/m². Δv is the breakup impulse; direction is sampled uniformly on the sphere.</div>`;
+    <div class="muted wind-hint">BC is kg/m². Mass and radius feed kinetic energy and the vulnerability area. Δv is the breakup impulse; direction is sampled uniformly on the sphere.</div>`;
   host.querySelector("[data-cat-name]")?.addEventListener("change", (ev) => {
     catalog.name = ev.target.value;
     persistCatalog(catalog);
@@ -3134,7 +3179,7 @@ function renderCatalogEditor(host, catalog) {
     });
   });
   host.querySelector("[data-act='add-piece']")?.addEventListener("click", () => {
-    catalog.pieces.push({ name: "Piece", ballistic_coeff: 80, delta_v_mps: 80, count: 1 });
+    catalog.pieces.push({ name: "Piece", ballistic_coeff: 80, delta_v_mps: 80, count: 1, mass_kg: 10, radius_m: 0.2 });
     persistCatalog(catalog);
   });
 }
@@ -3667,6 +3712,75 @@ function setImpactStatus(text) {
   if (els.kdeStatus) els.kdeStatus.textContent = text;
 }
 
+async function saveVesselParams() {
+  const params = {
+    ke_threshold_j: Number(els.vesselKe?.value),
+    a_proj_m2: Number(els.vesselArea?.value),
+    p_proj_m: Number(els.vesselPerim?.value),
+    max_trials: Math.round(Number(els.vesselTrials?.value)),
+    default_mass_kg: Number(riskModel?.vessel?.default_mass_kg ?? 50),
+    default_radius_m: Number(riskModel?.vessel?.default_radius_m ?? 0.3),
+  };
+  try {
+    const saved = await invoke("set_vessel_params", ipcArgs({ params }));
+    if (riskModel) riskModel.vessel = saved;
+    applyVesselParams(saved);
+    scheduleVessel();
+  } catch (err) {
+    if (els.vesselStatus) els.vesselStatus.textContent = String(err);
+  }
+}
+
+async function saveBoatPeople(id, people) {
+  try {
+    const list = await invoke("set_boat_people", ipcArgs({ id, people }));
+    applyScoredBoats(list);
+    scheduleVessel();
+  } catch (err) {
+    els.progress.textContent = String(err);
+  }
+}
+
+function applyVesselParams(vessel) {
+  if (!vessel) return;
+  if (els.vesselKe && document.activeElement !== els.vesselKe) els.vesselKe.value = vessel.ke_threshold_j ?? 0;
+  if (els.vesselArea && document.activeElement !== els.vesselArea) els.vesselArea.value = vessel.a_proj_m2 ?? 80;
+  if (els.vesselPerim && document.activeElement !== els.vesselPerim) els.vesselPerim.value = vessel.p_proj_m ?? 40;
+  if (els.vesselTrials && document.activeElement !== els.vesselTrials) els.vesselTrials.value = vessel.max_trials ?? 32;
+}
+
+function cancelVesselWork() {
+  if (vesselTimer) {
+    clearTimeout(vesselTimer);
+    vesselTimer = null;
+  }
+  vesselSeq += 1;
+}
+
+function scheduleVessel() {
+  cancelVesselWork();
+  const scheduled = vesselSeq;
+  vesselTimer = setTimeout(() => {
+    vesselTimer = null;
+    if (scheduled !== vesselSeq) return;
+    runVessel(scheduled);
+  }, KDE_IDLE_MS);
+}
+
+async function runVessel(seq) {
+  try {
+    const result = await invoke("compute_vessel_risk");
+    if (seq !== vesselSeq) return;
+    vesselResult = result;
+    setVesselRiskCells(result.cells || []);
+    setVesselRiskVisible(els.showVessel?.checked !== false);
+    renderBoats();
+  } catch (err) {
+    if (seq !== vesselSeq) return;
+    if (els.vesselStatus) els.vesselStatus.textContent = String(err);
+  }
+}
+
 function cancelKdeWork() {
   if (kdeTimer) {
     clearTimeout(kdeTimer);
@@ -3707,13 +3821,17 @@ async function refreshOverlays(opts = {}) {
   if (!pointKey) {
     impactSeq += 1;
     cancelKdeWork();
+    cancelVesselWork();
     lastPointKey = "";
     lastWeightKey = "";
     lastImpactSummary = "";
     setImpactPoints([]);
     await setKdeGrid(null);
+    setVesselRiskCells([]);
+    vesselResult = null;
     clearBoatScores();
     setImpactStatus("");
+    renderBoats();
     return;
   }
   const pointsChanged = opts.force || pointKey !== lastPointKey;
@@ -3727,9 +3845,12 @@ async function refreshOverlays(opts = {}) {
   if (pointsChanged || weightsChanged || opts.immediate) {
     if (opts.immediate) {
       cancelKdeWork();
+      cancelVesselWork();
       await runKde(kdeSeq);
+      await runVessel(vesselSeq);
     } else {
       scheduleKde();
+      scheduleVessel();
     }
   }
 }
@@ -3808,6 +3929,7 @@ function currentMissionUi() {
     show_impacts: Boolean(els.showImpacts?.checked),
     show_kde: Boolean(els.showKde?.checked),
     show_boats: Boolean(els.showBoats?.checked),
+    show_vessel_risk: Boolean(els.showVessel?.checked),
     show_iip_boundary: Boolean(els.showIipBoundary?.checked),
     show_terminate_boundary: Boolean(els.showTerminateBoundary?.checked),
     kde_object_name: null,
@@ -3930,6 +4052,10 @@ function applyMissionUi(ui) {
   if (els.showBoats && ui.show_boats != null) {
     els.showBoats.checked = ui.show_boats;
     setBoatsVisible(ui.show_boats);
+  }
+  if (els.showVessel && ui.show_vessel_risk != null) {
+    els.showVessel.checked = ui.show_vessel_risk;
+    setVesselRiskVisible(ui.show_vessel_risk);
   }
   if (els.showIipBoundary && ui.show_iip_boundary != null) {
     els.showIipBoundary.checked = ui.show_iip_boundary;

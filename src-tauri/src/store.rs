@@ -10,6 +10,7 @@ use crate::kde::KdeGrid;
 use crate::generate::GenerateSpec;
 use crate::rocketpy::RocketPySpec;
 use crate::simulate::{DebrisCatalog, SimulateOrigin};
+use crate::vessel::VesselParams;
 use crate::wind::WindSpec;
 use crate::parse::{downsample_lla, ParsedTrack};
 use crate::risk::{
@@ -143,6 +144,7 @@ pub struct Store {
     pub boats: HashMap<u64, Boat>,
     pub catalogs: HashMap<u64, DebrisCatalog>,
     pub wind: WindSpec,
+    pub vessel: VesselParams,
     cache: RefCell<ModelCache>,
 }
 
@@ -155,6 +157,7 @@ impl Store {
             boats: HashMap::new(),
             catalogs: default_catalogs(),
             wind: WindSpec::Off,
+            vessel: VesselParams::default(),
             cache: RefCell::new(ModelCache::default()),
         }
     }
@@ -166,6 +169,7 @@ impl Store {
         self.boats.clear();
         self.catalogs = default_catalogs();
         self.wind = WindSpec::Off;
+        self.vessel = VesselParams::default();
         self.reset_model_cache();
     }
 
@@ -279,6 +283,12 @@ impl Store {
     pub fn set_boat_visible(&mut self, id: u64, visible: bool) -> Result<(), String> {
         let boat = self.boats.get_mut(&id).ok_or_else(|| "unknown boat".to_string())?;
         boat.visible = visible;
+        Ok(())
+    }
+
+    pub fn set_boat_people(&mut self, id: u64, people: Option<u32>) -> Result<(), String> {
+        let boat = self.boats.get_mut(&id).ok_or_else(|| "unknown boat".to_string())?;
+        boat.people_on_board = people;
         Ok(())
     }
 
@@ -1229,6 +1239,7 @@ impl Store {
             unassigned,
             wind: self.wind.without_site_profiles(),
             catalogs: self.catalogs_view(),
+            vessel: self.vessel.clone(),
         }
     }
 
@@ -1602,6 +1613,9 @@ mod tests {
             source_time_s: Some(10.0),
             delta_v_ecef: None,
             ground_alt_m: 0.0,
+            mass_kg: 0.0,
+            radius_m: 0.0,
+            trial_id: 0,
         };
         let (oid, mid) = store
             .resolve_sim_target(None, Some("Spent stage"), "Staging", "Spent stage")
@@ -1678,6 +1692,9 @@ mod tests {
             source_time_s: Some(10.0),
             delta_v_ecef: delta_v.then_some([1.0, 0.0, 0.0]),
             ground_alt_m: 0.0,
+            mass_kg: 0.0,
+            radius_m: 0.0,
+            trial_id: 0,
         }
     }
 
@@ -1758,6 +1775,8 @@ mod tests {
                 ballistic_coeff: 400.0,
                 delta_v_mps: 30.0,
                 count: 1,
+                mass_kg: 40.0,
+                radius_m: 0.4,
             }],
         };
         let nav_spec = NavFailSpec {
@@ -1788,12 +1807,16 @@ mod tests {
                     ballistic_coeff: 400.0,
                     delta_v_mps: 50.0,
                     count: 2,
+                    mass_kg: 40.0,
+                    radius_m: 0.4,
                 },
                 DebrisPiece {
                     name: "Skin".into(),
                     ballistic_coeff: 40.0,
                     delta_v_mps: 80.0,
                     count: 3,
+                    mass_kg: 4.0,
+                    radius_m: 0.3,
                 },
             ],
         };
@@ -1821,6 +1844,9 @@ mod tests {
                     source_time_s: None,
                     delta_v_ecef: Some([1.0, 0.0, 0.0]),
                     ground_alt_m: 0.0,
+                    mass_kg: 1.0,
+                    radius_m: 0.1,
+                    trial_id: 1,
                 },
                 weight: 1.0,
             })

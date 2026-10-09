@@ -81,6 +81,8 @@ pub struct RiskModelView {
     pub wind: crate::wind::WindSpec,
     #[serde(default)]
     pub catalogs: Vec<crate::simulate::DebrisCatalog>,
+    #[serde(default)]
+    pub vessel: crate::vessel::VesselParams,
 }
 
 pub fn trajectory_probability(
