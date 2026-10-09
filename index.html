@@ -65,10 +65,25 @@
           <input id="boat-kml-input" type="file" accept=".kml,application/vnd.google-earth.kml+xml" multiple hidden />
           <div class="section-body">
             <p class="muted risk-hint">
-              Load AIS-style boat reports. Hover or select a boat for people on board, age, and the
-              predicted-track score against the debris KDE.
+              Load AIS-style boat reports. Each boat’s strike probability is the vessel risk of the H3
+              cell it sits in. Individual risk is that probability times people on board.
             </p>
+            <div class="gen-grid vessel-grid">
+              <label title="KE_th. A debris piece is dropped from a trial when its kinetic energy is below this.">KE threshold J
+                <input id="vessel-ke" type="number" min="0" step="1000" value="0" />
+              </label>
+              <label title="A_proj, vessel presented area perpendicular to the debris path.">Vessel area m²
+                <input id="vessel-area" type="number" min="0" step="1" value="80" />
+              </label>
+              <label title="P_proj, vessel presented perimeter perpendicular to the debris path.">Perimeter m
+                <input id="vessel-perim" type="number" min="0" step="1" value="40" />
+              </label>
+              <label title="Maximum Monte Carlo trials kept for each trajectory.">Trial cap N
+                <input id="vessel-trials" type="number" min="1" max="64" step="1" value="32" />
+              </label>
+            </div>
             <div id="boat-risk" class="muted boat-risk"></div>
+            <div id="vessel-status" class="muted wind-hint"></div>
             <div id="boat-list" class="boat-list">
               <div class="empty">No boats loaded.</div>
             </div>
@@ -103,6 +118,7 @@
           <div class="globe-bar-right">
             <label class="inline muted"><input type="checkbox" id="show-impacts" checked /> Impacts</label>
             <label class="inline muted"><input type="checkbox" id="show-kde" checked /> KDE</label>
+            <label class="inline muted" title="H3 cell risk Risk(g) for vessels"><input type="checkbox" id="show-vessel-risk" checked /> Vessel risk</label>
             <label class="inline muted"><input type="checkbox" id="show-boats" checked /> Boats</label>
             <label class="inline muted" title="Convex hull on the ellipsoid around impact points"><input type="checkbox" id="show-iip-boundary" /> IIP boundary</label>
             <label class="inline muted" title="Convex hull on the ellipsoid around nav-failure FTS fire positions"><input type="checkbox" id="show-terminate-boundary" /> Terminate boundary</label>

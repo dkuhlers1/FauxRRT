@@ -34,6 +34,8 @@ pub struct MissionDocument {
     pub boats: Vec<Boat>,
     #[serde(default)]
     pub catalogs: Vec<DebrisCatalog>,
+    #[serde(default)]
+    pub vessel: crate::vessel::VesselParams,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -101,6 +103,8 @@ pub struct MissionUi {
     pub show_iip_boundary: bool,
     #[serde(default)]
     pub show_terminate_boundary: bool,
+    #[serde(default = "default_true")]
+    pub show_vessel_risk: bool,
 }
 
 impl Default for MissionUi {
@@ -114,6 +118,7 @@ impl Default for MissionUi {
             show_boats: true,
             show_iip_boundary: false,
             show_terminate_boundary: false,
+            show_vessel_risk: true,
         }
     }
 }
@@ -192,6 +197,7 @@ impl MissionDocument {
                 boats
             },
             catalogs: store.catalogs_view(),
+            vessel: store.vessel.clone(),
         }
     }
 
@@ -210,6 +216,7 @@ impl MissionDocument {
 
     pub fn apply_to_store(&self, store: &mut Store, mission_dir: Option<&Path>) -> Vec<String> {
         store.clear();
+        store.vessel = self.vessel.clone();
         store.set_wind(self.wind.clone());
         if !self.catalogs.is_empty() {
             store.catalogs.clear();
@@ -474,6 +481,8 @@ mod tests {
                     ballistic_coeff: 500.0,
                     delta_v_mps: 40.0,
                     count: 2,
+                    mass_kg: 40.0,
+                    radius_m: 0.4,
                 }],
             })
             .unwrap();

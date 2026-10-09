@@ -1,6 +1,8 @@
 //! Sample a state from an existing trajectory, then propagate a spent stage,
 //! FTS debris, or a max-g nav-failure turn followed by FTS.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use serde::{Deserialize, Serialize};
 
 use crate::generate::{ecef_coast_accel, enu_basis, integrate_turn, track_from_state, Vec3};
@@ -20,11 +22,27 @@ pub struct DebrisPiece {
     pub delta_v_mps: f64,
     #[serde(default = "default_count")]
     pub count: u32,
+    /// Piece mass used by the vessel kinetic-energy gate.
+    #[serde(default = "default_piece_mass")]
+    pub mass_kg: f64,
+    /// Piece radius used by the vulnerability area.
+    #[serde(default = "default_piece_radius")]
+    pub radius_m: f64,
 }
 
 fn default_count() -> u32 {
     1
 }
+
+fn default_piece_mass() -> f64 {
+    10.0
+}
+
+fn default_piece_radius() -> f64 {
+    0.2
+}
+
+static NEXT_TRIAL: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DebrisCatalog {
@@ -39,11 +57,11 @@ impl DebrisCatalog {
             id: 1,
             name: "Default FTS".into(),
             pieces: vec![
-                piece("Propellant tank", 800.0, 40.0, 2),
-                piece("Aft skirt", 350.0, 60.0, 2),
-                piece("Avionics", 180.0, 80.0, 2),
-                piece("Skin panel", 70.0, 100.0, 6),
-                piece("Fragment", 20.0, 140.0, 10),
+                piece("Propellant tank", 800.0, 40.0, 2, 250.0, 0.55),
+                piece("Aft skirt", 350.0, 60.0, 2, 80.0, 0.45),
+                piece("Avionics", 180.0, 80.0, 2, 15.0, 0.18),
+                piece("Skin panel", 70.0, 100.0, 6, 4.0, 0.35),
+                piece("Fragment", 20.0, 140.0, 10, 0.8, 0.06),
             ],
         }
     }
@@ -85,12 +103,21 @@ impl DebrisCatalog {
     }
 }
 
-fn piece(name: &str, ballistic_coeff: f64, delta_v_mps: f64, count: u32) -> DebrisPiece {
+fn piece(
+    name: &str,
+    ballistic_coeff: f64,
+    delta_v_mps: f64,
+    count: u32,
+    mass_kg: f64,
+    radius_m: f64,
+) -> DebrisPiece {
     DebrisPiece {
         name: name.into(),
         ballistic_coeff,
         delta_v_mps,
         count,
+        mass_kg,
+        radius_m,
     }
 }
 
@@ -141,6 +168,19 @@ pub struct SimulateOrigin {
     /// HAE floor matching the parent landing (pad), not necessarily the ellipsoid.
     #[serde(default, skip_serializing_if = "is_zero_f64")]
     pub ground_alt_m: f64,
+    /// Mass copied from the catalogue piece. Zero means the vessel default.
+    #[serde(default, skip_serializing_if = "is_zero_f64")]
+    pub mass_kg: f64,
+    /// Radius copied from the catalogue piece. Zero means the vessel default.
+    #[serde(default, skip_serializing_if = "is_zero_f64")]
+    pub radius_m: f64,
+    /// Pieces spawned together share one trial id so the cloud stays correlated.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub trial_id: u64,
+}
+
+fn is_zero_u64(v: &u64) -> bool {
+    *v == 0
 }
 
 fn is_zero_f64(v: &f64) -> bool {
@@ -552,6 +592,9 @@ pub fn build_spent_stage(
             source_time_s: Some(sample.time_s),
             delta_v_ecef: None,
             ground_alt_m,
+            mass_kg: 0.0,
+            radius_m: 0.0,
+            trial_id: 0,
         },
         weight: 1.0,
     })
@@ -637,6 +680,9 @@ pub fn build_nav_failure(
                 source_time_s: Some(sample.time_s),
                 delta_v_ecef: None,
                 ground_alt_m,
+                mass_kg: 0.0,
+                radius_m: 0.0,
+                trial_id: 0,
             },
             weight: 0.0,
         });
@@ -741,6 +787,7 @@ fn spawn_debris(
     ground_alt_m: f64,
 ) -> Result<Vec<BuiltTrack>, String> {
     let mut rng = Rng::new(seed.max(1));
+    let trial_id = NEXT_TRIAL.fetch_add(1, Ordering::Relaxed);
     let mut jobs = Vec::new();
     for piece in &catalog.pieces {
         for i in 1..=piece.count {
@@ -752,11 +799,11 @@ fn spawn_debris(
             } else {
                 format!("{name_prefix}-{slug}-{i:02}")
             };
-            jobs.push((name, piece.ballistic_coeff, dv));
+            jobs.push((name, piece.ballistic_coeff, dv, piece.mass_kg, piece.radius_m));
         }
     }
     jobs.into_par_iter()
-        .map(|(name, beta, dv)| {
+        .map(|(name, beta, dv, mass_kg, radius_m)| {
             let v_piece = v.add(dv);
             let parsed = track_from_state(r, v_piece, beta, wind, ground_alt_m, time_offset)?;
             Ok(BuiltTrack {
@@ -772,6 +819,9 @@ fn spawn_debris(
                     source_time_s: Some(source.time_s),
                     delta_v_ecef: Some(dv.to_array()),
                     ground_alt_m,
+                    mass_kg,
+                    radius_m,
+                    trial_id,
                 },
                 weight: 1.0,
             })
@@ -1097,7 +1147,7 @@ mod tests {
         let cat = DebrisCatalog {
             id: 1,
             name: "tiny".into(),
-            pieces: vec![piece("Tank", 400.0, 50.0, 2), piece("Skin", 40.0, 80.0, 3)],
+            pieces: vec![piece("Tank", 400.0, 50.0, 2, 40.0, 0.4), piece("Skin", 40.0, 80.0, 3, 4.0, 0.3)],
         };
         let tracks = build_fts_debris(&sample, &cat, 1, &WindSpec::Off, "", 0.0).unwrap();
         assert_eq!(tracks.len(), 5);
@@ -1114,7 +1164,7 @@ mod tests {
         let cat = DebrisCatalog {
             id: 1,
             name: "tiny".into(),
-            pieces: vec![piece("Tank", 400.0, 30.0, 1)],
+            pieces: vec![piece("Tank", 400.0, 30.0, 1, 40.0, 0.4)],
         };
         let spec = NavFailSpec {
             source_track_id: 1,
@@ -1163,7 +1213,7 @@ mod tests {
         let cat = DebrisCatalog {
             id: 1,
             name: "tiny".into(),
-            pieces: vec![piece("Tank", 400.0, 30.0, 1)],
+            pieces: vec![piece("Tank", 400.0, 30.0, 1, 40.0, 0.4)],
         };
         let spec = NavFailSpec {
             source_track_id: 1,
@@ -1396,7 +1446,7 @@ mod tests {
         let catalog = DebrisCatalog {
             id: 1,
             name: "one".into(),
-            pieces: vec![piece("Tank", 400.0, 0.0, 1)],
+            pieces: vec![piece("Tank", 400.0, 0.0, 1, 40.0, 0.4)],
         };
         let calm_fts = build_fts_debris(&sample, &catalog, 1, &WindSpec::Off, "", 0.0).unwrap();
         let wind_fts = build_fts_debris(&sample, &catalog, 1, &prepared, "", 0.0).unwrap();

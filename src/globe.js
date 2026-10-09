@@ -856,11 +856,79 @@ export function setKdeVisible(visible) {
   requestRender();
 }
 
+let vesselPrim = null;
+let showVessel = true;
+
+export function setVesselRiskCells(cells) {
+  const Cesium = window.Cesium;
+  clearVesselRisk();
+  if (!viewer || !cells?.length) {
+    requestRender();
+    return;
+  }
+  const max = Math.max(...cells.map((c) => Number(c.risk) || 0), 1e-12);
+  const instances = [];
+  for (const cell of cells) {
+    const ring = cell.boundary || [];
+    if (ring.length < 6) continue;
+    const positions = [];
+    for (let i = 0; i + 1 < ring.length; i += 2) {
+      positions.push(Cesium.Cartesian3.fromDegrees(ring[i], ring[i + 1], 0));
+    }
+    const t = Math.pow(Math.max(Number(cell.risk) || 0, 0) / max, 0.55);
+    const color = Cesium.Color.fromBytes(
+      Math.round(40 + 200 * t),
+      Math.round(70 + 40 * (1 - t)),
+      Math.round(160 * (1 - t) + 30),
+      Math.round(40 + 150 * t),
+    );
+    instances.push(new Cesium.GeometryInstance({
+      geometry: new Cesium.PolygonGeometry({
+        polygonHierarchy: new Cesium.PolygonHierarchy(positions),
+        height: 0,
+        vertexFormat: Cesium.PerInstanceColorAppearance.VERTEX_FORMAT,
+      }),
+      attributes: {
+        color: Cesium.ColorGeometryInstanceAttribute.fromColor(color),
+      },
+    }));
+  }
+  if (!instances.length) {
+    requestRender();
+    return;
+  }
+  vesselPrim = viewer.scene.primitives.add(new Cesium.Primitive({
+    geometryInstances: instances,
+    appearance: new Cesium.PerInstanceColorAppearance({
+      translucent: true,
+      closed: false,
+    }),
+    asynchronous: true,
+    allowPicking: false,
+  }));
+  vesselPrim.show = showVessel;
+  requestRender();
+}
+
+export function setVesselRiskVisible(visible) {
+  showVessel = Boolean(visible);
+  if (vesselPrim) vesselPrim.show = showVessel;
+  requestRender();
+}
+
+export function clearVesselRisk() {
+  if (vesselPrim && viewer) {
+    viewer.scene.primitives.remove(vesselPrim);
+    vesselPrim = null;
+  }
+}
+
 export function clearRiskOverlay() {
   lastImpacts = [];
   lastGrid = null;
   if (impactPoints) impactPoints.removeAll();
   clearKde();
+  clearVesselRisk();
   rebuildIipHull();
 }
 
