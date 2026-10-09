@@ -13,6 +13,7 @@ import {
   nextPendingIndex,
   reviewCardHtml,
   formatLoadProgress,
+  loadFailureMessage,
   uniqueSchemaSummary,
 } from "./schema-review.js";
 
@@ -181,6 +182,15 @@ test("editor requires an origin for a local frame that has none", () => {
   const edited = applyEditorDraft(pending, draft);
   assert.equal(assignmentOf(edited).origin_lat, 32.4);
   assert.equal(assignmentOf(edited).paths[0], "/data/ned.csv");
+});
+
+test("a rejected load command stays visible instead of becoming a blank object", () => {
+  assert.equal(
+    loadFailureMessage("classify_picked not allowed. Command not found"),
+    "classify_picked not allowed. Command not found",
+  );
+  assert.equal(loadFailureMessage({ message: "commit_schema_assignments not allowed" }), "commit_schema_assignments not allowed");
+  assert.equal(loadFailureMessage({}), "The trajectory load failed.");
 });
 
 test("load progress shows bytes, files, and the device", () => {
