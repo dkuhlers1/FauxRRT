@@ -403,6 +403,28 @@ export function applyEditorDraft(group, draft) {
   };
 }
 
+export function formatLoadProgress(payload) {
+  if (!payload) return "";
+  const file = payload.file || "";
+  const device = payload.device && !file.includes(payload.device) ? ` · ${payload.device}` : "";
+  const bytesTotal = Number(payload.bytes_total) || 0;
+  if (bytesTotal > 0) {
+    return `${file} ${formatByteCount(payload.bytes)} / ${formatByteCount(bytesTotal)}${device}`;
+  }
+  const done = Number(payload.done) || 0;
+  const total = Number(payload.total) || 0;
+  if (done > 0 && total > 0) return `${file} (${done}/${total})${device}`;
+  return `${file}${device}`;
+}
+
+function formatByteCount(value) {
+  const n = Number(value) || 0;
+  if (n >= 1e9) return `${(n / 1e9).toFixed(1)} GB`;
+  if (n >= 1e6) return `${(n / 1e6).toFixed(1)} MB`;
+  if (n >= 1e3) return `${(n / 1e3).toFixed(0)} KB`;
+  return `${Math.round(n)} B`;
+}
+
 export function bindReview(root, handlers) {
   root.querySelector("[data-act='schema-yes']")?.addEventListener("click", () => handlers.onYes?.());
   root.querySelector("[data-act='schema-no']")?.addEventListener("click", () => handlers.onNo?.());

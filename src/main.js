@@ -47,6 +47,7 @@ import {
   markCorrection,
   nextPendingIndex,
   reviewCardHtml,
+  formatLoadProgress,
   summaryHtml,
   uniqueSchemaSummary,
 } from "./schema-review.js";
@@ -133,6 +134,7 @@ const els = {
   missionSave: document.getElementById("btn-mission-save"),
   fit: document.getElementById("btn-fit"),
   progress: document.getElementById("progress"),
+  cancelClassify: document.getElementById("btn-cancel-classify"),
   statTracks: document.getElementById("stat-tracks"),
   statPoints: document.getElementById("stat-points"),
   statTime: document.getElementById("stat-time"),
@@ -239,11 +241,16 @@ try {
   console.error(err);
   if (els.progress) els.progress.textContent = `Globe failed: ${err}`;
 }
+els.cancelClassify?.addEventListener("click", () => {
+  els.progress.textContent = "Cancelling…";
+  invoke("cancel_classify").catch((err) => {
+    console.warn(err);
+  });
+});
 try {
   await listen("load-progress", ({ payload }) => {
-    els.progress.textContent = payload.done
-      ? `${payload.file} (${payload.done}/${payload.total})`
-      : payload.file;
+    const text = formatLoadProgress(payload);
+    if (text) els.progress.textContent = text;
   });
 } catch {
   /* previewed outside the Tauri shell */
@@ -300,12 +307,22 @@ async function runLoad(cmd, dest) {
 
 async function runClassify(cmd, dest) {
   setBusy(true);
-  els.progress.textContent = "Classifying trajectory files…";
+  els.progress.textContent = "Choose trajectory files…";
   try {
-    const result = await invoke(cmd, ipcArgs({
+    const picked = await invoke(cmd, ipcArgs({
       objectId: dest.object_id,
       modeName: dest.mode_name,
     }));
+    const paths = picked?.paths || [];
+    if (!paths.length) {
+      schemaSession = null;
+      hideSchemaReview();
+      els.progress.textContent = "No trajectories loaded — pick CSV/text files, or a folder of them.";
+      return;
+    }
+    if (els.cancelClassify) els.cancelClassify.hidden = false;
+    els.progress.textContent = "Preparing local Llama 3.1 8B Instruct…";
+    const result = await invoke("classify_picked", { paths });
     const groups = (result.groups || []).map((group) => ({
       ...group,
       status: "pending",
@@ -333,6 +350,7 @@ async function runClassify(cmd, dest) {
   } catch (err) {
     els.progress.textContent = String(err);
   } finally {
+    if (els.cancelClassify) els.cancelClassify.hidden = true;
     setBusy(false);
     render();
   }
@@ -2424,7 +2442,7 @@ function fillFileLoad(body, obj, destLabel) {
       <button type="button" data-act="load-files" class="primary compact">Choose files…</button>
       <button type="button" data-act="load-folder" class="ghost compact">Choose folder…</button>
     </div>
-    <div class="muted wind-hint">The first import classifies each text file on this computer with Llama 3.1 8B Instruct (Q4_K_M). That model downloads once into the app data folder. Files that share a layout are one schema.</div>
+    <div class="muted wind-hint">The first import classifies each text file on this computer with Llama 3.1 8B Instruct (Q4_K_M). The download and classification stay off the window thread, and Cancel stops them. CUDA is used on NVIDIA, Vulkan on other GPUs, and CPU when there is no GPU.</div>
     ${schemaSession ? summaryHtml(schemaSession.groups, schemaSession.errors) : ""}`;
   const needObject = () => {
     els.progress.textContent = "Add an object, name a mode, then Load files or Generate.";
