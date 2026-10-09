@@ -78,6 +78,11 @@ pub struct Trajectory {
     pub generate: Option<GenerateSpec>,
     pub simulate: Option<SimulateOrigin>,
     pub rocketpy: Option<RocketPySpec>,
+    pub states: crate::parse::LoadedStates,
+    pub classification: Option<crate::classify::TrajectoryClassification>,
+    pub origin_lat: Option<f64>,
+    pub origin_lon: Option<f64>,
+    pub origin_alt_m: Option<f64>,
 }
 
 /// What the Fly 6DOF builder needs from the failure model: the vehicle spec
@@ -304,6 +309,11 @@ impl Store {
                 generate: None,
                 simulate: None,
                 rocketpy: None,
+                states: parsed.states,
+                classification: parsed.classification,
+                origin_lat: parsed.origin_lat,
+                origin_lon: parsed.origin_lon,
+                origin_alt_m: parsed.origin_alt_m,
             };
             self.tracks.insert(id, track);
             ids.push(id);
@@ -351,6 +361,11 @@ impl Store {
                 generate: None,
                 simulate: Some(item.origin),
                 rocketpy: None,
+                states: crate::parse::LoadedStates::default(),
+                classification: None,
+                origin_lat: None,
+                origin_lon: None,
+                origin_alt_m: None,
             };
             self.tracks.insert(id, track);
             ids.push(id);
@@ -1449,11 +1464,11 @@ mod tests {
         let mut store = Store::new();
         let obj = object_with_nominal(&mut store);
         let nom = obj.modes[0].id;
-        let parsed = crate::parse::ParsedTrack {
-            schema: crate::schema::DetectedSchema::generated(),
-            times: Some(vec![0.0, 1.0]),
-            lla: vec![-106.0, 32.0, 100.0, -105.0, 32.1, 80.0],
-        };
+        let parsed = crate::parse::ParsedTrack::from_lla(
+            crate::schema::DetectedSchema::generated(),
+            Some(vec![0.0, 1.0]),
+            vec![-106.0, 32.0, 100.0, -105.0, 32.1, 80.0],
+        );
         store
             .insert_parsed_into(vec![("t".into(), None, parsed)], Some(obj.id), Some(nom))
             .unwrap();
@@ -1464,11 +1479,11 @@ mod tests {
     }
 
     fn stub_track(lon: f32) -> crate::parse::ParsedTrack {
-        crate::parse::ParsedTrack {
-            schema: crate::schema::DetectedSchema::generated(),
-            times: Some(vec![0.0, 1.0]),
-            lla: vec![lon, 32.0, 100.0, lon + 1.0, 32.1, 80.0],
-        }
+        crate::parse::ParsedTrack::from_lla(
+            crate::schema::DetectedSchema::generated(),
+            Some(vec![0.0, 1.0]),
+            vec![lon, 32.0, 100.0, lon + 1.0, 32.1, 80.0],
+        )
     }
 
     #[test]
@@ -1665,6 +1680,11 @@ mod tests {
             generate: None,
             simulate: origin,
             rocketpy: None,
+            states: crate::parse::LoadedStates::default(),
+            classification: None,
+            origin_lat: None,
+            origin_lon: None,
+            origin_alt_m: None,
         }
     }
 
@@ -1769,11 +1789,11 @@ mod tests {
         let synthetic: Vec<BuiltTrack> = (0..extra)
             .map(|i| BuiltTrack {
                 name: format!("frag-{i}"),
-                parsed: ParsedTrack {
-                    schema: DetectedSchema::generated(),
-                    times: Some(vec![0.0, 1.0]),
-                    lla: vec![-106.0, 32.0, 1000.0, -106.0, 32.0, 0.0],
-                },
+                parsed: ParsedTrack::from_lla(
+                    DetectedSchema::generated(),
+                    Some(vec![0.0, 1.0]),
+                    vec![-106.0, 32.0, 1000.0, -106.0, 32.0, 0.0],
+                ),
                 origin: SimulateOrigin {
                     r_ecef: [0.0, 0.0, 0.0],
                     v_ecef: [0.0, 0.0, 0.0],

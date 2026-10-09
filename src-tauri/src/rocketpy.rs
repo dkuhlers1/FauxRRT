@@ -720,11 +720,11 @@ pub fn fly_rocketpy(spec: &RocketPySpec) -> Result<RocketPyFlight, String> {
     }
     let kept = lla.len() / 3;
     Ok(RocketPyFlight {
-        parsed: ParsedTrack {
-            schema: DetectedSchema::generated(),
-            times: Some(times.into_iter().take(kept).collect()),
+        parsed: ParsedTrack::from_lla(
+            DetectedSchema::generated(),
+            Some(times.into_iter().take(kept).collect()),
             lla,
-        },
+        ),
         apogee_m: out.apogee_m,
         impact_time_s: out.impact_time_s,
     })
