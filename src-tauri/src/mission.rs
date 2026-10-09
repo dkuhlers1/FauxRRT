@@ -10,7 +10,7 @@ use crate::generate::GenerateSpec;
 use crate::rocketpy::RocketPySpec;
 use crate::simulate::{DebrisCatalog, SimulateOrigin};
 use crate::wind::WindSpec;
-use crate::parse::{parse_path_with, ParsedTrack};
+use crate::parse::{parse_path, parse_path_with, ParsedTrack};
 use crate::schema::{ColumnMapping, DetectedSchema};
 use crate::store::Store;
 
@@ -323,6 +323,8 @@ fn restore_track(
                 _ => None,
             };
             crate::parse::parse_path_with_classification(&path, class, origin)?
+        } else if track.mapping.is_none() {
+            parse_path(&path)?
         } else {
             parse_path_with(&path, track.mapping.as_ref())?
         };

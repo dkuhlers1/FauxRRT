@@ -12,6 +12,7 @@ import {
   markCorrection,
   nextPendingIndex,
   reviewCardHtml,
+  formatLoadProgress,
   uniqueSchemaSummary,
 } from "./schema-review.js";
 
@@ -180,4 +181,26 @@ test("editor requires an origin for a local frame that has none", () => {
   const edited = applyEditorDraft(pending, draft);
   assert.equal(assignmentOf(edited).origin_lat, 32.4);
   assert.equal(assignmentOf(edited).paths[0], "/data/ned.csv");
+});
+
+test("load progress shows bytes, files, and the device", () => {
+  assert.equal(
+    formatLoadProgress({
+      file: "Downloading Llama 3.1 8B Instruct",
+      bytes: 1_200_000_000,
+      bytes_total: 4_900_000_000,
+      device: "CUDA",
+      done: 0,
+      total: 2,
+    }),
+    "Downloading Llama 3.1 8B Instruct 1.2 GB / 4.9 GB · CUDA",
+  );
+  assert.equal(
+    formatLoadProgress({ file: "Classifying track.csv", done: 1, total: 3, device: "Vulkan", bytes: 0, bytes_total: 0 }),
+    "Classifying track.csv (1/3) · Vulkan",
+  );
+  assert.equal(
+    formatLoadProgress({ file: "No GPU found; classifying on CPU", device: "CPU", done: 0, total: 1 }),
+    "No GPU found; classifying on CPU",
+  );
 });

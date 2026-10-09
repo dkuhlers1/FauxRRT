@@ -61,6 +61,15 @@ pub struct TrackMeta {
     /// Lat of FTS fire (turn-track end or fragment start) for the terminate hull.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub breakup_lat: Option<f32>,
+    /// Loaded state channels, in samples. Zero when that file had no such columns.
+    #[serde(default)]
+    pub velocity_samples: usize,
+    #[serde(default)]
+    pub acceleration_samples: usize,
+    #[serde(default)]
+    pub orientation_samples: usize,
+    #[serde(default)]
+    pub mass_samples: usize,
 }
 
 pub struct Trajectory {
@@ -1314,7 +1323,15 @@ fn summarize_with_prob(track: &Trajectory, budget: usize, probability: f64) -> T
         show_path,
         breakup_lon: fts.0,
         breakup_lat: fts.1,
+        velocity_samples: channel_samples(track.states.velocity_mps.as_deref(), 3),
+        acceleration_samples: channel_samples(track.states.acceleration_mps2.as_deref(), 3),
+        orientation_samples: channel_samples(track.states.orientation_rad.as_deref(), 3),
+        mass_samples: channel_samples(track.states.mass_kg.as_deref(), 1),
     }
+}
+
+fn channel_samples(values: Option<&[f32]>, width: usize) -> usize {
+    values.map(|items| items.len() / width.max(1)).unwrap_or(0)
 }
 
 /// Nav-failure FTS fire: fragments start there; coordinated-turn tracks end there.

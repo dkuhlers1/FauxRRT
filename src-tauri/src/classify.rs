@@ -7,8 +7,11 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::time::Duration;
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -23,10 +26,10 @@ pub const GGUF_URL: &str = "https://huggingface.co/bartowski/Meta-Llama-3.1-8B-I
 const GGUF_MIN_BYTES: u64 = 4_500_000_000;
 
 const LLAMA_TAG: &str = "b11538";
-const LLAMA_LINUX_URL: &str =
-    "https://github.com/ggml-org/llama.cpp/releases/download/b11538/llama-b11538-bin-ubuntu-x64.tar.gz";
-const LLAMA_WINDOWS_URL: &str =
-    "https://github.com/ggml-org/llama.cpp/releases/download/b11538/llama-b11538-bin-win-cpu-x64.zip";
+const LLAMA_RELEASE: &str = "https://github.com/ggml-org/llama.cpp/releases/download/b11538";
+/// One classification call. Long enough for an 8B model on CPU, short enough that a hung llama-cli ends.
+pub const INFERENCE_TIMEOUT: Duration = Duration::from_secs(8 * 60);
+pub const CANCELLED: &str = "classification cancelled";
 
 pub const SYSTEM_PROMPT: &str = r#"You classify trajectory state text files. Return one JSON object and nothing else. No markdown and no conversation.
 
@@ -112,6 +115,7 @@ pub struct ClassificationUnits {
     pub mass: Option<String>,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SchemaReviewStatus {
     Pending,
@@ -291,7 +295,7 @@ enum UnitKind {
     Mass,
 }
 
-pub fn canonical_unit(kind: UnitKind, raw: &str) -> Result<String, ()> {
+fn canonical_unit(kind: UnitKind, raw: &str) -> Result<String, ()> {
     let t = raw.trim().to_ascii_lowercase().replace(' ', "");
     let t = t.replace("per", "/");
     let ok = match kind {
@@ -572,6 +576,7 @@ pub fn group_files(files: Vec<(GroupedFile, TrajectoryClassification)>) -> Vec<S
     groups
 }
 
+#[cfg(test)]
 pub fn next_pending(status: &[SchemaReviewStatus]) -> Option<usize> {
     status.iter().position(|item| *item == SchemaReviewStatus::Pending)
 }
@@ -658,31 +663,151 @@ pub fn position_indexes(class: &TrajectoryClassification) -> Result<(Option<usiz
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct ClassifyNote {
+    pub label: String,
+    pub bytes: u64,
+    pub bytes_total: u64,
+    pub device: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GpuBackend {
+    Cuda,
+    Vulkan,
+    Cpu,
+}
+
+/// NVIDIA uses the CUDA llama.cpp build. Any other GPU uses Vulkan. No GPU uses CPU.
+pub fn choose_backend(nvidia: bool, vulkan: bool) -> GpuBackend {
+    if nvidia {
+        GpuBackend::Cuda
+    } else if vulkan {
+        GpuBackend::Vulkan
+    } else {
+        GpuBackend::Cpu
+    }
+}
+
+pub fn device_name(backend: GpuBackend) -> &'static str {
+    match backend {
+        GpuBackend::Cuda => "CUDA",
+        GpuBackend::Vulkan => "Vulkan",
+        GpuBackend::Cpu => "CPU",
+    }
+}
+
+pub fn device_message(backend: GpuBackend, fell_back: bool) -> &'static str {
+    if fell_back {
+        "GPU runtime failed; classifying on CPU"
+    } else {
+        match backend {
+            GpuBackend::Cuda => "Running on CUDA",
+            GpuBackend::Vulkan => "Running on Vulkan",
+            GpuBackend::Cpu => "No GPU found; classifying on CPU",
+        }
+    }
+}
+
+/// Ask llama.cpp to keep as many layers as fit in VRAM. CPU builds get no offload flags.
+pub fn offload_args(backend: GpuBackend, help: &str) -> Vec<String> {
+    if backend == GpuBackend::Cpu {
+        return Vec::new();
+    }
+    let mut args = Vec::new();
+    if help_has(help, "--fit") {
+        args.push("--fit".into());
+        args.push("on".into());
+    }
+    if help_has(help, "-ngl") || help_has(help, "--n-gpu-layers") {
+        // "auto" leaves the layer count unset so --fit can use the layers that fit.
+        args.push("-ngl".into());
+        args.push("auto".into());
+    }
+    args
+}
+
 pub struct LlamaRuntime {
     pub cli: PathBuf,
     pub model: PathBuf,
+    pub device: String,
+    pub backend: GpuBackend,
+    pub cancel: Arc<AtomicBool>,
+    help: Mutex<Option<String>>,
 }
 
 impl LlamaRuntime {
-    pub fn ensure(data_dir: &Path) -> Result<Self, String> {
-        let model = ensure_model(data_dir)?;
-        let cli = ensure_cli(data_dir)?;
-        Ok(Self { cli, model })
+    #[cfg(test)]
+    pub fn from_paths(cli: PathBuf, model: PathBuf) -> Self {
+        Self {
+            cli,
+            model,
+            device: device_name(GpuBackend::Cpu).into(),
+            backend: GpuBackend::Cpu,
+            cancel: Arc::new(AtomicBool::new(false)),
+            help: Mutex::new(None),
+        }
     }
+
+    /// Download the GGUF and a matching llama.cpp build. Call this only from a background task.
+    pub fn ensure(
+        data_dir: &Path,
+        cancel: &Arc<AtomicBool>,
+        progress: &dyn Fn(ClassifyNote),
+    ) -> Result<Self, String> {
+        let probed = probe_backend();
+        note(progress, device_message(probed, false), 0, 0, device_name(probed));
+        let model = ensure_model(data_dir, cancel, progress, probed)?;
+        let (cli, backend, fell_back) = ensure_cli(data_dir, probed, cancel, progress)?;
+        if fell_back {
+            note(progress, device_message(backend, true), 0, 0, device_name(backend));
+        }
+        Ok(Self {
+            cli,
+            model,
+            device: device_name(backend).into(),
+            backend,
+            cancel: Arc::clone(cancel),
+            help: Mutex::new(None),
+        })
+    }
+
+    fn cached_help(&self) -> Result<String, String> {
+        let mut slot = self.help.lock().unwrap_or_else(|err| err.into_inner());
+        if slot.is_none() {
+            *slot = Some(cli_help(&self.cli, &self.cancel)?);
+        }
+        Ok(slot.clone().unwrap_or_default())
+    }
+}
+
+fn note(progress: &dyn Fn(ClassifyNote), label: &str, bytes: u64, bytes_total: u64, device: &str) {
+    progress(ClassifyNote {
+        label: label.to_string(),
+        bytes,
+        bytes_total,
+        device: device.to_string(),
+    });
 }
 
 impl TextCompleter for LlamaRuntime {
     fn complete(&self, system: &str, user: &str) -> Result<String, String> {
+        if self.cancel.load(Ordering::SeqCst) {
+            return Err(CANCELLED.into());
+        }
         let dir = std::env::temp_dir().join(format!("fauxrrt-llama-{}", std::process::id()));
         fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
         let prompt_path = dir.join("prompt.txt");
         let schema_path = dir.join("schema.json");
         fs::write(&prompt_path, llama_prompt(system, user)).map_err(|e| e.to_string())?;
         fs::write(&schema_path, JSON_SCHEMA).map_err(|e| e.to_string())?;
-        let help = cli_help(&self.cli);
+        let help = self.cached_help()?;
         let mut cmd = Command::new(&self.cli);
         cmd.arg("-m").arg(&self.model);
         cmd.arg("-n").arg("700");
+        for arg in offload_args(self.backend, &help) {
+            cmd.arg(arg);
+        }
         if help_has(&help, "--temp") {
             cmd.arg("--temp").arg("0");
         } else if help_has(&help, "--temperature") {
@@ -709,11 +834,15 @@ impl TextCompleter for LlamaRuntime {
             let prompt = fs::read_to_string(&prompt_path).unwrap_or_default();
             cmd.arg("-p").arg(prompt);
         }
-        let output = cmd.output().map_err(|e| format!("could not run {}: {e}", self.cli.display()))?;
+        let output = run_bounded(cmd, INFERENCE_TIMEOUT, &self.cancel)?;
         let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
         if stdout.trim().is_empty() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            let tail = stderr.lines().rev().find(|line| !line.trim().is_empty()).unwrap_or("no llama.cpp output");
+            let tail = stderr
+                .lines()
+                .rev()
+                .find(|line| !line.trim().is_empty())
+                .unwrap_or("no llama.cpp output");
             return Err(format!("llama.cpp failed: {tail}"));
         }
         Ok(stdout)
@@ -732,16 +861,64 @@ fn help_has(help: &str, flag: &str) -> bool {
     })
 }
 
-fn cli_help(cli: &Path) -> String {
-    let output = Command::new(cli).arg("--help").output();
-    match output {
-        Ok(out) => format!(
-            "{}\n{}",
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
-        ),
-        Err(_) => String::new(),
-    }
+fn cli_help(cli: &Path, cancel: &AtomicBool) -> Result<String, String> {
+    let mut cmd = Command::new(cli);
+    cmd.arg("--help");
+    let out = run_bounded(cmd, Duration::from_secs(30), cancel)?;
+    Ok(format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    ))
+}
+
+/// Run a process until it exits, the cancel flag is set, or the timeout elapses.
+pub fn run_bounded(mut cmd: Command, timeout: Duration, cancel: &AtomicBool) -> Result<std::process::Output, String> {
+    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = cmd.spawn().map_err(|err| format!("could not start process: {err}"))?;
+    let mut stdout = child.stdout.take().unwrap();
+    let mut stderr = child.stderr.take().unwrap();
+    let stdout_task = thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stdout.read_to_end(&mut buf);
+        buf
+    });
+    let stderr_task = thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stderr.read_to_end(&mut buf);
+        buf
+    });
+    let started = Instant::now();
+    let status = loop {
+        if cancel.load(Ordering::SeqCst) {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = stdout_task.join();
+            let _ = stderr_task.join();
+            return Err(CANCELLED.into());
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if started.elapsed() >= timeout => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stdout_task.join();
+                let _ = stderr_task.join();
+                return Err("llama.cpp timed out".into());
+            }
+            Ok(None) => thread::sleep(Duration::from_millis(50)),
+            Err(err) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stdout_task.join();
+                let _ = stderr_task.join();
+                return Err(format!("process failed: {err}"));
+            }
+        }
+    };
+    let stdout = stdout_task.join().unwrap_or_default();
+    let stderr = stderr_task.join().unwrap_or_default();
+    Ok(std::process::Output { status, stdout, stderr })
 }
 
 fn classification_grammar() -> &'static str {
@@ -756,7 +933,12 @@ pair ::= string ws ":" ws string
 "#
 }
 
-pub fn ensure_model(data_dir: &Path) -> Result<PathBuf, String> {
+pub fn ensure_model(
+    data_dir: &Path,
+    cancel: &AtomicBool,
+    progress: &dyn Fn(ClassifyNote),
+    backend: GpuBackend,
+) -> Result<PathBuf, String> {
     if let Ok(path) = std::env::var("FAUXRRT_LLAMA_MODEL") {
         let path = PathBuf::from(path);
         if path.is_file() {
@@ -769,7 +951,11 @@ pub fn ensure_model(data_dir: &Path) -> Result<PathBuf, String> {
         return Ok(dest);
     }
     fs::create_dir_all(dest.parent().unwrap()).map_err(|e| e.to_string())?;
-    download_to(GGUF_URL, &dest).map_err(|err| {
+    let device = device_name(backend);
+    download_to(GGUF_URL, &dest, cancel, &|bytes, total| {
+        note(progress, "Downloading Llama 3.1 8B Instruct", bytes, total, device);
+    })
+    .map_err(|err| {
         format!(
             "{err}. Llama-3.1-8B-Instruct Q4_K_M can also be placed at {}. Source: {GGUF_URL}",
             dest.display()
@@ -778,31 +964,126 @@ pub fn ensure_model(data_dir: &Path) -> Result<PathBuf, String> {
     Ok(dest)
 }
 
-pub fn ensure_cli(data_dir: &Path) -> Result<PathBuf, String> {
+fn ensure_cli(
+    data_dir: &Path,
+    probed: GpuBackend,
+    cancel: &AtomicBool,
+    progress: &dyn Fn(ClassifyNote),
+) -> Result<(PathBuf, GpuBackend, bool), String> {
     if let Ok(path) = std::env::var("FAUXRRT_LLAMA_CLI") {
         let path = PathBuf::from(path);
-        if path.is_file() {
-            return Ok(path);
+        if !path.is_file() {
+            return Err(format!("FAUXRRT_LLAMA_CLI is not a file: {}", path.display()));
         }
-        return Err(format!("FAUXRRT_LLAMA_CLI is not a file: {}", path.display()));
+        let help = cli_help(&path, cancel)?;
+        let backend = if offload_args(probed, &help).is_empty() {
+            GpuBackend::Cpu
+        } else {
+            probed
+        };
+        return Ok((path, backend, probed != GpuBackend::Cpu && backend == GpuBackend::Cpu));
     }
-    if let Some(found) = which_on_path(if cfg!(windows) { "llama-cli.exe" } else { "llama-cli" }) {
-        return Ok(found);
+    let primary = install_backend(data_dir, probed, cancel, progress)?;
+    if probed != GpuBackend::Cpu && !cli_launches(&primary, cancel)? {
+        let cpu = install_backend(data_dir, GpuBackend::Cpu, cancel, progress)?;
+        return Ok((cpu, GpuBackend::Cpu, true));
     }
-    let root = data_dir.join("llama.cpp");
+    Ok((primary, probed, false))
+}
+
+fn install_backend(
+    data_dir: &Path,
+    backend: GpuBackend,
+    cancel: &AtomicBool,
+    progress: &dyn Fn(ClassifyNote),
+) -> Result<PathBuf, String> {
+    let root = data_dir.join("llama.cpp").join(backend_dir_name(backend));
     if let Some(found) = find_cli(&root) {
         return Ok(found);
     }
     fs::create_dir_all(&root).map_err(|e| e.to_string())?;
-    let (name, url) = if cfg!(windows) {
-        (format!("llama-{LLAMA_TAG}-bin-win-cpu-x64.zip"), LLAMA_WINDOWS_URL)
-    } else {
-        (format!("llama-{LLAMA_TAG}-bin-ubuntu-x64.tar.gz"), LLAMA_LINUX_URL)
-    };
-    let archive = root.join(name);
-    download_to(url, &archive)?;
-    extract_archive(&archive, &root)?;
+    let (name, url) = cli_asset(backend);
+    let device = device_name(backend);
+    let archive = root.join(&name);
+    download_to(&url, &archive, cancel, &|bytes, total| {
+        note(
+            progress,
+            &format!("Downloading llama.cpp ({device})"),
+            bytes,
+            total,
+            device,
+        );
+    })?;
+    extract_archive(&archive, &root, cancel)?;
     find_cli(&root).ok_or_else(|| format!("llama.cpp archive did not contain llama-cli ({url})"))
+}
+
+pub fn cli_asset(backend: GpuBackend) -> (String, String) {
+    let name = if cfg!(windows) {
+        match backend {
+            GpuBackend::Cuda => format!("llama-{LLAMA_TAG}-bin-win-cuda-12.4-x64.zip"),
+            GpuBackend::Vulkan => format!("llama-{LLAMA_TAG}-bin-win-vulkan-x64.zip"),
+            GpuBackend::Cpu => format!("llama-{LLAMA_TAG}-bin-win-cpu-x64.zip"),
+        }
+    } else {
+        match backend {
+            GpuBackend::Cuda => format!("llama-{LLAMA_TAG}-bin-ubuntu-cuda-12.8-x64.tar.gz"),
+            GpuBackend::Vulkan => format!("llama-{LLAMA_TAG}-bin-ubuntu-vulkan-x64.tar.gz"),
+            GpuBackend::Cpu => format!("llama-{LLAMA_TAG}-bin-ubuntu-x64.tar.gz"),
+        }
+    };
+    let url = format!("{LLAMA_RELEASE}/{name}");
+    (name, url)
+}
+
+fn backend_dir_name(backend: GpuBackend) -> &'static str {
+    match backend {
+        GpuBackend::Cuda => "cuda",
+        GpuBackend::Vulkan => "vulkan",
+        GpuBackend::Cpu => "cpu",
+    }
+}
+
+fn probe_backend() -> GpuBackend {
+    choose_backend(nvidia_present(), vulkan_present())
+}
+
+fn nvidia_present() -> bool {
+    process_succeeds("nvidia-smi", &["-L"], Duration::from_secs(3))
+}
+
+fn vulkan_present() -> bool {
+    if cfg!(windows) && windows_vulkan_loader() {
+        return true;
+    }
+    process_succeeds("vulkaninfo", &["--summary"], Duration::from_secs(4))
+}
+
+fn windows_vulkan_loader() -> bool {
+    let root = std::env::var_os("SystemRoot").or_else(|| std::env::var_os("WINDIR"));
+    let Some(root) = root else {
+        return false;
+    };
+    PathBuf::from(root).join("System32").join("vulkan-1.dll").is_file()
+}
+
+fn process_succeeds(program: &str, args: &[&str], timeout: Duration) -> bool {
+    let mut cmd = Command::new(program);
+    cmd.args(args);
+    match run_bounded(cmd, timeout, &AtomicBool::new(false)) {
+        Ok(out) => out.status.success(),
+        Err(_) => false,
+    }
+}
+
+fn cli_launches(path: &Path, cancel: &AtomicBool) -> Result<bool, String> {
+    let mut cmd = Command::new(path);
+    cmd.arg("--version");
+    match run_bounded(cmd, Duration::from_secs(30), cancel) {
+        Err(err) if err == CANCELLED => Err(err),
+        Err(_) => Ok(false),
+        Ok(out) => Ok(out.status.success()),
+    }
 }
 
 fn find_cli(root: &Path) -> Option<PathBuf> {
@@ -814,18 +1095,15 @@ fn find_cli(root: &Path) -> Option<PathBuf> {
         .map(|entry| entry.into_path())
 }
 
-fn which_on_path(name: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path) {
-        let candidate = dir.join(name);
-        if candidate.is_file() {
-            return Some(candidate);
-        }
+fn download_to(
+    url: &str,
+    dest: &Path,
+    cancel: &AtomicBool,
+    on_progress: &dyn Fn(u64, u64),
+) -> Result<(), String> {
+    if cancel.load(Ordering::SeqCst) {
+        return Err(CANCELLED.into());
     }
-    None
-}
-
-fn download_to(url: &str, dest: &Path) -> Result<(), String> {
     if dest.is_file() && fs::metadata(dest).map(|m| m.len() > 0).unwrap_or(false) {
         if !dest.extension().is_some_and(|ext| ext == "gguf") || fs::metadata(dest).map(|m| m.len() >= GGUF_MIN_BYTES).unwrap_or(false)
         {
@@ -838,61 +1116,90 @@ fn download_to(url: &str, dest: &Path) -> Result<(), String> {
         .timeout(Duration::from_secs(60 * 180))
         .build();
     let response = agent.get(url).call().map_err(|err| format!("download {url} failed: {err}"))?;
+    let total = response.header("content-length").and_then(|value| value.parse().ok()).unwrap_or(0);
     let mut reader = response.into_reader();
     let mut file = fs::File::create(&tmp).map_err(|err| format!("create {}: {err}", tmp.display()))?;
-    let mut buf = [0u8; 1024 * 256];
-    loop {
-        let n = reader.read(&mut buf).map_err(|err| format!("read {url}: {err}"))?;
-        if n == 0 {
-            break;
+    let last_emit = std::cell::Cell::new(Instant::now() - Duration::from_secs(1));
+    let copied = copy_cancellable(&mut reader, &mut file, cancel, &|bytes| {
+        if last_emit.get().elapsed() >= Duration::from_millis(200) || (total > 0 && bytes >= total) {
+            on_progress(bytes, total);
+            last_emit.set(Instant::now());
         }
-        file.write_all(&buf[..n]).map_err(|err| format!("write {}: {err}", tmp.display()))?;
+    });
+    if let Err(err) = copied {
+        drop(file);
+        let _ = fs::remove_file(&tmp);
+        return Err(err);
     }
     file.sync_all().ok();
     fs::rename(&tmp, dest).map_err(|err| format!("rename download: {err}"))?;
     Ok(())
 }
 
-fn extract_archive(archive: &Path, dest: &Path) -> Result<(), String> {
+pub fn copy_cancellable<R: Read, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    cancel: &AtomicBool,
+    on_progress: &dyn Fn(u64),
+) -> Result<u64, String> {
+    let mut buf = [0u8; 1024 * 256];
+    let mut written = 0u64;
+    loop {
+        if cancel.load(Ordering::SeqCst) {
+            return Err(CANCELLED.into());
+        }
+        let n = reader.read(&mut buf).map_err(|err| format!("read download: {err}"))?;
+        if n == 0 {
+            break;
+        }
+        writer.write_all(&buf[..n]).map_err(|err| format!("write download: {err}"))?;
+        written += n as u64;
+        on_progress(written);
+    }
+    Ok(written)
+}
+
+fn extract_archive(archive: &Path, dest: &Path, cancel: &AtomicBool) -> Result<(), String> {
     let name = archive.file_name().and_then(|n| n.to_str()).unwrap_or("");
-    let status = if name.ends_with(".zip") {
+    let cmd = if name.ends_with(".zip") {
         if cfg!(windows) {
-            Command::new("powershell")
-                .args([
-                    "-NoProfile",
-                    "-Command",
-                    &format!(
-                        "Expand-Archive -Force -LiteralPath '{}' -DestinationPath '{}'",
-                        archive.display(),
-                        dest.display()
-                    ),
-                ])
-                .status()
+            let mut cmd = Command::new("powershell");
+            cmd.args([
+                "-NoProfile",
+                "-Command",
+                &format!(
+                    "Expand-Archive -Force -LiteralPath '{}' -DestinationPath '{}'",
+                    archive.display(),
+                    dest.display()
+                ),
+            ]);
+            cmd
         } else {
-            Command::new("unzip").args(["-o", &archive.to_string_lossy(), "-d", &dest.to_string_lossy()]).status()
+            let mut cmd = Command::new("unzip");
+            cmd.args(["-o", &archive.to_string_lossy(), "-d", &dest.to_string_lossy()]);
+            cmd
         }
     } else {
-        Command::new("tar")
-            .args(["-xzf", &archive.to_string_lossy(), "-C", &dest.to_string_lossy()])
-            .status()
-    }
-    .map_err(|err| format!("extract {}: {err}", archive.display()))?;
-    if status.success() {
+        let mut cmd = Command::new("tar");
+        cmd.args(["-xzf", &archive.to_string_lossy(), "-C", &dest.to_string_lossy()]);
+        cmd
+    };
+    let output = run_bounded(cmd, Duration::from_secs(10 * 60), cancel)?;
+    if output.status.success() {
         Ok(())
     } else {
         Err(format!("extract {} failed", archive.display()))
     }
 }
 
-pub fn classify_text(text: &str, data_dir: &Path) -> Result<TrajectoryClassification, String> {
-    let runtime = LlamaRuntime::ensure(data_dir)?;
-    classify_with(&runtime, &excerpt_of(text))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Mutex;
+    use std::time::Duration;
 
     fn sample_ecef() -> TrajectoryClassification {
         let mut columns = BTreeMap::new();
@@ -1114,13 +1421,105 @@ mod tests {
         if !Path::new(&model).is_file() || !Path::new(&cli).is_file() {
             return;
         }
-        let runtime = LlamaRuntime {
-            cli: PathBuf::from(cli),
-            model: PathBuf::from(model),
-        };
+        let runtime = LlamaRuntime::from_paths(PathBuf::from(cli), PathBuf::from(model));
         let excerpt = "time,lat,lon,alt\n0,32.4,-106.4,1000\n1,32.41,-106.39,1100\n";
         let class = classify_with(&runtime, excerpt).expect("live classification");
         assert_eq!(class.coordinate_system, "LLA");
         assert!(has_position_columns(&class));
+    }
+
+    #[test]
+    fn gpu_preference_is_cuda_then_vulkan_then_cpu() {
+        assert_eq!(choose_backend(true, true), GpuBackend::Cuda);
+        assert_eq!(choose_backend(true, false), GpuBackend::Cuda);
+        assert_eq!(choose_backend(false, true), GpuBackend::Vulkan);
+        assert_eq!(choose_backend(false, false), GpuBackend::Cpu);
+        assert_eq!(device_message(GpuBackend::Cpu, false), "No GPU found; classifying on CPU");
+        assert_eq!(device_message(GpuBackend::Cuda, false), "Running on CUDA");
+        assert_eq!(device_message(GpuBackend::Vulkan, false), "Running on Vulkan");
+        assert_eq!(device_message(GpuBackend::Cuda, true), "GPU runtime failed; classifying on CPU");
+
+        let (cuda_name, cuda_url) = cli_asset(GpuBackend::Cuda);
+        let (vulkan_name, vulkan_url) = cli_asset(GpuBackend::Vulkan);
+        let (cpu_name, cpu_url) = cli_asset(GpuBackend::Cpu);
+        assert!(cuda_url.contains("b11538") && cuda_name.contains("cuda"));
+        assert!(vulkan_name.contains("vulkan") && vulkan_url.contains("b11538"));
+        assert!(!cpu_name.contains("cuda") && !cpu_name.contains("vulkan"));
+        assert!(cpu_url.contains("b11538"));
+        if cfg!(windows) {
+            assert!(cuda_name.contains("win-cuda-12.4"));
+            assert!(vulkan_name.contains("win-vulkan"));
+            assert!(cpu_name.ends_with(".zip"));
+        } else {
+            assert!(cuda_name.contains("ubuntu-cuda"));
+            assert!(cpu_name.ends_with(".tar.gz"));
+        }
+    }
+
+    #[test]
+    fn gpu_offload_fits_layers_and_cpu_passes_none() {
+        let help = "usage --fit [on|off] -ngl N --n-gpu-layers N --temp N";
+        let cuda = offload_args(GpuBackend::Cuda, help);
+        assert_eq!(&cuda[0..2], ["--fit", "on"]);
+        assert_eq!(&cuda[2..4], ["-ngl", "auto"]);
+        assert!(offload_args(GpuBackend::Vulkan, help).windows(2).any(|pair| pair == ["--fit", "on"]));
+        assert!(offload_args(GpuBackend::Cpu, help).is_empty());
+        assert!(offload_args(GpuBackend::Cuda, "usage --temp N").is_empty());
+    }
+
+    #[test]
+    fn stuck_llama_times_out_and_cancel_kills_it() {
+        let cancel = AtomicBool::new(false);
+        let err = run_bounded(slow_command(), Duration::from_millis(400), &cancel).unwrap_err();
+        assert!(err.contains("timed out"), "{err}");
+
+        cancel.store(true, Ordering::SeqCst);
+        let err = run_bounded(slow_command(), Duration::from_secs(30), &cancel).unwrap_err();
+        assert!(err.contains("cancelled"), "{err}");
+
+        let out = run_bounded(echo_command(), Duration::from_secs(5), &AtomicBool::new(false)).unwrap();
+        assert!(out.status.success());
+        assert!(String::from_utf8_lossy(&out.stdout).to_ascii_lowercase().contains("ok"));
+    }
+
+    #[test]
+    fn download_copy_stops_when_cancelled() {
+        let cancel = AtomicBool::new(false);
+        let data = vec![7u8; 1024 * 256 * 3];
+        let mut reader = std::io::Cursor::new(data);
+        let mut writer = Vec::new();
+        let err = copy_cancellable(&mut reader, &mut writer, &cancel, &|n| {
+            if n >= 1024 * 256 {
+                cancel.store(true, Ordering::SeqCst);
+            }
+        })
+        .unwrap_err();
+        assert!(err.contains("cancelled"), "{err}");
+        assert!(writer.len() < 1024 * 256 * 3);
+        assert!(!writer.is_empty());
+    }
+
+    fn slow_command() -> Command {
+        if cfg!(windows) {
+            let mut cmd = Command::new("ping");
+            cmd.args(["-n", "40", "127.0.0.1"]);
+            cmd
+        } else {
+            let mut cmd = Command::new("sleep");
+            cmd.arg("30");
+            cmd
+        }
+    }
+
+    fn echo_command() -> Command {
+        if cfg!(windows) {
+            let mut cmd = Command::new("cmd");
+            cmd.args(["/C", "echo ok"]);
+            cmd
+        } else {
+            let mut cmd = Command::new("echo");
+            cmd.arg("ok");
+            cmd
+        }
     }
 }
