@@ -48,12 +48,14 @@ import {
   nextPendingIndex,
   reviewCardHtml,
   formatLoadProgress,
+  loadFailureMessage,
   summaryHtml,
   uniqueSchemaSummary,
 } from "./schema-review.js";
 
 const tracks = new Map();
 let schemaSession = null;
+let fileLoadError = "";
 let boats = [];
 let selectedId = null;
 let selectedBoatId = null;
@@ -307,6 +309,7 @@ async function runLoad(cmd, dest) {
 
 async function runClassify(cmd, dest) {
   setBusy(true);
+  fileLoadError = "";
   els.progress.textContent = "Choose trajectory files…";
   try {
     const picked = await invoke(cmd, ipcArgs({
@@ -317,38 +320,45 @@ async function runClassify(cmd, dest) {
     if (!paths.length) {
       schemaSession = null;
       hideSchemaReview();
-      els.progress.textContent = "No trajectories loaded — pick CSV/text files, or a folder of them.";
+      fileLoadError = "No trajectory files were returned from the file dialog.";
+      els.progress.textContent = fileLoadError;
       return;
     }
     if (els.cancelClassify) els.cancelClassify.hidden = false;
     els.progress.textContent = "Preparing local Llama 3.1 8B Instruct…";
     const result = await invoke("classify_picked", { paths });
-    const groups = (result.groups || []).map((group) => ({
+    const groups = (result?.groups || []).map((group) => ({
       ...group,
       status: "pending",
       loaded: false,
       correction_required: false,
     }));
+    const errors = result?.errors || [];
     if (!groups.length) {
       schemaSession = null;
       hideSchemaReview();
-      els.progress.textContent = result.errors?.length
-        ? result.errors[0]
-        : "No trajectories loaded — pick CSV/text files, or a folder of them.";
+      fileLoadError = errors.length
+        ? errors.join("\n")
+        : "Classification returned no schema and no error.";
+      els.progress.textContent = fileLoadError.split("\n")[0];
       return;
     }
+    fileLoadError = errors.join("\n");
     schemaSession = {
       groups,
       objectId: dest.object_id,
       modeName: dest.mode_name,
-      errors: result.errors || [],
+      errors,
       flow: null,
     };
     drawerLoadMethod = "files";
     hideSchemaReview();
     els.progress.textContent = uniqueSchemaSummary(groups);
   } catch (err) {
-    els.progress.textContent = String(err);
+    schemaSession = null;
+    hideSchemaReview();
+    fileLoadError = loadFailureMessage(err);
+    els.progress.textContent = fileLoadError;
   } finally {
     if (els.cancelClassify) els.cancelClassify.hidden = true;
     setBusy(false);
@@ -527,6 +537,7 @@ async function commitSchemaGroups(groups) {
     const destLabel = targetLabel({ object_id: schemaSession.objectId, mode_name: schemaSession.modeName });
     els.statTime.textContent = result.elapsed_ms ? `${result.elapsed_ms} ms` : "—";
     if (errors.length) schemaSession.errors = errors;
+    fileLoadError = errors.join("\n");
     els.progress.textContent = errors.length
       ? `${errors.length} file(s) still need a schema`
       : result.tracks?.length
@@ -534,7 +545,8 @@ async function commitSchemaGroups(groups) {
         : uniqueSchemaSummary(schemaSession.groups);
     return errors.length === 0;
   } catch (err) {
-    els.progress.textContent = String(err);
+    fileLoadError = loadFailureMessage(err);
+    els.progress.textContent = fileLoadError;
     return false;
   } finally {
     setBusy(false);
@@ -2443,6 +2455,7 @@ function fillFileLoad(body, obj, destLabel) {
       <button type="button" data-act="load-folder" class="ghost compact">Choose folder…</button>
     </div>
     <div class="muted wind-hint">The first import classifies each text file on this computer with Llama 3.1 8B Instruct (Q4_K_M). The download and classification stay off the window thread, and Cancel stops them. CUDA is used on NVIDIA, Vulkan on other GPUs, and CPU when there is no GPU.</div>
+    ${fileLoadError ? `<p class="schema-error" data-role="load-failure">${escapeHtml(fileLoadError)}</p>` : ""}
     ${schemaSession ? summaryHtml(schemaSession.groups, schemaSession.errors) : ""}`;
   const needObject = () => {
     els.progress.textContent = "Add an object, name a mode, then Load files or Generate.";

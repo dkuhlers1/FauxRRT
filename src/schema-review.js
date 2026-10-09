@@ -64,6 +64,14 @@ function escapeHtml(value) {
     .replace(/"/g, "&quot;");
 }
 
+export function loadFailureMessage(err) {
+  if (err == null || err === "") return "The trajectory load failed.";
+  if (typeof err === "string") return err;
+  if (typeof err.message === "string" && err.message) return err.message;
+  const text = String(err);
+  return text === "[object Object]" ? "The trajectory load failed." : text;
+}
+
 export function uniqueSchemaSummary(groups) {
   const schemas = groups.length;
   const files = groups.reduce((count, group) => count + (group.files?.length || 0), 0);

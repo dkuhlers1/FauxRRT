@@ -4,6 +4,9 @@ description = "FauxRRT trajectory commands"
 commands.allow = [
   "load_files",
   "load_folder",
+  "classify_picked",
+  "cancel_classify",
+  "commit_schema_assignments",
   "load_boats",
   "load_sample_boats",
   "import_boats_kml",

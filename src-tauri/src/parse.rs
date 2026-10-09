@@ -701,4 +701,38 @@ elevation: 100
         .unwrap();
         assert!(track.lla.len() >= 6);
     }
+
+    #[test]
+    fn eglin_keywest_csv_is_lla_with_position_only() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("samples")
+            .join("eglin_keywest_6dof.csv");
+        let text = std::fs::read_to_string(&path).unwrap();
+        let heuristic = parse_text(&text, None).unwrap();
+        assert!(heuristic.lla.len() / 3 >= 300, "heuristic points {}", heuristic.lla.len() / 3);
+        assert!(close(heuristic.lla[0] as f64, -86.5254));
+        assert!(close(heuristic.lla[1] as f64, 30.4832));
+        assert!(heuristic.states.velocity_mps.is_none());
+        assert!(heuristic.states.acceleration_mps2.is_none());
+        assert!(heuristic.states.orientation_rad.is_none());
+        assert!(heuristic.states.mass_kg.is_none());
+
+        let class = classified(base(
+            "LLA",
+            "m",
+            &[
+                ("col_0", "time"),
+                ("col_1", "pos_lat"),
+                ("col_2", "pos_lon"),
+                ("col_3", "pos_alt"),
+            ],
+        ));
+        assert!(may_load(&class, false));
+        let track = load_detected(&text, &class).unwrap();
+        assert_eq!(track.lla.len(), heuristic.lla.len());
+        assert!(close(track.lla[1] as f64, 30.4832));
+        assert!(track.states.velocity_mps.is_none());
+        assert!(track.states.mass_kg.is_none());
+    }
 }
