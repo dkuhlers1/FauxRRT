@@ -10,7 +10,7 @@ use crate::generate::GenerateSpec;
 use crate::rocketpy::RocketPySpec;
 use crate::simulate::{DebrisCatalog, SimulateOrigin};
 use crate::wind::WindSpec;
-use crate::parse::{parse_path_with, ParsedTrack};
+use crate::parse::{parse_path, parse_path_with, ParsedTrack};
 use crate::schema::{ColumnMapping, DetectedSchema};
 use crate::store::Store;
 
@@ -83,6 +83,14 @@ pub struct MissionTrack {
     pub simulate: Option<SimulateOrigin>,
     #[serde(default)]
     pub rocketpy: Option<RocketPySpec>,
+    #[serde(default)]
+    pub classification: Option<crate::classify::TrajectoryClassification>,
+    #[serde(default)]
+    pub origin_lat: Option<f64>,
+    #[serde(default)]
+    pub origin_lon: Option<f64>,
+    #[serde(default)]
+    pub origin_alt_m: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -289,6 +297,10 @@ fn track_record(track: &crate::store::Trajectory, mission_dir: Option<&Path>) ->
         generate: track.generate.clone(),
         simulate: track.simulate.clone(),
         rocketpy: track.rocketpy.clone(),
+        classification: track.classification.clone(),
+        origin_lat: track.origin_lat,
+        origin_lon: track.origin_lon,
+        origin_alt_m: track.origin_alt_m,
     }
 }
 
@@ -304,15 +316,26 @@ fn restore_track(
     let (path, parsed) = if inline {
         (
             None,
-            ParsedTrack {
-                schema: DetectedSchema::generated(),
-                times: track.times.clone(),
-                lla: track.lla.clone().unwrap_or_default(),
-            },
+            ParsedTrack::from_lla(
+                DetectedSchema::generated(),
+                track.times.clone(),
+                track.lla.clone().unwrap_or_default(),
+            ),
         )
     } else {
         let path = resolve_track_path(track.path.as_deref(), &track.name, mission_dir)?;
-        (Some(path.clone()), parse_path_with(&path, track.mapping.as_ref())?)
+        let parsed = if let Some(class) = &track.classification {
+            let origin = match (track.origin_lat, track.origin_lon) {
+                (Some(lat), Some(lon)) => Some((lat, lon, track.origin_alt_m.unwrap_or(0.0))),
+                _ => None,
+            };
+            crate::parse::parse_path_with_classification(&path, class, origin)?
+        } else if track.mapping.is_none() {
+            parse_path(&path)?
+        } else {
+            parse_path_with(&path, track.mapping.as_ref())?
+        };
+        (Some(path), parsed)
     };
     let loaded = store.insert_parsed_into(
         vec![(track.name.clone(), path, parsed)],

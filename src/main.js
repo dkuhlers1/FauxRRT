@@ -38,8 +38,26 @@ import {
 } from "./globe.js";
 import { enrichBoat, parseBoatKml, scoreBoatsAgainstGrid } from "./boats-kml.js";
 import { peekGfsSurfaceField } from "./wind-field.js";
+import {
+  acceptGroup,
+  applyEditorDraft,
+  assignmentOf,
+  bindReview,
+  declinePlan,
+  editorHtml,
+  editorProblems,
+  markCorrection,
+  nextPendingIndex,
+  reviewCardHtml,
+  formatLoadProgress,
+  loadFailureMessage,
+  summaryHtml,
+  uniqueSchemaSummary,
+} from "./schema-review.js";
 
 const tracks = new Map();
+let schemaSession = null;
+let fileLoadError = "";
 let boats = [];
 let selectedId = null;
 let selectedBoatId = null;
@@ -123,6 +141,7 @@ const els = {
   missionSave: document.getElementById("btn-mission-save"),
   fit: document.getElementById("btn-fit"),
   progress: document.getElementById("progress"),
+  cancelClassify: document.getElementById("btn-cancel-classify"),
   statTracks: document.getElementById("stat-tracks"),
   statPoints: document.getElementById("stat-points"),
   statTime: document.getElementById("stat-time"),
@@ -242,9 +261,16 @@ try {
   console.error(err);
   if (els.progress) els.progress.textContent = `Globe failed: ${err}`;
 }
+els.cancelClassify?.addEventListener("click", () => {
+  els.progress.textContent = "Cancelling…";
+  invoke("cancel_classify").catch((err) => {
+    console.warn(err);
+  });
+});
 try {
   await listen("load-progress", ({ payload }) => {
-    els.progress.textContent = `Parsing ${payload.done}/${payload.total}  ${payload.file}`;
+    const text = formatLoadProgress(payload);
+    if (text) els.progress.textContent = text;
   });
 } catch {
   /* previewed outside the Tauri shell */
@@ -299,6 +325,253 @@ async function runLoad(cmd, dest) {
   }
 }
 
+async function runClassify(cmd, dest) {
+  setBusy(true);
+  fileLoadError = "";
+  els.progress.textContent = "Choose trajectory files…";
+  try {
+    const picked = await invoke(cmd, ipcArgs({
+      objectId: dest.object_id,
+      modeName: dest.mode_name,
+    }));
+    const paths = picked?.paths || [];
+    if (!paths.length) {
+      schemaSession = null;
+      hideSchemaReview();
+      fileLoadError = "No trajectory files were returned from the file dialog.";
+      els.progress.textContent = fileLoadError;
+      return;
+    }
+    if (els.cancelClassify) els.cancelClassify.hidden = false;
+    els.progress.textContent = "Preparing local Llama 3.1 8B Instruct…";
+    const result = await invoke("classify_picked", { paths });
+    const groups = (result?.groups || []).map((group) => ({
+      ...group,
+      status: "pending",
+      loaded: false,
+      correction_required: false,
+    }));
+    const errors = result?.errors || [];
+    if (!groups.length) {
+      schemaSession = null;
+      hideSchemaReview();
+      fileLoadError = errors.length
+        ? errors.join("\n")
+        : "Classification returned no schema and no error.";
+      els.progress.textContent = fileLoadError.split("\n")[0];
+      return;
+    }
+    fileLoadError = errors.join("\n");
+    schemaSession = {
+      groups,
+      objectId: dest.object_id,
+      modeName: dest.mode_name,
+      errors,
+      flow: null,
+    };
+    drawerLoadMethod = "files";
+    hideSchemaReview();
+    els.progress.textContent = uniqueSchemaSummary(groups);
+  } catch (err) {
+    schemaSession = null;
+    hideSchemaReview();
+    fileLoadError = loadFailureMessage(err);
+    els.progress.textContent = fileLoadError;
+  } finally {
+    if (els.cancelClassify) els.cancelClassify.hidden = true;
+    setBusy(false);
+    render();
+  }
+}
+
+function hideSchemaReview() {
+  const root = document.getElementById("schema-review");
+  if (!root) return;
+  root.hidden = true;
+  root.innerHTML = "";
+}
+
+function dismissSchemaSession() {
+  schemaSession = null;
+  hideSchemaReview();
+  render();
+}
+
+function showSchemaOverlay(html, handlers) {
+  const root = document.getElementById("schema-review");
+  if (!root) return;
+  root.hidden = false;
+  root.innerHTML = html;
+  bindReview(root, handlers);
+}
+
+function currentSchemaIndex() {
+  if (!schemaSession) return -1;
+  return nextPendingIndex(schemaSession.groups);
+}
+
+function beginSchemaReview() {
+  if (!schemaSession) return;
+  schemaSession.flow = "review";
+  showNextSchema();
+}
+
+function showNextSchema() {
+  if (!schemaSession) return;
+  const index = currentSchemaIndex();
+  if (index < 0) {
+    finishSchemaReview();
+    return;
+  }
+  if (schemaSession.flow === "edit") {
+    openSchemaEditor(index);
+    return;
+  }
+  const group = schemaSession.groups[index];
+  showSchemaOverlay(reviewCardHtml(group, index, schemaSession.groups.length), {
+    onYes: () => confirmSchema(index),
+    onNo: () => rejectSchema(index),
+    onCancel: () => {
+      hideSchemaReview();
+      render();
+    },
+  });
+}
+
+function confirmSchema(index) {
+  const group = schemaSession?.groups[index];
+  if (!group) return;
+  schemaSession.groups[index] = acceptGroup(group);
+  showNextSchema();
+}
+
+function rejectSchema(index) {
+  const group = schemaSession?.groups[index];
+  if (!group) return;
+  schemaSession.groups[index] = markCorrection(group);
+  openSchemaEditor(index);
+}
+
+function openSchemaEditor(index) {
+  const group = schemaSession?.groups[index];
+  if (!group) return;
+  showSchemaOverlay(editorHtml(group, index, schemaSession.groups.length), {
+    onSave: (draft) => saveSchemaEditor(index, draft),
+    onCancel: () => {
+      if (schemaSession?.flow === "edit") {
+        hideSchemaReview();
+        render();
+        return;
+      }
+      showNextSchema();
+    },
+  });
+}
+
+function saveSchemaEditor(index, draft) {
+  const group = schemaSession?.groups[index];
+  const root = document.getElementById("schema-review");
+  const problems = editorProblems(draft, group);
+  if (problems.length) {
+    const err = root?.querySelector("[data-role='editor-error']");
+    if (err) err.textContent = problems.join(" ");
+    return;
+  }
+  schemaSession.groups[index] = applyEditorDraft(group, draft);
+  if (schemaSession.flow === "edit") {
+    const next = schemaSession.groups.findIndex((item, itemIndex) => itemIndex > index && declinePlan([item]).edit.length);
+    if (next >= 0) {
+      openSchemaEditor(next);
+      return;
+    }
+    finishSchemaReview();
+    return;
+  }
+  showNextSchema();
+}
+
+async function declineSchemaReview() {
+  if (!schemaSession) return;
+  const plan = declinePlan(schemaSession.groups);
+  schemaSession.flow = "edit";
+  if (plan.loadNow.length) await commitSchemaGroups(plan.loadNow);
+  if (plan.edit.length) {
+    const index = schemaSession.groups.indexOf(plan.edit[0]);
+    openSchemaEditor(index);
+    return;
+  }
+  clearSchemaSessionIfDone();
+}
+
+async function finishSchemaReview() {
+  if (!schemaSession) return;
+  const pending = schemaSession.groups.filter((group) => !group.loaded);
+  hideSchemaReview();
+  if (pending.length) {
+    const loaded = await commitSchemaGroups(pending);
+    if (!loaded) {
+      render();
+      return;
+    }
+  }
+  clearSchemaSessionIfDone();
+}
+
+function clearSchemaSessionIfDone() {
+  if (!schemaSession) return;
+  const waiting = schemaSession.groups.some((group) => !group.loaded);
+  if (!waiting) {
+    schemaSession = null;
+    hideSchemaReview();
+  }
+  render();
+}
+
+async function commitSchemaGroups(groups) {
+  if (!schemaSession || !groups.length) return true;
+  setBusy(true);
+  els.progress.textContent = "Loading trajectories…";
+  try {
+    const result = await invoke("commit_schema_assignments", ipcArgs({
+      assignments: groups.map(assignmentOf),
+      objectId: schemaSession.objectId,
+      modeName: schemaSession.modeName,
+    }));
+    const errors = result.errors || [];
+    const blob = errors.join("\n");
+    for (const group of groups) {
+      group.files = group.files.filter((file) => blob.includes(file.path) || blob.includes(file.name));
+      if (!group.files.length) group.loaded = true;
+    }
+    for (const track of result.tracks || []) tracks.set(track.id, track);
+    if (result.tracks?.length) {
+      addTracks(result.tracks);
+      objectMethod.set(schemaSession.objectId, "files");
+      fitAll(result.tracks.map((track) => track.bounds).filter(Boolean));
+      selectTrack(result.tracks[0].id);
+    }
+    await refreshRisk();
+    await refreshMission();
+    const destLabel = targetLabel({ object_id: schemaSession.objectId, mode_name: schemaSession.modeName });
+    els.statTime.textContent = result.elapsed_ms ? `${result.elapsed_ms} ms` : "—";
+    if (errors.length) schemaSession.errors = errors;
+    fileLoadError = errors.join("\n");
+    els.progress.textContent = errors.length
+      ? `${errors.length} file(s) still need a schema`
+      : result.tracks?.length
+        ? `Loaded ${result.tracks.length} exclusive traj → ${destLabel}`
+        : uniqueSchemaSummary(schemaSession.groups);
+    return errors.length === 0;
+  } catch (err) {
+    fileLoadError = loadFailureMessage(err);
+    els.progress.textContent = fileLoadError;
+    return false;
+  } finally {
+    setBusy(false);
+    render();
+  }
+}
+
 function targetLabel(target) {
   const obj = riskModel.objects.find((o) => o.id === target?.object_id);
   if (!obj) return "";
@@ -319,6 +592,9 @@ function setBusy(busy) {
   });
   els.rocketpyOverlay?.querySelectorAll("button").forEach((btn) => {
     if (btn.dataset.act === "rp-close") return;
+    btn.disabled = busy;
+  });
+  document.getElementById("schema-review")?.querySelectorAll("button").forEach((btn) => {
     btn.disabled = busy;
   });
 }
@@ -2220,7 +2496,9 @@ function fillFileLoad(body, obj, destLabel) {
       <button type="button" data-act="load-files" class="primary compact">Choose files…</button>
       <button type="button" data-act="load-folder" class="ghost compact">Choose folder…</button>
     </div>
-    <div class="muted wind-hint">CSV / text with time, lat, lon, alt. Folder import walks for matching files.</div>`;
+    <div class="muted wind-hint">The first import classifies each text file on this computer with Llama 3.1 8B Instruct (Q4_K_M). The download and classification stay off the window thread, and Cancel stops them. CUDA is used on NVIDIA, Vulkan on other GPUs, and CPU when there is no GPU.</div>
+    ${fileLoadError ? `<p class="schema-error" data-role="load-failure">${escapeHtml(fileLoadError)}</p>` : ""}
+    ${schemaSession ? summaryHtml(schemaSession.groups, schemaSession.errors) : ""}`;
   const needObject = () => {
     els.progress.textContent = "Add an object, name a mode, then Load files or Generate.";
   };
@@ -2228,14 +2506,22 @@ function fillFileLoad(body, obj, destLabel) {
     if (!obj) return needObject();
     const name = requireModeName(trajHost(), obj);
     if (!name) return;
-    runLoad("load_files", { object_id: obj.id, mode_name: name });
+    runClassify("load_files", { object_id: obj.id, mode_name: name });
   });
   body.querySelector("[data-act='load-folder']").addEventListener("click", () => {
     if (!obj) return needObject();
     const name = requireModeName(trajHost(), obj);
     if (!name) return;
-    runLoad("load_folder", { object_id: obj.id, mode_name: name });
+    runClassify("load_folder", { object_id: obj.id, mode_name: name });
   });
+  const summary = body.querySelector("[data-role='schema-summary']");
+  if (summary) {
+    bindReview(summary, {
+      onLoad: () => declineSchemaReview(),
+      onReview: () => beginSchemaReview(),
+      onDismiss: () => dismissSchemaSession(),
+    });
+  }
 }
 
 function fillGenerateEntry(body, obj, destLabel) {

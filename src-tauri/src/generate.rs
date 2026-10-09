@@ -339,11 +339,7 @@ fn integrate_named(
     let (times, lla, _) = integrate(spec, beta, v)?;
     Ok((
         name.to_string(),
-        ParsedTrack {
-            schema: DetectedSchema::generated(),
-            times: Some(times),
-            lla,
-        },
+        ParsedTrack::from_lla(DetectedSchema::generated(), Some(times), lla),
     ))
 }
 
@@ -391,11 +387,7 @@ pub(crate) fn track_from_state(
             *t += time_offset;
         }
     }
-    Ok(ParsedTrack {
-        schema: DetectedSchema::generated(),
-        times: Some(p.times),
-        lla: p.lla,
-    })
+    Ok(ParsedTrack::from_lla(DetectedSchema::generated(), Some(p.times), p.lla))
 }
 
 pub(crate) fn integrate_turn(
@@ -426,11 +418,7 @@ pub(crate) fn integrate_turn(
         }
     }
     Ok((
-        ParsedTrack {
-            schema: DetectedSchema::generated(),
-            times: Some(p.times),
-            lla: p.lla,
-        },
+        ParsedTrack::from_lla(DetectedSchema::generated(), Some(p.times), p.lla),
         p.r,
         p.v,
     ))
