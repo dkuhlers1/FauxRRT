@@ -1,4 +1,5 @@
 mod boats;
+mod classify;
 mod generate;
 mod geodesy;
 mod impact;
@@ -32,7 +33,11 @@ use mission::{
     push_recent, read_session, write_session, MissionDocument, MissionUi, RecentMission, SessionFile,
     UNTITLED,
 };
-use parse::{parse_path, parse_path_with, parse_text, ParsedTrack};
+use classify::{
+    classify_with, excerpt_of, file_origin, group_files, may_load, manual_reason, normalize_classification,
+    origin_from_text, GroupedFile, LlamaRuntime, SchemaAssignment, SchemaGroup, TrajectoryClassification,
+};
+use parse::{parse_path, parse_path_with, parse_text, parse_with_classification, read_trajectory_text, ParsedTrack};
 use pick::{pick_kml_sources, pick_trajectory_folder, pick_trajectory_sources};
 use rocketpy::{check_rocketpy, fly_rocketpy, RocketPySpec, RocketPyStatus};
 use rayon::prelude::*;
@@ -91,6 +96,14 @@ pub struct LoadResult {
 }
 
 #[derive(Serialize)]
+pub struct ClassifyResult {
+    pub groups: Vec<SchemaGroup>,
+    pub errors: Vec<String>,
+    pub elapsed_ms: u64,
+    pub file_count: usize,
+}
+
+#[derive(Serialize)]
 pub struct WindChangeResult {
     pub model: RiskModelView,
     pub tracks: Vec<TrackMeta>,
@@ -118,14 +131,10 @@ fn load_files(
     object_id: Option<u64>,
     failure_mode_id: Option<u64>,
     mode_name: Option<String>,
-) -> Result<LoadResult, String> {
+) -> Result<ClassifyResult, String> {
+    let _ = (state, object_id, failure_mode_id, mode_name);
     let files = pick_trajectory_sources()?;
-    if files.is_empty() {
-        return Ok(empty_result());
-    }
-    let result = load_paths(&app, &state, files, object_id, failure_mode_id, mode_name)?;
-    after_store_change(&app, &state);
-    Ok(result)
+    classify_paths(&app, files)
 }
 
 #[tauri::command]
@@ -135,14 +144,10 @@ fn load_folder(
     object_id: Option<u64>,
     failure_mode_id: Option<u64>,
     mode_name: Option<String>,
-) -> Result<LoadResult, String> {
+) -> Result<ClassifyResult, String> {
+    let _ = (state, object_id, failure_mode_id, mode_name);
     let files = pick_trajectory_folder()?;
-    if files.is_empty() {
-        return Ok(empty_result());
-    }
-    let result = load_paths(&app, &state, files, object_id, failure_mode_id, mode_name)?;
-    after_store_change(&app, &state);
-    Ok(result)
+    classify_paths(&app, files)
 }
 
 #[derive(Serialize)]
@@ -1161,46 +1166,124 @@ fn resolve_load_mode(
     Ok(Some(store.ensure_named_mode(object_id, name)?))
 }
 
-fn load_paths(
-    app: &AppHandle,
-    state: &State<AppState>,
-    files: Vec<PathBuf>,
+fn classify_paths(app: &AppHandle, files: Vec<PathBuf>) -> Result<ClassifyResult, String> {
+    let started = Instant::now();
+    let total = files.len();
+    if total == 0 {
+        return Ok(ClassifyResult {
+            groups: Vec::new(),
+            errors: Vec::new(),
+            elapsed_ms: 0,
+            file_count: 0,
+        });
+    }
+    let _ = app.emit(
+        "load-progress",
+        ProgressEvent {
+            done: 0,
+            total,
+            file: "Preparing local Llama 3.1 8B Instruct".into(),
+        },
+    );
+    let data_dir = app.path().app_data_dir().map_err(|err| err.to_string())?;
+    let runtime = LlamaRuntime::ensure(&data_dir)?;
+    let mut classified = Vec::new();
+    let mut errors = Vec::new();
+    for (i, path) in files.iter().enumerate() {
+        let name = file_name(path);
+        let _ = app.emit(
+            "load-progress",
+            ProgressEvent {
+                done: i + 1,
+                total,
+                file: format!("Classifying {name}"),
+            },
+        );
+        match classify_file(&runtime, path) {
+            Ok(item) => classified.push(item),
+            Err(err) => errors.push(format!("{name}: {err}")),
+        }
+    }
+    Ok(ClassifyResult {
+        groups: group_files(classified),
+        errors,
+        elapsed_ms: started.elapsed().as_millis() as u64,
+        file_count: total,
+    })
+}
+
+fn classify_file(
+    runtime: &LlamaRuntime,
+    path: &Path,
+) -> Result<(GroupedFile, TrajectoryClassification), String> {
+    let text = read_trajectory_text(path)?;
+    let excerpt = excerpt_of(&text);
+    let class = classify_with(runtime, &excerpt)?;
+    let origin = origin_from_text(&text, class.header_lines);
+    Ok((
+        GroupedFile {
+            path: path.to_string_lossy().into_owned(),
+            name: file_name(path),
+            excerpt,
+            origin_lat: origin.map(|item| item.0),
+            origin_lon: origin.map(|item| item.1),
+            origin_alt_m: origin.map(|item| item.2),
+        },
+        class,
+    ))
+}
+
+fn file_name(path: &Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string())
+}
+
+#[tauri::command]
+fn commit_schema_assignments(
+    app: AppHandle,
+    state: State<AppState>,
+    assignments: Vec<SchemaAssignment>,
     object_id: Option<u64>,
     failure_mode_id: Option<u64>,
     mode_name: Option<String>,
 ) -> Result<LoadResult, String> {
     let started = Instant::now();
-    let total = files.len();
-    let parsed: Vec<(usize, Result<(String, Option<PathBuf>, ParsedTrack), String>)> = files
-        .par_iter()
-        .enumerate()
-        .map(|(i, path)| {
-            let name = path
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| path.display().to_string());
-            let result = parse_path(path).map(|track| (name.clone(), Some(path.clone()), track));
-            let _ = app.emit(
-                "load-progress",
-                ProgressEvent {
-                    done: i + 1,
-                    total,
-                    file: name,
-                },
-            );
-            (i, result)
-        })
-        .collect();
-
     let mut items = Vec::new();
     let mut errors = Vec::new();
-    for (_, result) in parsed {
-        match result {
-            Ok(item) => items.push(item),
-            Err(err) => errors.push(err),
+    for assignment in assignments {
+        let mut class = assignment.classification.clone();
+        normalize_classification(&mut class);
+        if !may_load(&class, assignment.user_assigned) {
+            let why = manual_reason(&class);
+            let why = if why.is_empty() {
+                "schema is not usable".to_string()
+            } else {
+                why
+            };
+            for path in &assignment.paths {
+                errors.push(format!("{path}: schema needs a manual assignment ({why})"));
+            }
+            continue;
+        }
+        let assigned = match (assignment.origin_lat, assignment.origin_lon) {
+            (Some(lat), Some(lon)) => Some((lat, lon, assignment.origin_alt_m.unwrap_or(0.0))),
+            _ => None,
+        };
+        for path_str in &assignment.paths {
+            let path = PathBuf::from(path_str);
+            match read_trajectory_text(&path) {
+                Ok(text) => {
+                    let origin = file_origin(origin_from_text(&text, class.header_lines), assigned);
+                    match parse_with_classification(&text, &class, origin) {
+                        Ok(track) => items.push((file_name(&path), Some(path), track)),
+                        Err(err) => errors.push(format!("{}: {err}", path.display())),
+                    }
+                }
+                Err(err) => errors.push(err),
+            }
         }
     }
-
     if items.is_empty() {
         return Ok(LoadResult {
             tracks: Vec::new(),
@@ -1208,23 +1291,17 @@ fn load_paths(
             elapsed_ms: started.elapsed().as_millis() as u64,
         });
     }
-
-    let mut store = state.store.lock().map_err(|e| e.to_string())?;
-    let failure_mode_id = resolve_load_mode(&mut store, object_id, failure_mode_id, mode_name)?;
-    let tracks = store.insert_parsed_into(items, object_id, failure_mode_id)?;
+    let tracks = {
+        let mut store = state.store.lock().map_err(|e| e.to_string())?;
+        let failure_mode_id = resolve_load_mode(&mut store, object_id, failure_mode_id, mode_name)?;
+        store.insert_parsed_into(items, object_id, failure_mode_id)?
+    };
+    after_store_change(&app, &state);
     Ok(LoadResult {
         tracks,
         errors,
         elapsed_ms: started.elapsed().as_millis() as u64,
     })
-}
-
-fn empty_result() -> LoadResult {
-    LoadResult {
-        tracks: Vec::new(),
-        errors: Vec::new(),
-        elapsed_ms: 0,
-    }
 }
 
 fn risk_demo_tracks() -> Vec<(String, Option<PathBuf>, ParsedTrack)> {
@@ -1963,6 +2040,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             load_files,
             load_folder,
+            commit_schema_assignments,
             load_boats,
             load_sample_boats,
             import_boats_kml,
