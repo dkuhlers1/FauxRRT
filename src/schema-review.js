@@ -163,7 +163,7 @@ export function previewModel(group) {
   const dataLine = dataIndex >= 0 ? lines[dataIndex] : "";
   const cells = splitFields(dataLine, group.classification?.delimiter).map((text, index) => ({
     text,
-    role: columns[`col_${index}`] || "ignore",
+    role: roleAt(columns, index),
     index,
   }));
   return {
@@ -202,31 +202,66 @@ function selectOptions(values, selected) {
 }
 
 function roleOptions(selected) {
-  return ROLES.map((role) => `<option value="${role}"${role === selected ? " selected" : ""}>${role}</option>`).join("");
+  const values = ["", ...ROLES];
+  const shown = values.includes(selected) ? selected : "ignore";
+  return values
+    .map((role) => `<option value="${role}"${role === shown ? " selected" : ""}>${role === "" ? "—" : role}</option>`)
+    .join("");
+}
+
+function unitsForRole(role) {
+  if (role === "pos_lat" || role === "pos_lon") return ["deg", "rad"];
+  if (role.startsWith("pos_")) return UNIT_CHOICES.position;
+  const channel = channelOf(role);
+  return UNIT_CHOICES[channel] || [];
+}
+
+function sameUnitChoices(left, right) {
+  const a = unitsForRole(left);
+  const b = unitsForRole(right);
+  return a.length === b.length && a.every((unit, index) => unit === b[index]);
+}
+
+function unitFor(index, role, classif) {
+  const choices = unitsForRole(role);
+  if (!choices.length) return "";
+  const stored = classif.column_units?.[`col_${index}`];
+  if (stored && choices.includes(stored)) return stored;
+  if (role === "pos_lat" || role === "pos_lon") return "deg";
+  const channel = channelOf(role);
+  const channelUnit = classif.units?.[channel] || "";
+  if (choices.includes(channelUnit)) return channelUnit;
+  return choices[0];
+}
+
+function roleAt(columns, index) {
+  const key = `col_${index}`;
+  if (!columns || !Object.prototype.hasOwnProperty.call(columns, key)) return "ignore";
+  return columns[key] || "";
 }
 
 function unitFrameHtml(index, role, unit, frame) {
   const channel = channelOf(role);
   if (!channel) return "";
-  const units = UNIT_CHOICES[channel];
+  const units = unitsForRole(role);
   const unitValue = units.includes(unit) ? unit : units[0];
   const unitSelect = `<label>unit <select data-col="${index}" data-field="unit">${selectOptions(units, unitValue)}</select></label>`;
   if (channel !== "position" && channel !== "velocity" && channel !== "acceleration") return unitSelect;
-  const frames = channel === "position" ? FRAMES : ["", ...FRAMES];
-  const frameValue = frames.includes(frame) ? frame : frames[0];
+  const frames = ["", ...FRAMES];
+  const frameValue = frames.includes(frame) ? frame : "";
   return `${unitSelect}<label>frame <select data-col="${index}" data-field="frame">${selectOptions(frames, frameValue)}</select></label>`;
 }
 
 function columnMarkHtml(index, cellText, role, classif) {
   const channel = channelOf(role);
   const frames = classif.frames || {};
-  const units = classif.units || {};
   const frame = channel === "position" || channel === "velocity" || channel === "acceleration" ? frames[channel] || "" : "";
-  const unit = channel ? units[channel] || "" : "";
+  const unit = unitFor(index, role, classif);
+  const shown = role === "" || ROLES.includes(role) ? role : "ignore";
   return `<div class="schema-cell" data-column="${index}">
     <span class="schema-cell-text">${escapeHtml(cellText)}</span>
-    <label>role <select data-col="${index}" data-field="role">${roleOptions(ROLES.includes(role) ? role : "ignore")}</select></label>
-    ${unitFrameHtml(index, role, unit, frame)}
+    <label>role <select data-col="${index}" data-field="role">${roleOptions(shown)}</select></label>
+    ${unitFrameHtml(index, shown, unit, frame)}
   </div>`;
 }
 
@@ -266,7 +301,7 @@ function annotatedFileHtml(group) {
   const count = Math.max(columnCount(group), cells.length);
   const marks = [];
   for (let i = 0; i < count; i += 1) {
-    const role = classif.columns?.[`col_${i}`] || "ignore";
+    const role = roleAt(classif.columns, i);
     marks.push(columnMarkHtml(i, cells[i] || "", role, classif));
   }
   const body = lines
@@ -311,13 +346,19 @@ function actionCard(group) {
     <p class="schema-error" data-role="editor-error"></p>
     <div class="schema-actions">
       <button type="button" class="primary compact" data-act="schema-save">Confirm trajectory file format</button>
-      <button type="button" class="ghost compact" data-act="schema-cancel">Back</button>
+      <button type="button" class="ghost compact" data-act="schema-cancel">Cancel</button>
     </div>
   </div>`;
 }
 
 export function reviewCardHtml(group, index, total) {
   return `${stageHtml(group, index, total)}${actionCard(group)}`;
+}
+
+/** The confirm card is the first screen after a local read. */
+export function reviewHtmlAfterRead(groups) {
+  if (!groups?.length) return "";
+  return reviewCardHtml(groups[0], 0, groups.length);
 }
 
 export function editorHtml(group, index, total) {
@@ -372,16 +413,30 @@ export function readEditor(root) {
     positionFrame: channelValue(columns, "position", "frame", ""),
     velocityFrame: channelValue(columns, "velocity", "frame", ""),
     accelerationFrame: channelValue(columns, "acceleration", "frame", ""),
-    positionUnit: channelValue(columns, "position", "unit", "m"),
+    positionUnit: distanceUnit(columns),
     velocityUnit: channelValue(columns, "velocity", "unit", "m/s"),
     accelerationUnit: channelValue(columns, "acceleration", "unit", "m/s^2"),
-    orientationUnit: channelValue(columns, "orientation", "unit", "rad"),
+    orientationUnit: channelValue(columns, "orientation", "unit", "deg"),
     massUnit: channelValue(columns, "mass", "unit", "kg"),
+    columnUnits: Object.fromEntries(
+      columns
+        .filter((column) => column.role && column.role !== "ignore" && column.unit)
+        .map((column) => [`col_${column.index}`, column.unit]),
+    ),
     roles,
     originLat: lat === "" ? null : Number(lat),
     originLon: lon === "" ? null : Number(lon),
     originAlt: alt === "" ? 0 : Number(alt),
   };
+}
+
+function distanceUnit(columns) {
+  const order = ["pos_alt", "pos_z", "pos_d", "pos_u", "pos_x", "pos_y", "pos_n", "pos_e"];
+  for (const name of order) {
+    const found = columns.find((column) => column.role === name && UNIT_CHOICES.position.includes(column.unit));
+    if (found) return found.unit;
+  }
+  return "m";
 }
 
 function frameChosen(frame) {
@@ -431,8 +486,17 @@ export function editorProblems(draft, group) {
 
 export function buildClassification(draft) {
   const columns = {};
+  const column_units = { ...(draft.columnUnits || {}) };
   draft.roles.forEach((role, index) => {
-    columns[`col_${index}`] = role || "ignore";
+    columns[`col_${index}`] = role || "";
+    const key = `col_${index}`;
+    if (column_units[key] || !role || role === "ignore" || role === "time") return;
+    if (role === "pos_lat" || role === "pos_lon") column_units[key] = "deg";
+    else if (role.startsWith("pos_")) column_units[key] = draft.positionUnit || "m";
+    else if (role.startsWith("vel_")) column_units[key] = draft.velocityUnit || "m/s";
+    else if (role.startsWith("acc_")) column_units[key] = draft.accelerationUnit || "m/s^2";
+    else if (role.startsWith("orientation_")) column_units[key] = draft.orientationUnit || "deg";
+    else if (role === "mass") column_units[key] = draft.massUnit || "kg";
   });
   const units = {
     position: draft.positionUnit,
@@ -454,6 +518,7 @@ export function buildClassification(draft) {
     frames,
     units,
     columns,
+    column_units,
     confidence_score: 1,
     unsupported_flag: false,
     reasoning: "Assigned on the trajectory file format.",
@@ -516,8 +581,12 @@ function syncChannel(root, index) {
     if (select.dataset.col === String(index) || channelOf(select.value) !== channel) return;
     const otherUnit = root.querySelector(`[data-col='${select.dataset.col}'][data-field='unit']`);
     const otherFrame = root.querySelector(`[data-col='${select.dataset.col}'][data-field='frame']`);
-    if (otherUnit && unit) otherUnit.value = unit;
-    if (otherFrame && frame != null) otherFrame.value = frame;
+    if (otherUnit && unit && sameUnitChoices(role, select.value) && [...otherUnit.options].some((option) => option.value === unit)) {
+      otherUnit.value = unit;
+    }
+    if (otherFrame && frame != null && [...otherFrame.options].some((option) => option.value === frame)) {
+      otherFrame.value = frame;
+    }
   });
 }
 

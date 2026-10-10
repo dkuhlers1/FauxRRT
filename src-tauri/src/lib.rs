@@ -36,10 +36,8 @@ use mission::{
     UNTITLED,
 };
 use classify::{
-    classify_with, excerpt_of, file_origin, group_files, may_load, manual_reason, normalize_classification,
-    origin_from_text, partial_schema_guess, ClassifyNote, GroupedFile, LlamaRuntime, LlamaServerPool, SchemaAssignment,
-    SchemaGroup,
-    TrajectoryClassification, CANCELLED,
+    excerpt_of, file_origin, group_files, interpret_header, may_load, manual_reason, normalize_classification,
+    origin_from_text, GroupedFile, LlamaServerPool, SchemaAssignment, SchemaGroup, TrajectoryClassification, CANCELLED,
 };
 use parse::{parse_path_with, parse_text, parse_with_classification, read_trajectory_text, ParsedTrack};
 use pick::{pick_kml_sources, pick_trajectory_folder, pick_trajectory_sources};
@@ -55,7 +53,8 @@ pub struct AppState {
     store: Mutex<Store>,
     mission: Mutex<MissionSession>,
     classify_cancel: Arc<AtomicBool>,
-    /// Resident llama-server. Choose files reuses it; Cancel and app exit stop it.
+    /// Resident llama-server. It stays idle unless a later action asks for it.
+    /// Choose files does not start it. Cancel and app exit still shut it down.
     llama: Arc<LlamaServerPool>,
 }
 
@@ -169,15 +168,14 @@ fn picked_paths(files: Vec<PathBuf>) -> PickedPaths {
     }
 }
 
-/// Classify after the file dialog has returned. The dialog stays on the UI thread;
-/// the download and llama-server run on a blocking pool so the window can paint and cancel.
+/// Read headers after the file dialog has returned. The dialog itself is the command
+/// that opens it. Column marks are interpreted off the UI thread.
 #[tauri::command]
 async fn classify_picked(app: AppHandle, state: State<'_, AppState>, paths: Vec<String>) -> Result<ClassifyResult, String> {
     let cancel = Arc::clone(&state.classify_cancel);
     cancel.store(false, Ordering::SeqCst);
-    let llama = Arc::clone(&state.llama);
     let files: Vec<PathBuf> = paths.into_iter().map(PathBuf::from).collect();
-    tauri::async_runtime::spawn_blocking(move || classify_paths(&app, files, &cancel, &llama))
+    tauri::async_runtime::spawn_blocking(move || classify_paths(&app, files, &cancel))
         .await
         .map_err(|err| format!("classification task failed: {err}"))?
 }
@@ -1371,12 +1369,7 @@ fn resolve_load_mode(
     Ok(Some(store.ensure_named_mode(object_id, name)?))
 }
 
-fn classify_paths(
-    app: &AppHandle,
-    files: Vec<PathBuf>,
-    cancel: &Arc<AtomicBool>,
-    llama: &Arc<LlamaServerPool>,
-) -> Result<ClassifyResult, String> {
+fn classify_paths(app: &AppHandle, files: Vec<PathBuf>, cancel: &Arc<AtomicBool>) -> Result<ClassifyResult, String> {
     let started = Instant::now();
     let total = files.len();
     if total == 0 {
@@ -1389,70 +1382,29 @@ fn classify_paths(
     }
     let mut errors = Vec::new();
     let mut ready = Vec::new();
-    let mut pending = Vec::new();
-    for path in &files {
+    for (index, path) in files.iter().enumerate() {
         if cancel.load(Ordering::SeqCst) {
             return Err(CANCELLED.into());
         }
+        let name = file_name(path);
+        emit_progress(
+            app,
+            ProgressEvent {
+                done: index + 1,
+                total,
+                file: format!("Reading {name}"),
+                bytes: 0,
+                bytes_total: 0,
+                device: String::new(),
+            },
+        );
         match read_trajectory_text(path) {
-            Ok(text) => pending.push((path.clone(), text)),
+            Ok(text) => ready.push(grouped_classification(path, &text, interpret_header(&text))),
             Err(err) => errors.push(err),
         }
     }
-    let mut editor = Vec::new();
-    if !pending.is_empty() {
-        let data_dir = app.path().app_data_dir().map_err(|err| err.to_string())?;
-        match LlamaRuntime::ensure(&data_dir, cancel, &|note| emit_note(app, total, &note), llama) {
-            Err(err) if err == CANCELLED || err.contains(CANCELLED) => return Err(CANCELLED.into()),
-            Err(err) => {
-                errors.push(err.clone());
-                for (path, text) in pending {
-                    editor.push((grouped_classification(&path, &text, partial_schema_guess(&text)), err.clone()));
-                }
-            }
-            Ok(runtime) => {
-                for (i, (path, text)) in pending.iter().enumerate() {
-                    if cancel.load(Ordering::SeqCst) {
-                        return Err(CANCELLED.into());
-                    }
-                    let name = file_name(path);
-                    emit_progress(
-                        app,
-                        ProgressEvent {
-                            done: i + 1,
-                            total,
-                            file: format!("Classifying {name}"),
-                            bytes: 0,
-                            bytes_total: 0,
-                            device: runtime.status_device(),
-                        },
-                    );
-                    match classify_with(&runtime, &excerpt_of(text)) {
-                        Ok(class) => ready.push(grouped_classification(path, text, class)),
-                        Err(err) if err == CANCELLED || err.contains(CANCELLED) => return Err(CANCELLED.into()),
-                        Err(err) => {
-                            let message = format!("{name}: {err}");
-                            errors.push(message.clone());
-                            editor.push((grouped_classification(path, text, partial_schema_guess(text)), message));
-                        }
-                    }
-                }
-            }
-        }
-    }
-    let mut groups = group_files(ready);
-    if !editor.is_empty() {
-        let note = editor.iter().map(|(_, message)| message.clone()).collect::<Vec<_>>().join("\n");
-        let items = editor.into_iter().map(|(item, _)| item).collect();
-        for mut group in group_files(items) {
-            group.editor_required = true;
-            group.needs_manual = true;
-            group.manual_reason = note.clone();
-            groups.push(group);
-        }
-    }
     Ok(ClassifyResult {
-        groups,
+        groups: group_files(ready),
         errors,
         elapsed_ms: started.elapsed().as_millis() as u64,
         file_count: total,
@@ -1472,20 +1424,6 @@ fn grouped_classification(path: &Path, text: &str, class: TrajectoryClassificati
         },
         class,
     )
-}
-
-fn emit_note(app: &AppHandle, total: usize, note: &ClassifyNote) {
-    emit_progress(
-        app,
-        ProgressEvent {
-            done: 0,
-            total,
-            file: note.label.clone(),
-            bytes: note.bytes,
-            bytes_total: note.bytes_total,
-            device: note.device.clone(),
-        },
-    );
 }
 
 fn emit_progress(app: &AppHandle, event: ProgressEvent) {
@@ -2295,8 +2233,8 @@ fn sanitize_filename(name: &str) -> String {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    // Weights, llama.cpp, and GPU detection stay off this path. They start only
-    // after the user picks trajectory files, on a background task.
+    // The resident server is constructed idle. Choosing files reads headers locally
+    // and does not start it.
     tauri::Builder::default()
         .manage(AppState {
             store: Mutex::new(Store::new()),
@@ -2379,10 +2317,38 @@ mod classify_command_tests {
     #[test]
     fn classify_picked_stays_off_the_ui_thread() {
         let src = include_str!("lib.rs");
-        let start = src.find("async fn classify_picked").expect("classify_picked is async");
-        let body = &src[start..start + 700];
+        let body = function_source(src, "async fn classify_picked(");
         assert!(body.contains("spawn_blocking"), "{body}");
+        assert!(!body.to_ascii_lowercase().contains("llama"), "{body}");
         assert!(src.contains("state.llama.shutdown()"), "Cancel must stop llama-server");
         assert!(src.contains("RunEvent::Exit"), "app exit must stop llama-server");
+    }
+
+    #[test]
+    fn choose_files_reads_headers_without_starting_a_model() {
+        let src = include_str!("lib.rs");
+        let classify = function_source(src, "fn classify_paths(");
+        assert!(classify.contains("interpret_header"), "{classify}");
+        assert!(!classify.to_ascii_lowercase().contains("llama"), "{classify}");
+        let picked = function_source(src, "async fn classify_picked(");
+        assert!(picked.contains("spawn_blocking"));
+        assert!(!picked.to_ascii_lowercase().contains("llama"), "{picked}");
+        let dialog = function_source(src, "fn load_files(");
+        assert!(dialog.contains("pick_trajectory_sources"));
+        assert!(!dialog.to_ascii_lowercase().contains("llama"), "{dialog}");
+        assert!(!dialog.contains("interpret_header"));
+        assert!(!dialog.contains("classify_paths"));
+    }
+
+    fn function_source<'a>(src: &'a str, signature: &str) -> &'a str {
+        let start = src.find(signature).unwrap_or_else(|| panic!("missing {signature}"));
+        let rest = &src[start..];
+        let mut end = rest.len();
+        for needle in ["\nfn ", "\nasync fn ", "\n#[", "\npub fn ", "\npub(crate) fn "] {
+            if let Some(at) = rest[signature.len()..].find(needle) {
+                end = end.min(signature.len() + at);
+            }
+        }
+        &rest[..end]
     }
 }

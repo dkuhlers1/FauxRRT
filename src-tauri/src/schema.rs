@@ -353,7 +353,7 @@ pub fn detect_schema(preview: &DelimitedPreview) -> DetectedSchema {
     }
 }
 
-fn detect_delimiter(lines: &[&str]) -> Option<Delimiter> {
+pub(crate) fn detect_delimiter(lines: &[&str]) -> Option<Delimiter> {
     let candidates = [
         Delimiter::Tab,
         Delimiter::Comma,

@@ -53,7 +53,6 @@ import {
   reviewCardHtml,
   formatLoadProgress,
   loadFailureMessage,
-  summaryHtml,
   uniqueSchemaSummary,
 } from "./schema-review.js";
 
@@ -338,7 +337,6 @@ async function runLoad(cmd, dest) {
 }
 
 async function runClassify(cmd, dest) {
-  setBusy(true);
   fileLoadError = "";
   els.progress.textContent = "Choose trajectory files…";
   try {
@@ -354,12 +352,11 @@ async function runClassify(cmd, dest) {
       els.progress.textContent = fileLoadError;
       return;
     }
+    setBusy(true);
     if (els.cancelClassify) els.cancelClassify.hidden = false;
     fileLoadProgress = "Reading trajectory columns…";
     els.progress.textContent = fileLoadProgress;
     render();
-    setBusy(true);
-    if (els.cancelClassify) els.cancelClassify.hidden = false;
     const result = await invoke("classify_picked", { paths });
     fileLoadProgress = "";
     const groups = (result?.groups || []).map((group) => ({
@@ -374,7 +371,7 @@ async function runClassify(cmd, dest) {
       hideSchemaReview();
       fileLoadError = errors.length
         ? errors.join("\n")
-        : "Classification returned no trajectory file format and no error.";
+        : "No trajectory file format was read and no error was returned.";
       els.progress.textContent = fileLoadError.split("\n")[0];
       return;
     }
@@ -384,12 +381,10 @@ async function runClassify(cmd, dest) {
       objectId: dest.object_id,
       modeName: dest.mode_name,
       errors,
-      flow: null,
+      flow: "review",
     };
     drawerLoadMethod = "files";
-    hideSchemaReview();
     els.progress.textContent = uniqueSchemaSummary(groups);
-    schemaSession.openEditor = groups.some((group) => group.editor_required);
   } catch (err) {
     schemaSession = null;
     hideSchemaReview();
@@ -400,17 +395,15 @@ async function runClassify(cmd, dest) {
     if (els.cancelClassify) els.cancelClassify.hidden = true;
     setBusy(false);
     render();
-    openModelEditor();
+    beginSchemaReview();
   }
 }
 
-function openModelEditor() {
-  if (!schemaSession?.openEditor) return;
-  const index = schemaSession.groups.findIndex((group) => group.editor_required && !group.loaded);
-  if (index < 0) return;
-  schemaSession.flow = "edit";
-  schemaSession.openEditor = false;
-  openSchemaEditor(index);
+function abandonSchemaPick() {
+  schemaSession = null;
+  fileLoadProgress = "";
+  hideSchemaReview();
+  render();
 }
 
 function hideSchemaReview() {
@@ -459,10 +452,7 @@ function showNextSchema() {
   const group = schemaSession.groups[index];
   showSchemaOverlay(reviewCardHtml(group, index, schemaSession.groups.length), {
     onSave: (draft) => saveSchemaEditor(index, draft),
-    onCancel: () => {
-      hideSchemaReview();
-      render();
-    },
+    onCancel: () => abandonSchemaPick(),
   });
 }
 
@@ -485,14 +475,7 @@ function openSchemaEditor(index) {
   if (!group) return;
   showSchemaOverlay(editorHtml(group, index, schemaSession.groups.length), {
     onSave: (draft) => saveSchemaEditor(index, draft),
-    onCancel: () => {
-      if (schemaSession?.flow === "edit") {
-        hideSchemaReview();
-        render();
-        return;
-      }
-      showNextSchema();
-    },
+    onCancel: () => abandonSchemaPick(),
   });
 }
 
@@ -2527,10 +2510,8 @@ function fillFileLoad(body, obj, destLabel) {
       <button type="button" data-act="load-files" class="primary compact">Choose files…</button>
       <button type="button" data-act="load-folder" class="ghost compact">Choose folder…</button>
     </div>
-    <div class="muted wind-hint">The first import classifies each text file on this computer with Llama 3.1 8B Instruct (Q4_K_M). The download and classification stay off the window thread, and Cancel stops them. CUDA is used on NVIDIA, Vulkan on other GPUs, and CPU when there is no GPU.</div>
     ${fileLoadProgress ? `<p class="muted" data-role="load-progress">${escapeHtml(fileLoadProgress)}</p>` : ""}
-    ${fileLoadError ? `<p class="schema-error" data-role="load-failure">${escapeHtml(fileLoadError)}</p>` : ""}
-    ${schemaSession ? summaryHtml(schemaSession.groups, schemaSession.errors) : ""}`;
+    ${fileLoadError ? `<p class="schema-error" data-role="load-failure">${escapeHtml(fileLoadError)}</p>` : ""}`;
   const needObject = () => {
     els.progress.textContent = "Add an object, name a mode, then Load files or Generate.";
   };
@@ -2546,14 +2527,6 @@ function fillFileLoad(body, obj, destLabel) {
     if (!name) return;
     runClassify("load_folder", { object_id: obj.id, mode_name: name });
   });
-  const summary = body.querySelector("[data-role='schema-summary']");
-  if (summary) {
-    bindReview(summary, {
-      onLoad: () => declineSchemaReview(),
-      onReview: () => beginSchemaReview(),
-      onDismiss: () => dismissSchemaSession(),
-    });
-  }
 }
 
 function fillGenerateEntry(body, obj, destLabel) {

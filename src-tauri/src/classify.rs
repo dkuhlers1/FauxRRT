@@ -17,7 +17,10 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::schema::{detect_preview, detect_schema, ColumnRole, Delimiter, DetectedSchema, Frame};
+use crate::schema::{
+    detect_delimiter, detect_preview, detect_schema, is_comment_line, parse_number, row_is_header, ColumnRole, Delimiter,
+    DetectedSchema, Frame,
+};
 
 pub const LOW_CONFIDENCE: f64 = 0.6;
 pub const EXCERPT_LINES: usize = 40;
@@ -127,6 +130,10 @@ pub struct TrajectoryClassification {
     pub frames: ChannelFrames,
     pub units: ClassificationUnits,
     pub columns: BTreeMap<String, String>,
+    /// Unit for each `col_N`. Latitude and longitude are angles (`deg` or `rad`). Altitude and
+    /// other position components are distances. Empty when the column has no role yet.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub column_units: BTreeMap<String, String>,
     pub confidence_score: f64,
     pub unsupported_flag: bool,
     pub reasoning: String,
@@ -144,6 +151,8 @@ struct ClassificationWire {
     frames: Option<ChannelFrames>,
     units: ClassificationUnits,
     columns: BTreeMap<String, String>,
+    #[serde(default)]
+    column_units: BTreeMap<String, String>,
     confidence_score: f64,
     unsupported_flag: bool,
     reasoning: String,
@@ -171,6 +180,7 @@ impl<'de> Deserialize<'de> for TrajectoryClassification {
             frames,
             units: wire.units,
             columns: wire.columns,
+            column_units: wire.column_units,
             confidence_score: wire.confidence_score,
             unsupported_flag: wire.unsupported_flag,
             reasoning: wire.reasoning,
@@ -474,6 +484,7 @@ pub fn normalize_classification(class: &mut TrajectoryClassification) {
     } else {
         class.units.mass = None;
     }
+    ensure_column_units(class);
     let collapsed = class.reasoning.split_whitespace().collect::<Vec<_>>().join(" ");
     class.reasoning = if collapsed.chars().count() > 280 {
         let cut: String = collapsed.chars().take(279).collect();
@@ -607,12 +618,164 @@ pub fn scale_angle_to_rad(unit: &str) -> Result<f64, String> {
     }
 }
 
+pub fn scale_angle_to_deg(unit: &str) -> Result<f64, String> {
+    match canonical_unit(UnitKind::Orientation, unit).as_deref() {
+        Ok("deg") => Ok(1.0),
+        Ok("rad") => Ok(180.0 / std::f64::consts::PI),
+        _ => Err(format!("orientation unit {unit} is not supported")),
+    }
+}
+
 pub fn scale_mass(unit: &str) -> Result<f64, String> {
     match canonical_unit(UnitKind::Mass, unit).as_deref() {
         Ok("kg") => Ok(1.0),
         Ok("lbm") => Ok(0.45359237),
         _ => Err(format!("mass unit {unit} is not supported")),
     }
+}
+
+/// Unit shown on one column. Latitude and longitude are always angles. A length token on
+/// those columns is discarded in favor of degrees.
+pub fn column_unit(class: &TrajectoryClassification, role: &str) -> String {
+    if let Some((index, _)) = column_roles(class).iter().find(|(_, name)| name.as_str() == role) {
+        if let Some(unit) = class.column_units.get(&format!("col_{index}")) {
+            return canonical_column_unit(role, unit, &class.units);
+        }
+    }
+    canonical_column_unit(role, "", &class.units)
+}
+
+fn ensure_column_units(class: &mut TrajectoryClassification) {
+    let pairs: Vec<(String, String)> = class.columns.iter().map(|(key, role)| (key.clone(), role.clone())).collect();
+    class.column_units.retain(|key, _| pairs.iter().any(|(name, _)| name == key));
+    for (key, role) in pairs {
+        if role.trim().is_empty() || role == "ignore" {
+            class.column_units.remove(&key);
+            continue;
+        }
+        let raw = class.column_units.get(&key).map(String::as_str).unwrap_or("");
+        let unit = canonical_column_unit(&role, raw, &class.units);
+        if unit.is_empty() {
+            class.column_units.remove(&key);
+        } else {
+            class.column_units.insert(key, unit);
+        }
+    }
+    if let Some(unit) = distance_unit_from_columns(class) {
+        class.units.position = unit;
+    }
+    sync_uniform_channel(class, |role| role.starts_with("vel_"), UnitKind::Velocity, |units, unit| {
+        units.velocity = Some(unit);
+    });
+    sync_uniform_channel(class, |role| role.starts_with("acc_"), UnitKind::Acceleration, |units, unit| {
+        units.acceleration = Some(unit);
+    });
+    sync_uniform_channel(class, |role| role.starts_with("orientation_"), UnitKind::Orientation, |units, unit| {
+        units.orientation = Some(unit);
+    });
+    sync_uniform_channel(class, |role| role == "mass", UnitKind::Mass, |units, unit| units.mass = Some(unit));
+}
+
+fn stored_unit(class: &TrajectoryClassification, role: &str) -> Option<String> {
+    class
+        .columns
+        .iter()
+        .find(|(_, name)| name.as_str() == role)
+        .and_then(|(key, _)| class.column_units.get(key).cloned())
+}
+
+fn distance_unit_from_columns(class: &TrajectoryClassification) -> Option<String> {
+    const ORDER: &[&str] = &["pos_alt", "pos_z", "pos_d", "pos_u", "pos_x", "pos_y", "pos_n", "pos_e"];
+    for role in ORDER {
+        let Some(unit) = stored_unit(class, role) else {
+            continue;
+        };
+        if canonical_unit(UnitKind::Position, &unit).is_ok() {
+            return Some(unit);
+        }
+    }
+    None
+}
+
+fn sync_uniform_channel(
+    class: &mut TrajectoryClassification,
+    keep: impl Fn(&str) -> bool,
+    kind: UnitKind,
+    assign: impl Fn(&mut ClassificationUnits, String),
+) {
+    let mut found = Vec::new();
+    for (key, role) in &class.columns {
+        if !keep(role) {
+            continue;
+        }
+        if let Some(unit) = class.column_units.get(key) {
+            if canonical_unit(kind, unit).is_ok() {
+                found.push(unit.clone());
+            }
+        }
+    }
+    let Some(first) = found.first() else {
+        return;
+    };
+    if found.iter().all(|unit| unit == first) {
+        assign(&mut class.units, first.clone());
+    }
+}
+
+fn canonical_column_unit(role: &str, raw: &str, units: &ClassificationUnits) -> String {
+    if role == "time" || role.is_empty() || role == "ignore" {
+        return String::new();
+    }
+    if role == "pos_lat" || role == "pos_lon" {
+        return canonical_unit(UnitKind::Orientation, raw).unwrap_or_else(|_| "deg".to_string());
+    }
+    if role.starts_with("pos_") {
+        if let Ok(unit) = canonical_unit(UnitKind::Position, raw) {
+            return unit;
+        }
+        return canonical_unit(UnitKind::Position, &units.position).unwrap_or_else(|_| "m".to_string());
+    }
+    if role.starts_with("vel_") {
+        if let Ok(unit) = canonical_unit(UnitKind::Velocity, raw) {
+            return unit;
+        }
+        return units
+            .velocity
+            .as_deref()
+            .and_then(|unit| canonical_unit(UnitKind::Velocity, unit).ok())
+            .unwrap_or_else(|| "m/s".to_string());
+    }
+    if role.starts_with("acc_") {
+        if let Ok(unit) = canonical_unit(UnitKind::Acceleration, raw) {
+            return unit;
+        }
+        return units
+            .acceleration
+            .as_deref()
+            .and_then(|unit| canonical_unit(UnitKind::Acceleration, unit).ok())
+            .unwrap_or_else(|| "m/s^2".to_string());
+    }
+    if role.starts_with("orientation_") {
+        if let Ok(unit) = canonical_unit(UnitKind::Orientation, raw) {
+            return unit;
+        }
+        return units
+            .orientation
+            .as_deref()
+            .and_then(|unit| canonical_unit(UnitKind::Orientation, unit).ok())
+            .unwrap_or_else(|| "deg".to_string());
+    }
+    if role == "mass" {
+        if let Ok(unit) = canonical_unit(UnitKind::Mass, raw) {
+            return unit;
+        }
+        return units
+            .mass
+            .as_deref()
+            .and_then(|unit| canonical_unit(UnitKind::Mass, unit).ok())
+            .unwrap_or_else(|| "kg".to_string());
+    }
+    String::new()
 }
 
 pub fn column_roles(class: &TrajectoryClassification) -> BTreeMap<usize, String> {
@@ -793,6 +956,7 @@ pub fn layout_id(class: &TrajectoryClassification) -> String {
         "frames": class.frames,
         "units": class.units,
         "columns": class.columns,
+        "column_units": class.column_units,
     });
     layout.to_string()
 }
@@ -893,6 +1057,7 @@ fn classification_from_detected(schema: &DetectedSchema) -> TrajectoryClassifica
             mass: None,
         },
         columns,
+        column_units: BTreeMap::new(),
         confidence_score: (schema.confidence as f64).clamp(0.0, 1.0),
         unsupported_flag: false,
         reasoning: "Detected from the column names because the Llama weight was not available.".into(),
@@ -919,6 +1084,7 @@ pub fn partial_schema_guess(text: &str) -> TrajectoryClassification {
             mass: None,
         },
         columns: BTreeMap::new(),
+        column_units: BTreeMap::new(),
         confidence_score: 0.0,
         unsupported_flag: false,
         reasoning: String::new(),
@@ -929,6 +1095,362 @@ pub fn partial_schema_guess(text: &str) -> TrajectoryClassification {
     }
     normalize_classification(&mut class);
     class
+}
+
+/// Read column names and an optional unit row. This is the Choose-files classifier.
+/// It does not start a model. Unrecognized columns stay unset for the review window.
+pub fn interpret_header(text: &str) -> TrajectoryClassification {
+    let lines: Vec<&str> = text.lines().map(|line| line.trim_end()).collect();
+    let content: Vec<(usize, &str)> = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| !line.trim().is_empty() && !is_comment_line(line))
+        .map(|(index, line)| (index, *line))
+        .collect();
+    let sample: Vec<&str> = content.iter().take(40).map(|(_, line)| *line).collect();
+    let delimiter = detect_delimiter(&sample).unwrap_or(Delimiter::Comma);
+
+    let mut names: Option<Vec<String>> = None;
+    let mut unit_row: Option<Vec<String>> = None;
+    let mut cursor = 0usize;
+    if let Some((_, line)) = content.first() {
+        let cells = delimiter.split(line);
+        if row_is_header(&cells) && !row_is_units(&cells) {
+            names = Some(cells);
+            cursor = 1;
+            if let Some((_, line)) = content.get(cursor) {
+                let cells = delimiter.split(line);
+                if row_is_units(&cells) {
+                    unit_row = Some(cells);
+                    cursor += 1;
+                }
+            }
+        }
+    }
+    let header_lines = if let Some((index, _)) = content.get(cursor) {
+        *index as u32
+    } else if names.is_some() {
+        lines.len() as u32
+    } else {
+        0
+    };
+
+    let width = names
+        .as_ref()
+        .map(|cells| cells.len())
+        .or_else(|| content.get(cursor).map(|(_, line)| delimiter.split(line).len()))
+        .unwrap_or(0);
+
+    let mut identified: Vec<(String, Option<&'static str>, String)> = Vec::new();
+    for index in 0..width {
+        let raw_name = names.as_ref().and_then(|cells| cells.get(index)).map(String::as_str).unwrap_or("");
+        let mut hit = identify_header_name(raw_name);
+        if let Some(cells) = &unit_row {
+            if let Some(token) = cells.get(index).and_then(|cell| unit_token(cell)) {
+                if token != "s" {
+                    if let Some((role, _frame, _)) = hit.as_mut() {
+                        *role = promote_role(role, &token);
+                    }
+                    if let Some((_, _, unit)) = hit.as_mut() {
+                        *unit = token;
+                    }
+                }
+            }
+        }
+        identified.push(hit.unwrap_or_else(|| (String::new(), None, String::new())));
+    }
+
+    let mut columns = BTreeMap::new();
+    let mut column_units = BTreeMap::new();
+    for (index, (role, _, unit)) in identified.iter().enumerate() {
+        let key = format!("col_{index}");
+        columns.insert(key.clone(), role.clone());
+        if !role.is_empty() && !unit.is_empty() {
+            column_units.insert(key, unit.clone());
+        }
+    }
+
+    let position = frame_for(identified.iter().map(|(role, frame, _)| (role.as_str(), *frame)), "pos_").unwrap_or_default();
+    let velocity = frame_for(identified.iter().map(|(role, frame, _)| (role.as_str(), *frame)), "vel_");
+    let acceleration = frame_for(identified.iter().map(|(role, frame, _)| (role.as_str(), *frame)), "acc_");
+    let velocity_unit = velocity.as_ref().map(|_| "m/s".to_string());
+    let acceleration_unit = acceleration.as_ref().map(|_| "m/s^2".to_string());
+    let has_orientation = identified.iter().any(|(role, _, _)| role.starts_with("orientation_"));
+    let has_mass = identified.iter().any(|(role, _, _)| role == "mass");
+    let complete = position_complete(&position, &columns);
+    let unknown = names
+        .as_ref()
+        .is_some_and(|cells| cells.iter().any(|cell| !cell.trim().is_empty() && identify_header_name(cell).is_none()));
+    let confidence = if complete && !unknown { 0.95 } else { 0.2 };
+    let reasoning = if names.is_none() {
+        "No header row. Mark each column on the trajectory file format.".to_string()
+    } else if unknown || !complete {
+        "Read from the header. Unrecognized columns are unset.".to_string()
+    } else {
+        "Read from the header.".to_string()
+    };
+
+    let mut class = TrajectoryClassification {
+        header_lines,
+        delimiter: delimiter_label(delimiter),
+        frames: ChannelFrames {
+            position,
+            velocity,
+            acceleration,
+        },
+        units: ClassificationUnits {
+            position: "m".into(),
+            velocity: velocity_unit,
+            acceleration: acceleration_unit,
+            orientation: has_orientation.then(|| "deg".to_string()),
+            mass: has_mass.then(|| "kg".to_string()),
+        },
+        columns,
+        column_units,
+        confidence_score: confidence,
+        unsupported_flag: false,
+        reasoning,
+    };
+    normalize_classification(&mut class);
+    class
+}
+
+fn delimiter_label(delimiter: Delimiter) -> String {
+    match delimiter {
+        Delimiter::Comma => ",".into(),
+        Delimiter::Tab => "\t".into(),
+        Delimiter::Semicolon => ";".into(),
+        Delimiter::Pipe => "|".into(),
+        Delimiter::Whitespace => "whitespace".into(),
+    }
+}
+
+fn row_is_units(cells: &[String]) -> bool {
+    let nonempty: Vec<&String> = cells.iter().filter(|cell| !cell.trim().is_empty()).collect();
+    if nonempty.is_empty() || nonempty.iter().any(|cell| parse_number(cell).is_some()) {
+        return false;
+    }
+    let units = nonempty.iter().filter(|cell| unit_token(cell).is_some()).count();
+    units >= 1 && units * 2 >= nonempty.len()
+}
+
+fn unit_token(cell: &str) -> Option<String> {
+    let token = cell.trim().trim_matches(|c| c == '"' || c == '\'').to_ascii_lowercase().replace(' ', "");
+    if matches!(token.as_str(), "s" | "sec" | "second" | "seconds") {
+        return Some("s".into());
+    }
+    for kind in [UnitKind::Acceleration, UnitKind::Velocity, UnitKind::Orientation, UnitKind::Position, UnitKind::Mass] {
+        if let Ok(unit) = canonical_unit(kind, &token) {
+            return Some(unit);
+        }
+    }
+    None
+}
+
+fn identify_header_name(raw: &str) -> Option<(String, Option<&'static str>, String)> {
+    let normalized = normalize_header_token(raw);
+    if normalized.is_empty() {
+        return None;
+    }
+    let (base, suffix_unit) = peel_unit_suffix(&normalized);
+    let (mut role, frame) = identify_base(&base)?;
+    role = promote_role(&role, &suffix_unit);
+    Some((role, frame, suffix_unit))
+}
+
+fn normalize_header_token(raw: &str) -> String {
+    let mut out = String::new();
+    for ch in raw.trim().chars() {
+        let ch = ch.to_ascii_lowercase();
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch);
+        } else if !out.is_empty() && !out.ends_with('_') {
+            out.push('_');
+        }
+    }
+    while out.ends_with('_') {
+        out.pop();
+    }
+    out
+}
+
+fn peel_unit_suffix(name: &str) -> (String, String) {
+    const SUFFIXES: &[(&str, &str)] = &[
+        ("_m_s_2", "m/s^2"),
+        ("_m_s2", "m/s^2"),
+        ("_ft_s_2", "ft/s^2"),
+        ("_ft_s2", "ft/s^2"),
+        ("_mps2", "m/s^2"),
+        ("_m_s", "m/s"),
+        ("_ft_s", "ft/s"),
+        ("_km_s", "km/s"),
+        ("_mps", "m/s"),
+        ("_degrees", "deg"),
+        ("_degree", "deg"),
+        ("_radians", "rad"),
+        ("_radian", "rad"),
+        ("_deg", "deg"),
+        ("_rad", "rad"),
+        ("_meters", "m"),
+        ("_metres", "m"),
+        ("_meter", "m"),
+        ("_metre", "m"),
+        ("_feet", "ft"),
+        ("_foot", "ft"),
+        ("_km", "km"),
+        ("_ft", "ft"),
+        ("_kg", "kg"),
+        ("_lbm", "lbm"),
+        ("_m", "m"),
+    ];
+    for (suffix, unit) in SUFFIXES {
+        let Some(base) = name.strip_suffix(suffix) else {
+            continue;
+        };
+        if !base.is_empty() && identify_base(base).is_some() {
+            return (base.to_string(), (*unit).to_string());
+        }
+    }
+    (name.to_string(), String::new())
+}
+
+fn promote_role(role: &str, unit: &str) -> String {
+    if !role.starts_with("pos_") || unit.is_empty() {
+        return role.to_string();
+    }
+    if canonical_unit(UnitKind::Acceleration, unit).is_ok() {
+        return role.replacen("pos_", "acc_", 1);
+    }
+    if canonical_unit(UnitKind::Velocity, unit).is_ok() {
+        return role.replacen("pos_", "vel_", 1);
+    }
+    role.to_string()
+}
+
+fn identify_base(base: &str) -> Option<(String, Option<&'static str>)> {
+    if matches!(
+        base,
+        "time" | "t" | "epoch" | "utc" | "met" | "timestamp" | "seconds" | "sec" | "elapsed" | "datetime" | "gps" | "gpst" | "sow"
+            | "utc_time" | "gps_time" | "time_utc" | "time_s"
+    ) {
+        return Some(("time".into(), None));
+    }
+    if let Some(role) = match base {
+        "roll" | "orientation_roll" | "phi" => Some("orientation_roll"),
+        "pitch" | "orientation_pitch" | "theta" => Some("orientation_pitch"),
+        "yaw" | "orientation_yaw" | "psi" => Some("orientation_yaw"),
+        "mass" | "weight" => Some("mass"),
+        _ => None,
+    } {
+        return Some((role.to_string(), None));
+    }
+    const PREFIXES: &[(&str, &str)] = &[
+        ("acceleration_", "acc"),
+        ("accel_", "acc"),
+        ("acc_", "acc"),
+        ("velocity_", "vel"),
+        ("speed_", "vel"),
+        ("vel_", "vel"),
+        ("v_", "vel"),
+        ("position_", "pos"),
+        ("pos_", "pos"),
+    ];
+    for (prefix, kind) in PREFIXES {
+        if let Some(rest) = base.strip_prefix(prefix) {
+            if let Some((axis, frame)) = axis_component(rest) {
+                return Some((format!("{kind}_{axis}"), frame));
+            }
+        }
+    }
+    const SUFFIXES: &[(&str, &str)] = &[
+        ("_acceleration", "acc"),
+        ("_accel", "acc"),
+        ("_velocity", "vel"),
+        ("_speed", "vel"),
+        ("_vel", "vel"),
+    ];
+    for (suffix, kind) in SUFFIXES {
+        if let Some(rest) = base.strip_suffix(suffix) {
+            if let Some((axis, frame)) = axis_component(rest) {
+                return Some((format!("{kind}_{axis}"), frame));
+            }
+        }
+    }
+    if let Some(hit) = compact_vector(base) {
+        return Some(hit);
+    }
+    axis_component(base).map(|(axis, frame)| (format!("pos_{axis}"), frame))
+}
+
+fn compact_vector(base: &str) -> Option<(String, Option<&'static str>)> {
+    let (kind, rest) = if let Some(rest) = base.strip_prefix('v') {
+        if rest.is_empty() {
+            return None;
+        }
+        ("vel", rest)
+    } else if let Some(rest) = base.strip_prefix('a') {
+        if rest.is_empty() || rest == "lt" {
+            return None;
+        }
+        ("acc", rest)
+    } else {
+        return None;
+    };
+    let (axis, frame) = axis_component(rest)?;
+    Some((format!("{kind}_{axis}"), frame))
+}
+
+fn axis_component(token: &str) -> Option<(&'static str, Option<&'static str>)> {
+    match token {
+        "lat" | "latitude" | "geodetic_lat" | "geodetic_latitude" | "latd" => Some(("lat", Some("LLA"))),
+        "lon" | "long" | "lng" | "longitude" | "geodetic_lon" | "geodetic_longitude" | "lond" => Some(("lon", Some("LLA"))),
+        "alt" | "altitude" | "height" | "hae" | "msl" | "elev" | "elevation" | "ht" => Some(("alt", Some("LLA"))),
+        "x" | "x_ecr" | "ecr_x" | "x_ecef" | "ecef_x" => Some(("x", Some("ECEF"))),
+        "y" | "y_ecr" | "ecr_y" | "y_ecef" | "ecef_y" => Some(("y", Some("ECEF"))),
+        "z" | "z_ecr" | "ecr_z" | "z_ecef" | "ecef_z" => Some(("z", Some("ECEF"))),
+        "x_eci" | "eci_x" => Some(("x", Some("ECI"))),
+        "y_eci" | "eci_y" => Some(("y", Some("ECI"))),
+        "z_eci" | "eci_z" => Some(("z", Some("ECI"))),
+        "north" | "n" => Some(("n", None)),
+        "east" | "e" => Some(("e", None)),
+        "down" | "d" => Some(("d", Some("NED"))),
+        "up" | "u" => Some(("u", Some("NEU"))),
+        _ => None,
+    }
+}
+
+fn frame_for<'a>(items: impl Iterator<Item = (&'a str, Option<&'static str>)>, prefix: &'a str) -> Option<String> {
+    let rows: Vec<_> = items.filter(|(role, _)| role.starts_with(prefix)).collect();
+    if rows.is_empty() {
+        return None;
+    }
+    if rows.iter().any(|(role, _)| role.ends_with("_lat") || role.ends_with("_lon") || role.ends_with("_alt")) {
+        return Some("LLA".into());
+    }
+    if rows.iter().any(|(_, hint)| *hint == Some("ECI")) {
+        return Some("ECI".into());
+    }
+    if rows.iter().any(|(role, hint)| role.ends_with("_d") || *hint == Some("NED")) {
+        return Some("NED".into());
+    }
+    if rows.iter().any(|(role, hint)| role.ends_with("_u") || *hint == Some("NEU")) {
+        return Some("NEU".into());
+    }
+    if rows.iter().any(|(role, hint)| role.ends_with("_x") || role.ends_with("_y") || role.ends_with("_z") || *hint == Some("ECEF")) {
+        return Some("ECEF".into());
+    }
+    None
+}
+
+fn position_complete(frame: &str, columns: &BTreeMap<String, String>) -> bool {
+    let has = |role: &str| columns.values().any(|name| name == role);
+    match frame {
+        "LLA" => has("pos_lat") && has("pos_lon"),
+        "ECEF" | "ECI" => has("pos_x") && has("pos_y") && has("pos_z"),
+        "NED" => has("pos_n") && has("pos_e") && has("pos_d"),
+        "NEU" => has("pos_n") && has("pos_e") && has("pos_u"),
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -1018,6 +1540,7 @@ pub fn position_indexes(class: &TrajectoryClassification) -> Result<(Option<usiz
     }
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct ClassifyNote {
     pub label: String,
@@ -1598,6 +2121,25 @@ pub struct LlamaRuntime {
     pub backend: GpuBackend,
     pub layers: u32,
     cancel: Arc<AtomicBool>,
+}
+
+/// Ask the resident model to classify one excerpt.
+/// Choose files does not call this. A later action can.
+#[allow(dead_code)]
+pub fn classify_excerpt_with_resident_model(
+    data_dir: &Path,
+    cancel: &Arc<AtomicBool>,
+    progress: &dyn Fn(ClassifyNote),
+    pool: &Arc<LlamaServerPool>,
+    excerpt: &str,
+) -> Result<TrajectoryClassification, String> {
+    let runtime = LlamaRuntime::ensure(data_dir, cancel, progress, pool)?;
+    let _device = runtime.status_device();
+    match classify_with(&runtime, excerpt) {
+        Ok(class) => Ok(class),
+        Err(err) if err == CANCELLED || err.contains(CANCELLED) => Err(err),
+        Err(_) => Ok(partial_schema_guess(excerpt)),
+    }
 }
 
 impl LlamaRuntime {
@@ -2341,6 +2883,7 @@ mod tests {
                 mass: None,
             },
             columns,
+            column_units: BTreeMap::new(),
             confidence_score: 0.9,
             unsupported_flag: false,
             reasoning: "ECEF metres.".into(),
@@ -2752,54 +3295,139 @@ mod tests {
     }
 
     #[test]
-    fn every_excerpt_including_named_headers_is_sent_to_the_model() {
+    fn eglin_keywest_header_is_lla_degrees_degrees_metres() {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("..")
             .join("samples")
             .join("eglin_keywest_6dof.csv");
         let text = fs::read_to_string(&path).unwrap();
-        let excerpt = excerpt_of(&text);
-        assert!(excerpt.lines().count() <= 50 && excerpt.lines().count() >= 20);
-        assert!(excerpt.starts_with("time,lat,lon,alt"));
-        let json = r#"{"header_lines":1,"delimiter":",","frames":{"position":"LLA"},"units":{"position":"m"},"columns":{"col_0":"time","col_1":"pos_lat","col_2":"pos_lon","col_3":"pos_alt"},"confidence_score":0.93,"unsupported_flag":false,"reasoning":"lat lon alt"}"#;
-        let saw = Mutex::new(String::new());
-        struct Watch<'a> {
-            json: &'a str,
-            saw: &'a Mutex<String>,
-            calls: Mutex<usize>,
-        }
-        impl TextCompleter for Watch<'_> {
-            fn complete(&self, system: &str, user: &str) -> Result<String, String> {
-                *self.calls.lock().unwrap() += 1;
-                assert!(system.contains("x-ecr"));
-                assert!(system.contains("Do not convert coordinates"));
-                *self.saw.lock().unwrap() = user.to_string();
-                Ok(self.json.to_string())
-            }
-        }
-        let model = Watch { json, saw: &saw, calls: Mutex::new(0) };
-        let class = classify_with(&model, &excerpt).unwrap();
-        assert_eq!(*model.calls.lock().unwrap(), 1);
-        assert!(saw.lock().unwrap().contains("time,lat,lon,alt"));
+        let class = interpret_header(&text);
         assert_eq!(class.header_lines, 1);
         assert_eq!(class.delimiter, ",");
         assert_eq!(class.frames.position, "LLA");
+        assert_eq!(class.columns.get("col_0").map(String::as_str), Some("time"));
         assert_eq!(class.columns.get("col_1").map(String::as_str), Some("pos_lat"));
+        assert_eq!(class.columns.get("col_2").map(String::as_str), Some("pos_lon"));
+        assert_eq!(class.columns.get("col_3").map(String::as_str), Some("pos_alt"));
+        assert_eq!(class.column_units.get("col_1").map(String::as_str), Some("deg"));
+        assert_eq!(class.column_units.get("col_2").map(String::as_str), Some("deg"));
+        assert_eq!(class.column_units.get("col_3").map(String::as_str), Some("m"));
+        assert_eq!(column_unit(&class, "pos_lat"), "deg");
+        assert_eq!(column_unit(&class, "pos_lon"), "deg");
+        assert_eq!(column_unit(&class, "pos_alt"), "m");
+        assert_ne!(column_unit(&class, "pos_lat"), "m");
+        assert_ne!(column_unit(&class, "pos_lon"), "m");
         assert!(class.units.velocity.is_none());
         assert!(may_load(&class, false), "{class:?}");
         let track = crate::parse::parse_with_classification(&text, &class, None).unwrap();
         assert!(track.lla.len() / 3 >= 300);
         assert!((track.lla[0] as f64 + 86.5254).abs() < 1e-2);
         assert!((track.lla[1] as f64 - 30.4832).abs() < 1e-2);
+        assert!((track.lla[2] as f64 - 26.0).abs() < 1e-2);
+    }
 
-        let ecr = "time,x-ecr,z-ecr,y-ecr\n0,1,2,3\n";
-        let ned = "time,north,east,down\n0,1,2,3\n";
-        for excerpt in [ecr, ned] {
-            let model = Watch { json, saw: &saw, calls: Mutex::new(0) };
-            let _ = classify_with(&model, excerpt).unwrap();
-            assert_eq!(*model.calls.lock().unwrap(), 1);
-            assert!(saw.lock().unwrap().contains(excerpt.lines().next().unwrap()));
-        }
+    #[test]
+    fn lla_unit_row_keeps_angles_and_scales_altitude() {
+        let labelled = "\
+time,lat,lon,alt
+s,deg,deg,ft
+0,30.4832,-86.5254,26
+1,30.4900,-86.5100,100
+";
+        let feet = interpret_header(labelled);
+        assert_eq!(feet.header_lines, 2);
+        assert_eq!(column_unit(&feet, "pos_lat"), "deg");
+        assert_eq!(column_unit(&feet, "pos_lon"), "deg");
+        assert_eq!(column_unit(&feet, "pos_alt"), "ft");
+        assert_eq!(feet.units.position, "ft");
+        let track = crate::parse::parse_with_classification(labelled, &feet, None).unwrap();
+        assert!((track.lla[2] as f64 - 26.0 * 0.3048).abs() < 1e-2);
+        assert!((track.lla[1] as f64 - 30.4832).abs() < 1e-3);
+
+        let metres = "\
+time,lat,lon,alt
+s,m,m,m
+0,30.4832,-86.5254,26
+1,30.4900,-86.5100,100
+";
+        let class = interpret_header(metres);
+        assert_eq!(column_unit(&class, "pos_lat"), "deg");
+        assert_eq!(column_unit(&class, "pos_lon"), "deg");
+        assert_eq!(column_unit(&class, "pos_alt"), "m");
+        assert_ne!(class.column_units.get("col_1").map(String::as_str), Some("m"));
+
+        let suffixed = interpret_header("time,lat_deg,lon_deg,alt_ft\n0,10,20,100\n1,10.1,20.1,110\n");
+        assert_eq!(column_unit(&suffixed, "pos_lat"), "deg");
+        assert_eq!(column_unit(&suffixed, "pos_alt"), "ft");
+        let suffixed_track = crate::parse::parse_with_classification(
+            "time,lat_deg,lon_deg,alt_ft\n0,10,20,100\n1,10.1,20.1,110\n",
+            &suffixed,
+            None,
+        )
+        .unwrap();
+        assert!((suffixed_track.lla[2] as f64 - 30.48).abs() < 1e-2);
+
+        let radians = "\
+time,lat,lon,alt
+s,rad,rad,m
+0,0.5320,-1.5100,26
+1,0.5330,-1.5090,40
+";
+        let rad = interpret_header(radians);
+        assert_eq!(column_unit(&rad, "pos_lat"), "rad");
+        assert_eq!(column_unit(&rad, "pos_lon"), "rad");
+        assert_eq!(column_unit(&rad, "pos_alt"), "m");
+        let converted = crate::parse::parse_with_classification(radians, &rad, None).unwrap();
+        let lat = 0.5320 * 180.0 / std::f64::consts::PI;
+        let lon = -1.5100 * 180.0 / std::f64::consts::PI;
+        assert!((converted.lla[1] as f64 - lat).abs() < 1e-3, "{}", converted.lla[1]);
+        assert!((converted.lla[0] as f64 - lon).abs() < 1e-3, "{}", converted.lla[0]);
+        assert!((converted.lla[2] as f64 - 26.0).abs() < 1e-2);
+    }
+
+    #[test]
+    fn odd_header_names_fill_the_review_without_a_model() {
+        let ecr = interpret_header("time,x-ecr,z-ecr,y-ecr\n0,6378137,0,0\n1,6378137,1000,0\n");
+        assert_eq!(ecr.frames.position, "ECEF");
+        assert_eq!(ecr.columns.get("col_1").map(String::as_str), Some("pos_x"));
+        assert_eq!(ecr.columns.get("col_2").map(String::as_str), Some("pos_z"));
+        assert_eq!(ecr.columns.get("col_3").map(String::as_str), Some("pos_y"));
+        assert_eq!(column_unit(&ecr, "pos_x"), "m");
+        let track = crate::parse::parse_with_classification(
+            "time,x-ecr,z-ecr,y-ecr\n0,6378137,0,0\n1,6378137,1000,0\n",
+            &ecr,
+            None,
+        )
+        .unwrap();
+        assert!((track.lla[0] as f64).abs() < 1e-2);
+        assert!((track.lla[1] as f64).abs() < 1e-2);
+
+        let ned = interpret_header("time,north,east,down\n0,0,0,0\n1,1000,200,-50\n");
+        assert_eq!(ned.frames.position, "NED");
+        assert_eq!(ned.columns.get("col_1").map(String::as_str), Some("pos_n"));
+        assert_eq!(ned.columns.get("col_2").map(String::as_str), Some("pos_e"));
+        assert_eq!(ned.columns.get("col_3").map(String::as_str), Some("pos_d"));
+
+        let mixed = interpret_header("time,x-ecr,y-ecr,z-ecr,vn,ve,vd,ax,ay,az\n0,1,2,3,4,5,6,7,8,9\n1,1,2,4,4,5,6,7,8,9\n");
+        assert_eq!(mixed.frames.position, "ECEF");
+        assert_eq!(mixed.frames.velocity.as_deref(), Some("NED"));
+        assert_eq!(mixed.frames.acceleration.as_deref(), Some("ECEF"));
+        assert_eq!(mixed.columns.get("col_4").map(String::as_str), Some("vel_n"));
+        assert_eq!(mixed.columns.get("col_7").map(String::as_str), Some("acc_x"));
+        assert_eq!(column_unit(&mixed, "vel_n"), "m/s");
+        assert_eq!(column_unit(&mixed, "acc_x"), "m/s^2");
+
+        let blank = interpret_header("0,1,2,3\n1,1,2,4\n");
+        assert_eq!(blank.header_lines, 0);
+        assert!(blank.columns.values().all(|role| role.is_empty()), "{blank:?}");
+        assert!(blank.column_units.is_empty());
+        assert!(blank.confidence_score < 0.6);
+
+        let partial = interpret_header("time,widget,lat,lon,alt\n0,nope,30.4,-86.5,26\n1,nope,30.5,-86.4,40\n");
+        assert_eq!(partial.columns.get("col_1").map(String::as_str), Some(""));
+        assert_eq!(partial.columns.get("col_2").map(String::as_str), Some("pos_lat"));
+        assert_eq!(partial.frames.position, "LLA");
+        assert!(partial.confidence_score < 0.6);
     }
 
     #[test]
