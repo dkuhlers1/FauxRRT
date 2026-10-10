@@ -2,8 +2,8 @@ use std::fs;
 use std::path::Path;
 
 use crate::classify::{
-    column_roles, delimiter_of, origin_from_text, position_indexes, scale_accel, scale_angle_to_rad, scale_length,
-    scale_mass, scale_speed, TrajectoryClassification,
+    column_roles, column_unit, delimiter_of, origin_from_text, position_indexes, scale_accel, scale_angle_to_deg,
+    scale_angle_to_rad, scale_length, scale_mass, scale_speed, TrajectoryClassification,
 };
 use crate::geodesy::{ecef_to_lla, eci_to_ecef, enu_to_ecef_vector, enu_to_lla, gmst_rad};
 use crate::schema::{
@@ -201,6 +201,8 @@ pub fn to_internal_track(
     let (_time_col, a_col, b_col, c_col) = position_indexes(classification)?;
     let roles = column_roles(classification);
     let length_scale = scale_length(&classification.units.position)?;
+    let lat_to_deg = scale_angle_to_deg(&column_unit(classification, "pos_lat")).unwrap_or(1.0);
+    let lon_to_deg = scale_angle_to_deg(&column_unit(classification, "pos_lon")).unwrap_or(1.0);
     let speed_scale = classification.units.velocity.as_deref().map(scale_speed).transpose()?;
     let accel_scale = classification.units.acceleration.as_deref().map(scale_accel).transpose()?;
     let angle_scale = classification.units.orientation.as_deref().map(scale_angle_to_rad).transpose()?;
@@ -235,7 +237,17 @@ pub fn to_internal_track(
             .find(|(_, role)| role.as_str() == "time")
             .and_then(|(index, _)| fields.get(*index))
             .and_then(|raw| parse_time_value(raw));
-        let Some(point) = to_internal_frame(position_frame, &fields, a_col, b_col, c_col, length_scale, origin) else {
+        let Some(point) = to_internal_frame(
+            position_frame,
+            &fields,
+            a_col,
+            b_col,
+            c_col,
+            length_scale,
+            lat_to_deg,
+            lon_to_deg,
+            origin,
+        ) else {
             continue;
         };
         rows.push(Row {
@@ -368,12 +380,14 @@ pub(crate) fn to_internal_frame(
     b_col: usize,
     c_col: usize,
     length_scale: f64,
+    lat_to_deg: f64,
+    lon_to_deg: f64,
     origin: Option<(f64, f64, f64)>,
 ) -> Option<(f64, f64, f64)> {
     match frame {
         "LLA" => {
-            let lat = number_at(fields, a_col)?;
-            let lon = number_at(fields, b_col)?;
+            let lat = number_at(fields, a_col)? * lat_to_deg;
+            let lon = number_at(fields, b_col)? * lon_to_deg;
             if !(-90.0..=90.0).contains(&lat) || !(-180.0..=180.0).contains(&lon) {
                 return None;
             }
@@ -638,6 +652,7 @@ mod tests {
                 mass: None,
             },
             columns: map,
+            column_units: BTreeMap::new(),
             confidence_score: 0.92,
             unsupported_flag: false,
             reasoning: "fixture".into(),
@@ -873,7 +888,7 @@ elevation: 100
             ],
         ));
         let fields = ecr.lines().nth(1).unwrap().split(',').map(|s| s.to_string()).collect::<Vec<_>>();
-        let one = to_internal_frame("ECEF", &fields, 1, 3, 2, 1.0, None).unwrap();
+        let one = to_internal_frame("ECEF", &fields, 1, 3, 2, 1.0, 1.0, 1.0, None).unwrap();
         assert!(close(one.0, -86.5254));
         assert!(close(one.1, 30.4832));
         assert!((one.2 - 26.0).abs() < 1.0);

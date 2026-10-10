@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import fs from "node:fs";
 import test from "node:test";
 
 import {
@@ -12,6 +13,7 @@ import {
   markCorrection,
   nextPendingIndex,
   reviewCardHtml,
+  reviewHtmlAfterRead,
   formatLoadProgress,
   loadFailureMessage,
   uniqueSchemaSummary,
@@ -228,6 +230,58 @@ test("a rejected load command stays visible instead of becoming a blank object",
   );
   assert.equal(loadFailureMessage({ message: "commit_schema_assignments not allowed" }), "commit_schema_assignments not allowed");
   assert.equal(loadFailureMessage({}), "The trajectory load failed.");
+});
+
+test("review markup is the first screen and LLA units are per column", () => {
+  const lla = group("eglin", {
+    files: [{
+      path: "/data/eglin_keywest_6dof.csv",
+      name: "eglin_keywest_6dof.csv",
+      excerpt: "time,lat,lon,alt\n0.0000,30.483200,-86.525400,26.00\n",
+      origin_lat: null,
+      origin_lon: null,
+      origin_alt_m: null,
+    }],
+    classification: {
+      header_lines: 1,
+      delimiter: ",",
+      frames: { position: "LLA" },
+      units: { position: "m" },
+      columns: { col_0: "time", col_1: "pos_lat", col_2: "pos_lon", col_3: "pos_alt" },
+      column_units: { col_1: "deg", col_2: "deg", col_3: "m" },
+      confidence_score: 0.95,
+      unsupported_flag: false,
+      reasoning: "Read from the header.",
+    },
+  });
+  const html = reviewHtmlAfterRead([lla, group("other")]);
+  assert.match(html, /Trajectory file format 1 of 2/);
+  assert.match(html, /Confirm trajectory file format/);
+  assert.match(html, /data-role="column-marks"/);
+  assert.match(html, /data-field="role"/);
+  assert.match(html, /data-field="unit"/);
+  assert.match(html, /data-field="frame"/);
+  assert.match(html, /data-col="1" data-field="unit"><option value="deg" selected>deg<\/option><option value="rad">rad<\/option>/);
+  assert.match(html, /data-col="2" data-field="unit"><option value="deg" selected>deg<\/option>/);
+  assert.match(html, /data-col="3" data-field="unit"><option value="m" selected>m<\/option>/);
+  assert.doesNotMatch(html, /data-col="1" data-field="unit"><option value="m"/);
+  assert.doesNotMatch(html, /data-col="2" data-field="unit"><option value="m"/);
+  assert.doesNotMatch(html, /Load without reviewing/);
+  assert.doesNotMatch(html, /data-act="schema-load"/);
+
+  const src = fs.readFileSync(new URL("./main.js", import.meta.url), "utf8");
+  const run = src.slice(src.indexOf("async function runClassify"), src.indexOf("function abandonSchemaPick"));
+  assert.ok(run.indexOf("await invoke(cmd") >= 0);
+  assert.ok(run.indexOf("await invoke(cmd") < run.indexOf("setBusy(true)"));
+  assert.match(run, /beginSchemaReview\(\)/);
+  assert.doesNotMatch(run, /openModelEditor/);
+  assert.doesNotMatch(run, /llama/i);
+  const fill = src.slice(src.indexOf("function fillFileLoad"), src.indexOf("function fillGenerateEntry"));
+  assert.doesNotMatch(fill, /Load without reviewing/);
+  assert.doesNotMatch(fill, /Llama/);
+  assert.doesNotMatch(fill, /summaryHtml/);
+  assert.match(src, /onCancel: \(\) => abandonSchemaPick\(\)/);
+  assert.match(src, /function abandonSchemaPick\(\) {\s*schemaSession = null;/);
 });
 
 test("load progress shows bytes, files, and the device", () => {
