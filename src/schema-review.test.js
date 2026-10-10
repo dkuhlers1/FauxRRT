@@ -184,6 +184,21 @@ test("editor requires an origin for a local frame that has none", () => {
   assert.equal(assignmentOf(edited).paths[0], "/data/ned.csv");
 });
 
+test("a failed model schema opens the editor with the error", () => {
+  const html = editorHtml(
+    group("bad", {
+      needs_manual: true,
+      editor_required: true,
+      manual_reason: "eglin_keywest_6dof.csv: model output was not a JSON object",
+    }),
+    0,
+    1,
+  );
+  assert.match(html, /data-role="model-error"/);
+  assert.match(html, /model output was not a JSON object/);
+  assert.match(html, /data-act="schema-save"/);
+});
+
 test("a rejected load command stays visible instead of becoming a blank object", () => {
   assert.equal(
     loadFailureMessage("classify_picked not allowed. Command not found"),
@@ -208,6 +223,17 @@ test("load progress shows bytes, files, and the device", () => {
   assert.equal(
     formatLoadProgress({ file: "Classifying track.csv", done: 1, total: 3, device: "Vulkan", bytes: 0, bytes_total: 0 }),
     "Classifying track.csv (1/3) · Vulkan",
+  );
+  assert.equal(
+    formatLoadProgress({
+      file: "Download interrupted; resuming",
+      bytes: 1_200_000_000,
+      bytes_total: 4_900_000_000,
+      device: "CPU",
+      done: 0,
+      total: 1,
+    }),
+    "Download interrupted; resuming 1.2 GB / 4.9 GB · CPU",
   );
   assert.equal(
     formatLoadProgress({ file: "No GPU found; classifying on CPU", device: "CPU", done: 0, total: 1 }),

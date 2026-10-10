@@ -201,7 +201,7 @@ pub fn parse_with_classification(
             .find(|(_, role)| role.as_str() == "time")
             .and_then(|(index, _)| fields.get(*index))
             .and_then(|raw| parse_time_value(raw));
-        let Some(point) = row_lla(frame, &fields, a_col, b_col, c_col, length_scale, origin) else {
+        let Some(point) = to_internal_frame(frame, &fields, a_col, b_col, c_col, length_scale, origin) else {
             continue;
         };
         if let Some(scale) = speed_scale {
@@ -267,7 +267,10 @@ pub fn parse_with_classification(
     })
 }
 
-fn row_lla(
+/// Convert one position from the coordinate system Llama identified into the internal
+/// geodetic frame: longitude degrees, latitude degrees, altitude metres.
+/// The map and the risk calculation both read this frame. The model does not convert.
+pub(crate) fn to_internal_frame(
     frame: &str,
     fields: &[String],
     a_col: usize,
@@ -734,5 +737,52 @@ elevation: 100
         assert!(close(track.lla[1] as f64, 30.4832));
         assert!(track.states.velocity_mps.is_none());
         assert!(track.states.mass_kg.is_none());
+    }
+
+    #[test]
+    fn to_internal_frame_converts_lla_ecr_and_ned() {
+        let (x, y, z) = crate::geodesy::lla_to_ecef(30.4832, -86.5254, 26.0);
+        let (x2, y2, z2) = crate::geodesy::lla_to_ecef(30.4900, -86.5100, 120.0);
+        let ecr = format!("time,x-ecr,z-ecr,y-ecr\n0,{x},{z},{y}\n1,{x2},{z2},{y2}\n");
+        let ecr_class = classified(base(
+            "ECEF",
+            "m",
+            &[
+                ("col_0", "time"),
+                ("col_1", "pos_x"),
+                ("col_2", "pos_z"),
+                ("col_3", "pos_y"),
+            ],
+        ));
+        let fields = ecr.lines().nth(1).unwrap().split(',').map(|s| s.to_string()).collect::<Vec<_>>();
+        let one = to_internal_frame("ECEF", &fields, 1, 3, 2, 1.0, None).unwrap();
+        assert!(close(one.0, -86.5254));
+        assert!(close(one.1, 30.4832));
+        assert!((one.2 - 26.0).abs() < 1.0);
+        let track = load_detected(&ecr, &ecr_class).unwrap();
+        assert!(close(track.lla[0] as f64, -86.5254));
+        assert!(close(track.lla[1] as f64, 30.4832));
+        assert!(close(track.lla[3] as f64, -86.5100));
+        assert!(close(track.lla[4] as f64, 30.4900));
+
+        let ned = "time,north,east,down\n0,0,0,0\n1,1000,200,-50\n";
+        let ned_class = classified(base(
+            "NED",
+            "m",
+            &[
+                ("col_0", "time"),
+                ("col_1", "pos_n"),
+                ("col_2", "pos_e"),
+                ("col_3", "pos_d"),
+            ],
+        ));
+        let origin = (30.4832, -86.5254, 26.0);
+        let track = parse_with_classification(ned, &ned_class, Some(origin)).unwrap();
+        let (lon, lat, alt) = crate::geodesy::enu_to_lla(30.4832, -86.5254, 26.0, 200.0, 1000.0, 50.0);
+        assert!(close(track.lla[0] as f64, -86.5254));
+        assert!(close(track.lla[1] as f64, 30.4832));
+        assert!(close(track.lla[3] as f64, lon));
+        assert!(close(track.lla[4] as f64, lat));
+        assert!((track.lla[5] as f64 - alt).abs() < 1.0);
     }
 }
