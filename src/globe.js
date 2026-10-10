@@ -927,55 +927,112 @@ let isolineLines = null;
 let isolineLabels = null;
 let showIsolines = true;
 
-export function setRiskIsolines(lines) {
-  const Cesium = window.Cesium;
-  clearRiskIsolines();
-  if (!viewer || !lines?.length) {
-    requestRender();
-    return;
-  }
-  isolineLines = viewer.scene.primitives.add(new Cesium.PolylineCollection());
-  isolineLabels = viewer.scene.primitives.add(new Cesium.LabelCollection());
+// Screen-space polyline ribbons are centered on the path. At 120 m the lower
+// half of a 2.5 px line is inside the ellipsoid, so the depth test drops it,
+// and the translucent risk hexes cover whatever remains. Lift the same lon/lat
+// above that ribbon, and keep a depth-fail pass for fragments the globe still
+// occludes.
+const ISOLINE_MIN_LIFT_M = 2500;
+const ISOLINE_MAX_LIFT_M = 80000;
+const ISOLINE_CHUNK = 2000;
+let lastIsolineInput = null;
+let lastIsolineLift = 0;
+let isolineCameraBound = false;
+
+function isolineLiftMeters(lines) {
+  let west = Infinity;
+  let east = -Infinity;
+  let south = Infinity;
+  let north = -Infinity;
   for (const line of lines) {
-    const flat = line.line || [];
-    if (flat.length < 4) continue;
-    const heights = [];
+    const flat = line?.line || [];
     for (let i = 0; i + 1 < flat.length; i += 2) {
-      heights.push(flat[i], flat[i + 1], 120);
+      const lon = Number(flat[i]);
+      const lat = Number(flat[i + 1]);
+      if (!Number.isFinite(lon) || !Number.isFinite(lat)) continue;
+      west = Math.min(west, lon);
+      east = Math.max(east, lon);
+      south = Math.min(south, lat);
+      north = Math.max(north, lat);
     }
-    const positions = Cesium.Cartesian3.fromDegreesArrayHeights(heights);
-    const color = isolineColor(Cesium, Number(line.level));
-    isolineLines.add({
-      positions,
-      width: 2.5,
-      material: colorMaterial(Cesium, color),
-    });
-    isolineLabels.add({
-      position: positions[Math.floor(positions.length / 2)],
-      text: line.label || formatIsolineLabel(line.level),
-      font: "600 13px sans-serif",
-      fillColor: Cesium.Color.WHITE,
-      outlineColor: Cesium.Color.BLACK,
-      outlineWidth: 3,
-      style: Cesium.LabelStyle.FILL_AND_OUTLINE,
-      disableDepthTestDistance: Number.POSITIVE_INFINITY,
-      pixelOffset: new Cesium.Cartesian2(10, -8),
-      showBackground: false,
-    });
   }
-  isolineLines.show = showIsolines;
-  isolineLabels.show = showIsolines;
-  requestRender();
+  let spanLift = ISOLINE_MIN_LIFT_M;
+  if (Number.isFinite(west)) {
+    let lonSpan = east - west;
+    if (lonSpan > 180) lonSpan = 360 - lonSpan;
+    const spanM = Math.max(lonSpan, north - south, 0) * 111_000;
+    spanLift = Math.max(ISOLINE_MIN_LIFT_M, spanM * 0.04);
+  }
+  const cameraH = viewer?.camera?.positionCartographic?.height;
+  const canvasH = Math.max(viewer?.scene?.canvas?.clientHeight || 800, 1);
+  const ribbonM = Number.isFinite(cameraH) && cameraH > 0
+    ? (2.5 * 0.5) * (cameraH / canvasH)
+    : 0;
+  return Math.min(ISOLINE_MAX_LIFT_M, Math.max(spanLift, ribbonM * 4 + 400));
 }
 
-export function setRiskIsolinesVisible(visible) {
-  showIsolines = Boolean(visible);
-  if (isolineLines) isolineLines.show = showIsolines;
-  if (isolineLabels) isolineLabels.show = showIsolines;
-  requestRender();
+function bindIsolineCamera() {
+  if (isolineCameraBound || !viewer) return;
+  isolineCameraBound = true;
+  viewer.camera.moveEnd.addEventListener(() => {
+    if (!showIsolines || !lastIsolineInput?.length || !isolineLines) return;
+    const next = isolineLiftMeters(lastIsolineInput);
+    if (lastIsolineLift > 0 && Math.abs(next - lastIsolineLift) / lastIsolineLift < 0.35) return;
+    paintRiskIsolines(lastIsolineInput);
+  });
 }
 
-export function clearRiskIsolines() {
+function isolineRings(Cesium, flat, height) {
+  const rings = [];
+  let current = [];
+  let prevLon = null;
+  let prevLat = null;
+  const flush = () => {
+    if (current.length >= 2) rings.push(current);
+    current = [];
+    prevLon = null;
+    prevLat = null;
+  };
+  for (let i = 0; i + 1 < flat.length; i += 2) {
+    const lon = Number(flat[i]);
+    const lat = Number(flat[i + 1]);
+    if (!Number.isFinite(lon) || !Number.isFinite(lat)) continue;
+    if (prevLon != null && Math.abs(lon - prevLon) > 180) flush();
+    if (
+      prevLon != null
+      && Math.abs(lon - prevLon) < 1e-10
+      && Math.abs(lat - prevLat) < 1e-10
+    ) {
+      continue;
+    }
+    current.push(Cesium.Cartesian3.fromDegrees(lon, lat, height));
+    prevLon = lon;
+    prevLat = lat;
+  }
+  flush();
+  return rings;
+}
+
+function chunkPositions(positions) {
+  if (positions.length <= ISOLINE_CHUNK) return [positions];
+  const out = [];
+  for (let i = 0; i < positions.length - 1; i += ISOLINE_CHUNK - 1) {
+    const slice = positions.slice(i, Math.min(positions.length, i + ISOLINE_CHUNK));
+    if (slice.length >= 2) out.push(slice);
+  }
+  return out;
+}
+
+function isolineAppearance(Cesium, color, depthMask) {
+  const appearance = {
+    material: Cesium.Material.fromType("Color", { color: Cesium.Color.clone(color) }),
+    translucent: false,
+  };
+  if (depthMask === false) appearance.renderState = { depthMask: false };
+  return new Cesium.PolylineMaterialAppearance(appearance);
+}
+
+function removeIsolinePrimitives() {
   if (isolineLines && viewer) {
     viewer.scene.primitives.remove(isolineLines);
     isolineLines = null;
@@ -986,6 +1043,132 @@ export function clearRiskIsolines() {
   }
 }
 
+let isolinePainting = false;
+
+function paintRiskIsolines(lines) {
+  if (isolinePainting) return;
+  isolinePainting = true;
+  try {
+    removeIsolinePrimitives();
+    if (!viewer || !lines?.length) {
+      requestRender();
+      return;
+    }
+    const Cesium = window.Cesium;
+    const height = isolineLiftMeters(lines);
+    lastIsolineLift = height;
+    bindIsolineCamera();
+    const groups = new Map();
+    const labels = [];
+    for (const line of lines) {
+      const flat = line?.line || [];
+      if (flat.length < 4) continue;
+      const rings = isolineRings(Cesium, flat, height);
+      if (!rings.length) continue;
+      const color = isolineColor(Cesium, Number(line.level));
+      const key = `${color.red.toFixed(3)},${color.green.toFixed(3)},${color.blue.toFixed(3)}`;
+      let group = groups.get(key);
+      if (!group) {
+        group = { color, instances: [] };
+        groups.set(key, group);
+      }
+      let labelAt = rings[0];
+      for (const ring of rings) {
+        if (ring.length > labelAt.length) labelAt = ring;
+        for (const slice of chunkPositions(ring)) {
+          group.instances.push(new Cesium.GeometryInstance({
+            geometry: new Cesium.PolylineGeometry({
+              positions: slice,
+              width: 2.5,
+              vertexFormat: Cesium.PolylineMaterialAppearance.VERTEX_FORMAT,
+              arcType: Cesium.ArcType.GEODESIC,
+            }),
+          }));
+        }
+      }
+      labels.push({
+        position: labelAt[Math.floor(labelAt.length / 2)],
+        text: line.label || formatIsolineLabel(line.level),
+      });
+    }
+    if (!groups.size) {
+      requestRender();
+      return;
+    }
+    isolineLines = viewer.scene.primitives.add(new Cesium.PrimitiveCollection());
+    for (const group of groups.values()) {
+      isolineLines.add(new Cesium.Primitive({
+        geometryInstances: group.instances,
+        appearance: isolineAppearance(Cesium, group.color, true),
+        depthFailAppearance: isolineAppearance(Cesium, group.color, false),
+        asynchronous: false,
+        allowPicking: false,
+      }));
+    }
+    isolineLabels = viewer.scene.primitives.add(new Cesium.LabelCollection());
+    for (const label of labels) {
+      isolineLabels.add({
+        position: label.position,
+        text: label.text,
+        font: "600 13px sans-serif",
+        fillColor: Cesium.Color.WHITE,
+        outlineColor: Cesium.Color.BLACK,
+        outlineWidth: 3,
+        style: Cesium.LabelStyle.FILL_AND_OUTLINE,
+        disableDepthTestDistance: Number.POSITIVE_INFINITY,
+        eyeOffset: new Cesium.Cartesian3(0, 0, -Math.min(height, 8000)),
+        pixelOffset: new Cesium.Cartesian2(10, -8),
+        showBackground: false,
+      });
+    }
+    isolineLines.show = showIsolines;
+    isolineLabels.show = showIsolines;
+    viewer.scene.primitives.raiseToTop(isolineLines);
+    viewer.scene.primitives.raiseToTop(isolineLabels);
+    requestRender();
+    requestAnimationFrame(() => requestRender());
+  } finally {
+    isolinePainting = false;
+  }
+}
+
+export function setRiskIsolines(lines) {
+  lastIsolineInput = lines?.length ? lines : null;
+  lastIsolineLift = 0;
+  if (!lastIsolineInput) {
+    clearRiskIsolines();
+    requestRender();
+    return;
+  }
+  paintRiskIsolines(lastIsolineInput);
+}
+
+export function setRiskIsolinesVisible(visible) {
+  const next = Boolean(visible);
+  const turnedOn = next && !showIsolines;
+  showIsolines = next;
+  if (!showIsolines) {
+    if (isolineLines) isolineLines.show = false;
+    if (isolineLabels) isolineLabels.show = false;
+    requestRender();
+    return;
+  }
+  if ((turnedOn || !isolineLines) && lastIsolineInput?.length) {
+    lastIsolineLift = 0;
+    paintRiskIsolines(lastIsolineInput);
+    return;
+  }
+  if (isolineLines) isolineLines.show = true;
+  if (isolineLabels) isolineLabels.show = true;
+  requestRender();
+}
+
+export function clearRiskIsolines() {
+  lastIsolineInput = null;
+  lastIsolineLift = 0;
+  removeIsolinePrimitives();
+}
+
 function isolineColor(Cesium, level) {
   const exp = Math.log10(Math.max(level, 1e-12));
   const t = Math.min(1, Math.max(0, (exp + 4) / 4));
@@ -993,7 +1176,7 @@ function isolineColor(Cesium, level) {
     255,
     Math.round(214 - 130 * t),
     Math.round(70 + 50 * (1 - t)),
-    235,
+    255,
   );
 }
 
