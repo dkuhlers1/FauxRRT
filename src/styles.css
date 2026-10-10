@@ -852,6 +852,18 @@ input[type="number"], input[type="text"] {
 }
 .schema-kicker { color: var(--muted); font-size: 11px; letter-spacing: 0.04em; text-transform: uppercase; }
 .schema-share, .schema-note { color: var(--muted); font-size: 12px; }
+.schema-raw {
+  margin: 8px 0;
+  padding: 8px;
+  max-height: 9.5em;
+  overflow: auto;
+  white-space: pre;
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 12px;
+  line-height: 1.45;
+  background: rgba(11, 16, 22, 0.72);
+  border: 1px solid rgba(232, 237, 243, 0.16);
+}
 .schema-line { padding: 2px 0; white-space: pre-wrap; }
 .schema-header {
   background: rgba(227, 93, 106, 0.16);

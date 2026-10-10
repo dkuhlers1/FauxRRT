@@ -30,6 +30,18 @@ pub fn enu_to_lla(lat0: f64, lon0: f64, alt0: f64, east: f64, north: f64, up: f6
     ecef_to_lla(x, y, z)
 }
 
+/// Local east/north/up vector, in metres, to an ECEF vector. The origin is not added.
+pub fn enu_to_ecef_vector(lat_deg: f64, lon_deg: f64, east: f64, north: f64, up: f64) -> (f64, f64, f64) {
+    let lat = lat_deg.to_radians();
+    let lon = lon_deg.to_radians();
+    let (sl, cl) = (lat.sin(), lat.cos());
+    let (so, co) = (lon.sin(), lon.cos());
+    let x = (-so) * east + (-sl * co) * north + (cl * co) * up;
+    let y = co * east + (-sl * so) * north + (cl * so) * up;
+    let z = cl * north + sl * up;
+    (x, y, z)
+}
+
 /// Earth-fixed from inertial by a GMST (or elapsed earth-rotation) angle.
 pub fn eci_to_ecef(x: f64, y: f64, z: f64, theta_rad: f64) -> (f64, f64, f64) {
     let (c, s) = (theta_rad.cos(), theta_rad.sin());

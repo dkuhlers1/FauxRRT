@@ -138,6 +138,14 @@ export function splitFields(line, delimiter) {
   return line.split(ch).map((part) => part.trim());
 }
 
+/** First lines of the file, unchanged, including the header and the original column text. */
+export function rawFilePreview(group, limit = 8) {
+  const excerpt = group.files?.[0]?.excerpt || "";
+  const lines = excerpt.split("\n");
+  if (lines.length && lines[lines.length - 1] === "") lines.pop();
+  return lines.slice(0, limit).join("\n");
+}
+
 export function previewModel(group) {
   const excerpt = group.files?.[0]?.excerpt || "";
   const lines = excerpt.split(/\n/);
@@ -177,25 +185,8 @@ function columnCount(group) {
   return Math.max(max, previewModel(group).cells.length, 1);
 }
 
-function markedLines(group) {
-  const preview = previewModel(group);
-  return preview.lines
-    .map((line, index) => {
-      if (index < preview.headerCount) {
-        return `<div class="schema-line schema-header"><span class="schema-tag">header</span><span class="schema-text">${escapeHtml(line)}</span></div>`;
-      }
-      if (index === preview.dataIndex) {
-        const cells = preview.cells
-          .map(
-            (cell) =>
-              `<span class="schema-cell"><span class="schema-role">${escapeHtml(cell.role)}</span><span class="schema-value">${escapeHtml(cell.text)}</span></span>`,
-          )
-          .join("");
-        return `<div class="schema-line schema-data">${cells}</div>`;
-      }
-      return `<div class="schema-line"><span class="schema-text">${escapeHtml(line)}</span></div>`;
-    })
-    .join("");
+function rawLinesHtml(group) {
+  return `<pre class="schema-raw" data-role="file-text">${escapeHtml(rawFilePreview(group))}</pre>`;
 }
 
 function stageHtml(group, index, total) {
@@ -205,15 +196,23 @@ function stageHtml(group, index, total) {
     <div class="schema-stage">
       <div class="schema-kicker">Schema ${index + 1} of ${total} · ${escapeHtml(preview.fileName)}</div>
       <p class="schema-share">This layout is shared by ${preview.fileCount} ${preview.fileCount === 1 ? "file" : "files"}: ${escapeHtml(names)}</p>
-      ${markedLines(group)}
+      ${rawLinesHtml(group)}
     </div>`;
 }
 
+function frameSummary(classif) {
+  const frames = classif?.frames || {};
+  const parts = [`position ${frames.position || ""}`];
+  if (frames.velocity) parts.push(`velocity ${frames.velocity}`);
+  if (frames.acceleration) parts.push(`acceleration ${frames.acceleration}`);
+  return parts.join(", ");
+}
+
 export function reviewCardHtml(group, index, total) {
-  const frame = group.classification?.coordinate_system || "";
+  const frames = frameSummary(group.classification);
   const note = group.classification?.reasoning ? `<p class="schema-note">${escapeHtml(group.classification.reasoning)}</p>` : "";
   const ask = canAccept(group)
-    ? `<p class="schema-ask">Confirm this ${escapeHtml(frame)} schema?</p>
+    ? `<p class="schema-ask">Confirm this schema? ${escapeHtml(frames)}</p>
        <div class="schema-actions">
          <button type="button" class="primary compact" data-act="schema-yes">Yes</button>
          <button type="button" class="ghost compact" data-act="schema-no">No</button>
@@ -254,9 +253,12 @@ export function editorHtml(group, index, total) {
       <select data-col="${i}">${ROLES.map((role) => `<option value="${role}"${role === selected ? " selected" : ""}>${role}</option>`).join("")}</select>
     </label>`);
   }
-  const frame = FRAMES.includes(classif.coordinate_system) ? classif.coordinate_system : "ECEF";
+  const frames = classif.frames || {};
+  const positionFrame = FRAMES.includes(frames.position) ? frames.position : "ECEF";
+  const velocityFrame = FRAMES.includes(frames.velocity) ? frames.velocity : "";
+  const accelerationFrame = FRAMES.includes(frames.acceleration) ? frames.acceleration : "";
   const delimiter = delimiterChoice(classif.delimiter);
-  const local = frame === "NED" || frame === "NEU";
+  const local = positionFrame === "NED" || positionFrame === "NEU";
   const originFile = (group.files || []).find((file) => file.origin_lat != null);
   const origin = group.assigned_origin || {};
   const lat = origin.lat ?? originFile?.origin_lat ?? "";
@@ -272,7 +274,9 @@ export function editorHtml(group, index, total) {
       <div class="schema-form">
         <label>Header lines <input data-field="header" type="number" min="0" step="1" value="${Number(classif.header_lines) || 0}" /></label>
         <label>Delimiter <select data-field="delimiter">${DELIMITERS.map((item) => `<option value="${escapeHtml(item.value)}"${item.value === delimiter ? " selected" : ""}>${item.label}</option>`).join("")}</select></label>
-        <label>Coordinate system <select data-field="frame">${selectOptions(FRAMES, frame)}</select></label>
+        <label>Position frame <select data-field="position-frame">${selectOptions(FRAMES, positionFrame)}</select></label>
+        <label>Velocity frame <select data-field="velocity-frame">${selectOptions(["", ...FRAMES], velocityFrame)}</select></label>
+        <label>Acceleration frame <select data-field="acceleration-frame">${selectOptions(["", ...FRAMES], accelerationFrame)}</select></label>
         ${unitSelect("position", units.position || "m")}
         ${unitSelect("velocity", units.velocity || "m/s")}
         ${unitSelect("acceleration", units.acceleration || "m/s^2")}
@@ -322,7 +326,9 @@ export function readEditor(root) {
   return {
     headerLines: Number(value("header")),
     delimiter: value("delimiter"),
-    frame: value("frame"),
+    positionFrame: value("position-frame"),
+    velocityFrame: value("velocity-frame"),
+    accelerationFrame: value("acceleration-frame"),
     positionUnit: value("position"),
     velocityUnit: value("velocity"),
     accelerationUnit: value("acceleration"),
@@ -333,6 +339,10 @@ export function readEditor(root) {
     originLon: lon === "" ? null : Number(lon),
     originAlt: alt === "" ? 0 : Number(alt),
   };
+}
+
+function frameChosen(frame) {
+  return FRAMES.includes(frame);
 }
 
 function hasPosition(frame, roles) {
@@ -346,22 +356,24 @@ function hasPosition(frame, roles) {
 
 export function editorProblems(draft, group) {
   const problems = [];
-  if (!FRAMES.includes(draft.frame)) problems.push("Choose a supported coordinate system.");
+  if (!frameChosen(draft.positionFrame)) problems.push("Choose a position coordinate system.");
   if (!DELIMITERS.some((item) => item.value === draft.delimiter)) problems.push("Choose a supported delimiter.");
   if (!Number.isFinite(draft.headerLines) || draft.headerLines < 0) problems.push("Header lines must be zero or more.");
   if (!UNIT_CHOICES.position.includes(draft.positionUnit)) problems.push("Choose a supported position unit.");
-  if (!hasPosition(draft.frame, draft.roles)) problems.push("Assign the position columns for this coordinate system.");
-  if (draft.roles.some((role) => role.startsWith("vel_")) && !UNIT_CHOICES.velocity.includes(draft.velocityUnit)) {
-    problems.push("Choose a velocity unit.");
+  if (!hasPosition(draft.positionFrame, draft.roles)) problems.push("Assign the position columns for this coordinate system.");
+  if (draft.roles.some((role) => role.startsWith("vel_"))) {
+    if (!frameChosen(draft.velocityFrame)) problems.push("Choose a velocity coordinate system.");
+    if (!UNIT_CHOICES.velocity.includes(draft.velocityUnit)) problems.push("Choose a velocity unit.");
   }
-  if (draft.roles.some((role) => role.startsWith("acc_")) && !UNIT_CHOICES.acceleration.includes(draft.accelerationUnit)) {
-    problems.push("Choose an acceleration unit.");
+  if (draft.roles.some((role) => role.startsWith("acc_"))) {
+    if (!frameChosen(draft.accelerationFrame)) problems.push("Choose an acceleration coordinate system.");
+    if (!UNIT_CHOICES.acceleration.includes(draft.accelerationUnit)) problems.push("Choose an acceleration unit.");
   }
   if (draft.roles.some((role) => role.startsWith("orientation_")) && !UNIT_CHOICES.orientation.includes(draft.orientationUnit)) {
     problems.push("Choose an orientation unit.");
   }
   if (draft.roles.includes("mass") && !UNIT_CHOICES.mass.includes(draft.massUnit)) problems.push("Choose a mass unit.");
-  const local = draft.frame === "NED" || draft.frame === "NEU";
+  const local = draft.positionFrame === "NED" || draft.positionFrame === "NEU";
   const missingOrigin = (group.files || []).some((file) => file.origin_lat == null || file.origin_lon == null);
   if (local && missingOrigin) {
     if (!Number.isFinite(draft.originLat) || draft.originLat < -90 || draft.originLat > 90) {
@@ -386,10 +398,17 @@ export function buildClassification(draft) {
     orientation: draft.orientationUnit,
   };
   if (draft.roles.includes("mass")) units.mass = draft.massUnit;
+  const frames = { position: draft.positionFrame };
+  if (draft.roles.some((role) => role.startsWith("vel_")) && frameChosen(draft.velocityFrame)) {
+    frames.velocity = draft.velocityFrame;
+  }
+  if (draft.roles.some((role) => role.startsWith("acc_")) && frameChosen(draft.accelerationFrame)) {
+    frames.acceleration = draft.accelerationFrame;
+  }
   return {
     header_lines: draft.headerLines,
     delimiter: draft.delimiter,
-    coordinate_system: draft.frame,
+    frames,
     units,
     columns,
     confidence_score: 1,
@@ -399,7 +418,7 @@ export function buildClassification(draft) {
 }
 
 export function applyEditorDraft(group, draft) {
-  const local = draft.frame === "NED" || draft.frame === "NEU";
+  const local = draft.positionFrame === "NED" || draft.positionFrame === "NEU";
   const assigned =
     local && Number.isFinite(draft.originLat) && Number.isFinite(draft.originLon)
       ? { lat: draft.originLat, lon: draft.originLon, alt: Number.isFinite(draft.originAlt) ? draft.originAlt : 0 }

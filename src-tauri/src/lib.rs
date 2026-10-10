@@ -26,7 +26,7 @@ use generate::{generate_track, resolve_winds, GenerateSpec};
 use geodesy::ecef_to_lla;
 use simulate::{
     build_fts_debris, build_nav_failure, build_spent_stage, regenerate_simulated, sample_stage_times,
-    sample_track_state, BuiltTrack, DebrisCatalog, FtsSpec, NavFailSpec, SpentStageSpec, StateSample,
+    sample_with_internal_velocity, BuiltTrack, DebrisCatalog, FtsSpec, NavFailSpec, SpentStageSpec, StateSample,
 };
 use wind::{prepare_flight_wind, WindSpec};
 use impact::extract_impact;
@@ -689,7 +689,13 @@ fn simulate_nav_failure(
 
 fn sample_from_store(store: &Store, track_id: u64, time_s: f64) -> Result<StateSample, String> {
     let track = store.tracks.get(&track_id).ok_or_else(|| "unknown track".to_string())?;
-    sample_track_state(track_id, &track.lla, track.times.as_deref(), time_s)
+    sample_with_internal_velocity(
+        track_id,
+        &track.lla,
+        track.times.as_deref(),
+        track.states.velocity_mps.as_deref(),
+        time_s,
+    )
 }
 
 fn floor_alt_of(store: &Store, track_id: u64) -> f64 {
@@ -1079,7 +1085,12 @@ fn vessel_inputs(store: &Store) -> (Vec<vessel::ObjectInput>, Vec<vessel::BoatQu
         let Some(hit) = extract_impact(&track.lla, track.times.as_deref(), 0.0) else {
             continue;
         };
-        let vel = impact_velocity_enu(&track.lla, track.times.as_deref(), hit.index);
+        let vel = impact_velocity_enu(
+            &track.lla,
+            track.times.as_deref(),
+            hit.index,
+            track.states.velocity_mps.as_deref(),
+        );
         let origin = track.simulate.as_ref();
         let fragment = origin.map(|o| o.delta_v_ecef.is_some()).unwrap_or(false);
         let mass = origin.map(|o| o.mass_kg).filter(|m| *m > 0.0).unwrap_or(store.vessel.default_mass_kg);
@@ -1131,10 +1142,24 @@ fn vessel_inputs(store: &Store) -> (Vec<vessel::ObjectInput>, Vec<vessel::BoatQu
     (vessel::objects_from_tracks(pieces), boats)
 }
 
-fn impact_velocity_enu(lla: &[f32], times: Option<&[f64]>, index: usize) -> [f64; 3] {
+fn impact_velocity_enu(lla: &[f32], times: Option<&[f64]>, index: usize, velocity_ecef: Option<&[f32]>) -> [f64; 3] {
     let n = lla.len() / 3;
     if n < 2 {
         return [0.0, 0.0, -1.0];
+    }
+    let lat = lla[index.min(n - 1) * 3 + 1] as f64;
+    let lon = lla[index.min(n - 1) * 3] as f64;
+    let (east, north, up) = crate::generate::enu_basis(lat, lon);
+    if let Some(vel) = velocity_ecef.filter(|vel| vel.len() == n * 3) {
+        let i = index.min(n - 1) * 3;
+        let vx = vel[i] as f64;
+        let vy = vel[i + 1] as f64;
+        let vz = vel[i + 2] as f64;
+        return [
+            vx * east.x + vy * east.y + vz * east.z,
+            vx * north.x + vy * north.y + vz * north.z,
+            vx * up.x + vy * up.y + vz * up.z,
+        ];
     }
     let i = index.min(n - 2);
     let j = i + 1;
@@ -2008,7 +2033,7 @@ fn regenerate_simulated_with_wind(
             let sample = origin.source_track_id.and_then(|sid| {
                 let track = store.tracks.get(&sid)?;
                 let time = origin.source_time_s.unwrap_or(origin.time_offset);
-                sample_track_state(sid, &track.lla, track.times.as_deref(), time).ok()
+                sample_with_internal_velocity(sid, &track.lla, track.times.as_deref(), track.states.velocity_mps.as_deref(), time).ok()
             });
             (*id, origin.clone(), sample)
         })
