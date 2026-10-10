@@ -58,6 +58,7 @@ import {
 const tracks = new Map();
 let schemaSession = null;
 let fileLoadError = "";
+let fileLoadProgress = "";
 let boats = [];
 let selectedId = null;
 let selectedBoatId = null;
@@ -270,7 +271,11 @@ els.cancelClassify?.addEventListener("click", () => {
 try {
   await listen("load-progress", ({ payload }) => {
     const text = formatLoadProgress(payload);
-    if (text) els.progress.textContent = text;
+    if (!text) return;
+    fileLoadProgress = text;
+    if (els.progress) els.progress.textContent = text;
+    const slot = document.querySelector("#drawer-trajectories [data-role='load-progress']");
+    if (slot) slot.textContent = text;
   });
 } catch {
   /* previewed outside the Tauri shell */
@@ -343,8 +348,13 @@ async function runClassify(cmd, dest) {
       return;
     }
     if (els.cancelClassify) els.cancelClassify.hidden = false;
-    els.progress.textContent = "Preparing local Llama 3.1 8B Instruct…";
+    fileLoadProgress = "Reading trajectory columns…";
+    els.progress.textContent = fileLoadProgress;
+    render();
+    setBusy(true);
+    if (els.cancelClassify) els.cancelClassify.hidden = false;
     const result = await invoke("classify_picked", { paths });
+    fileLoadProgress = "";
     const groups = (result?.groups || []).map((group) => ({
       ...group,
       status: "pending",
@@ -372,16 +382,28 @@ async function runClassify(cmd, dest) {
     drawerLoadMethod = "files";
     hideSchemaReview();
     els.progress.textContent = uniqueSchemaSummary(groups);
+    schemaSession.openEditor = groups.some((group) => group.editor_required);
   } catch (err) {
     schemaSession = null;
     hideSchemaReview();
+    fileLoadProgress = "";
     fileLoadError = loadFailureMessage(err);
     els.progress.textContent = fileLoadError;
   } finally {
     if (els.cancelClassify) els.cancelClassify.hidden = true;
     setBusy(false);
     render();
+    openModelEditor();
   }
+}
+
+function openModelEditor() {
+  if (!schemaSession?.openEditor) return;
+  const index = schemaSession.groups.findIndex((group) => group.editor_required && !group.loaded);
+  if (index < 0) return;
+  schemaSession.flow = "edit";
+  schemaSession.openEditor = false;
+  openSchemaEditor(index);
 }
 
 function hideSchemaReview() {
@@ -2497,6 +2519,7 @@ function fillFileLoad(body, obj, destLabel) {
       <button type="button" data-act="load-folder" class="ghost compact">Choose folder…</button>
     </div>
     <div class="muted wind-hint">The first import classifies each text file on this computer with Llama 3.1 8B Instruct (Q4_K_M). The download and classification stay off the window thread, and Cancel stops them. CUDA is used on NVIDIA, Vulkan on other GPUs, and CPU when there is no GPU.</div>
+    ${fileLoadProgress ? `<p class="muted" data-role="load-progress">${escapeHtml(fileLoadProgress)}</p>` : ""}
     ${fileLoadError ? `<p class="schema-error" data-role="load-failure">${escapeHtml(fileLoadError)}</p>` : ""}
     ${schemaSession ? summaryHtml(schemaSession.groups, schemaSession.errors) : ""}`;
   const needObject = () => {

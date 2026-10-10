@@ -262,9 +262,13 @@ export function editorHtml(group, index, total) {
   const lat = origin.lat ?? originFile?.origin_lat ?? "";
   const lon = origin.lon ?? originFile?.origin_lon ?? "";
   const alt = origin.alt ?? originFile?.origin_alt_m ?? "";
+  const modelError = group.manual_reason
+    ? `<p class="schema-error" data-role="model-error">${escapeHtml(group.manual_reason)}</p>`
+    : "";
   return `${stageHtml(group, index, total)}
     <div class="schema-card schema-editor">
       <p class="schema-ask">Correct this schema. The change applies to every file that shares it.</p>
+      ${modelError}
       <div class="schema-form">
         <label>Header lines <input data-field="header" type="number" min="0" step="1" value="${Number(classif.header_lines) || 0}" /></label>
         <label>Delimiter <select data-field="delimiter">${DELIMITERS.map((item) => `<option value="${escapeHtml(item.value)}"${item.value === delimiter ? " selected" : ""}>${item.label}</option>`).join("")}</select></label>

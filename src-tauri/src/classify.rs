@@ -3,8 +3,9 @@
 //! The model is Meta Llama 3.1 8B Instruct, quantized GGUF, run with llama.cpp.
 //! Weights are downloaded on first use and are not part of the repository.
 
+use std::cell::Cell;
 use std::collections::BTreeMap;
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -16,7 +17,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::schema::Delimiter;
+use crate::schema::{detect_preview, detect_schema, ColumnRole, Delimiter, DetectedSchema, Frame};
 
 pub const LOW_CONFIDENCE: f64 = 0.6;
 pub const EXCERPT_LINES: usize = 40;
@@ -49,6 +50,12 @@ ECEF and ECI use pos_x, pos_y, pos_z.
 NED uses pos_n, pos_e, pos_d for north, east, and down.
 NEU uses pos_n, pos_e, pos_u for north, east, and up.
 Velocity, acceleration, and orientation use the same axis names when those columns exist.
+
+Read the names in the excerpt. They are not a fixed dictionary, and a named header is still your job.
+lat, latitude, lon, longitude, alt, and altitude are LLA position: pos_lat, pos_lon, pos_alt.
+x-ecr, y-ecr, and z-ecr are Earth-centered rotating position, which is ECEF: pos_x, pos_y, and pos_z. Match each column by the axis in its name. z-ecr may appear before y-ecr.
+north, east, and down are NED: pos_n, pos_e, and pos_d.
+Return that identification only. Do not convert coordinates into another frame.
 Always include position, velocity, acceleration, and orientation under units. Include mass under units only when a column role is mass.
 
 delimiter is one of "," , "\t" , ";" , "|" , or "whitespace".
@@ -140,6 +147,9 @@ pub struct SchemaGroup {
     pub needs_manual: bool,
     pub manual_reason: String,
     pub files: Vec<GroupedFile>,
+    /// The model did not return JSON. The editor opens with this group's best guess.
+    #[serde(default)]
+    pub editor_required: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -204,14 +214,62 @@ pub fn accept_output(raw: &str) -> Result<TrajectoryClassification, String> {
 
 fn sole_json_object(raw: &str) -> Result<&str, String> {
     let trimmed = raw.trim();
-    if !trimmed.starts_with('{') {
-        return Err("model output was not a JSON object".into());
+    if let Some(object) = json_object_in(trimmed) {
+        return Ok(object);
     }
-    let value: Value = serde_json::from_str(trimmed).map_err(|_| "model output was not a single JSON object".to_string())?;
-    if !value.is_object() {
-        return Err("model output was not a JSON object".into());
+    Err("model output was not a JSON object".into())
+}
+
+fn json_object_in(raw: &str) -> Option<&str> {
+    let start = raw.find('{')?;
+    let slice = &raw[start..];
+    let end = balanced_object_end(slice)?;
+    let object = &slice[..=end];
+    let value: Value = serde_json::from_str(object).ok()?;
+    value.is_object().then_some(object)
+}
+
+fn balanced_object_end(text: &str) -> Option<usize> {
+    let mut depth = 0i32;
+    let mut in_string = false;
+    let mut escape = false;
+    for (index, ch) in text.char_indices() {
+        if in_string {
+            if escape {
+                escape = false;
+            } else if ch == '\\' {
+                escape = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_string = true,
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(index);
+                }
+            }
+            _ => {}
+        }
     }
-    Ok(trimmed)
+    None
+}
+
+fn free_vram_mib() -> Option<u64> {
+    let mut cmd = Command::new("nvidia-smi");
+    cmd.args(["--query-gpu=memory.free", "--format=csv,noheader,nounits"]);
+    let out = run_bounded(cmd, Duration::from_secs(3), &AtomicBool::new(false)).ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|line| line.trim().parse::<u64>().ok())
+        .min()
 }
 
 pub fn normalize_classification(class: &mut TrajectoryClassification) {
@@ -543,6 +601,7 @@ pub fn group_files(files: Vec<(GroupedFile, TrajectoryClassification)>) -> Vec<S
                     needs_manual: false,
                     manual_reason: String::new(),
                     files: Vec::new(),
+                    editor_required: false,
                 },
             );
         }
@@ -574,6 +633,82 @@ pub fn group_files(files: Vec<(GroupedFile, TrajectoryClassification)>) -> Vec<S
         groups.push(group);
     }
     groups
+}
+
+/// Low-confidence column guess for the manual editor when Llama does not return JSON.
+/// Loading a file does not use this in place of the model.
+pub fn heuristic_classification(text: &str) -> Result<TrajectoryClassification, String> {
+    let preview = detect_preview(text).ok_or_else(|| "could not detect a columnar schema".to_string())?;
+    Ok(classification_from_detected(&detect_schema(&preview)))
+}
+
+fn classification_from_detected(schema: &DetectedSchema) -> TrajectoryClassification {
+    let mut columns = BTreeMap::new();
+    for col in &schema.columns {
+        let role = match col.role {
+            ColumnRole::Time => "time",
+            ColumnRole::Lat => "pos_lat",
+            ColumnRole::Lon => "pos_lon",
+            ColumnRole::Alt => "pos_alt",
+            ColumnRole::X => "pos_x",
+            ColumnRole::Y => "pos_y",
+            ColumnRole::Z => "pos_z",
+            ColumnRole::Other => continue,
+        };
+        columns.insert(format!("col_{}", col.index), role.to_string());
+    }
+    let km = schema.columns.iter().any(|col| {
+        matches!(col.role, ColumnRole::Alt | ColumnRole::X | ColumnRole::Y | ColumnRole::Z)
+            && col.name.to_ascii_lowercase().contains("km")
+    });
+    let mut class = TrajectoryClassification {
+        header_lines: if schema.has_header { 1 } else { 0 },
+        delimiter: schema.delimiter.clone(),
+        coordinate_system: match schema.frame {
+            Frame::Lla => "LLA",
+            Frame::Ecef => "ECEF",
+        }
+        .to_string(),
+        units: ClassificationUnits {
+            position: if km { "km" } else { "m" }.to_string(),
+            velocity: None,
+            acceleration: None,
+            orientation: None,
+            mass: None,
+        },
+        columns,
+        confidence_score: (schema.confidence as f64).clamp(0.0, 1.0),
+        unsupported_flag: false,
+        reasoning: "Detected from the column names because the Llama weight was not available.".into(),
+    };
+    normalize_classification(&mut class);
+    class
+}
+
+/// Guess used only to fill the manual editor when Llama does not return JSON.
+pub fn partial_schema_guess(text: &str) -> TrajectoryClassification {
+    let mut class = heuristic_classification(text).unwrap_or_else(|_| TrajectoryClassification {
+        header_lines: 0,
+        delimiter: ",".into(),
+        coordinate_system: "LLA".into(),
+        units: ClassificationUnits {
+            position: "m".into(),
+            velocity: None,
+            acceleration: None,
+            orientation: None,
+            mass: None,
+        },
+        columns: BTreeMap::new(),
+        confidence_score: 0.0,
+        unsupported_flag: false,
+        reasoning: String::new(),
+    });
+    class.confidence_score = class.confidence_score.min(0.2);
+    if class.reasoning.trim().is_empty() {
+        class.reasoning = "Partial guess from the file text.".into();
+    }
+    normalize_classification(&mut class);
+    class
 }
 
 #[cfg(test)]
@@ -709,8 +844,51 @@ pub fn device_message(backend: GpuBackend, fell_back: bool) -> &'static str {
     }
 }
 
-/// Ask llama.cpp to keep as many layers as fit in VRAM. CPU builds get no offload flags.
+/// Prompt plus 20–50 excerpt lines. Llama 3.1's native 131072 context is about 16 GB of KV cache.
+pub const CLASSIFY_CONTEXT: &str = "2048";
+/// The classification object is a few hundred tokens. A long generation is prose, not a schema.
+pub const CLASSIFY_PREDICT: &str = "384";
+
+/// How many Llama 3.1 8B layers fit in free VRAM. Q4_K_M is about 160 MiB of weights per layer.
+/// Unknown memory means zero layers so the GGUF stays mmap'd instead of being copied into RAM.
+pub fn gpu_layer_limit(free_mib: Option<u64>) -> u32 {
+    const LAYERS: u32 = 32;
+    const MIB_PER_LAYER: u64 = 160;
+    const RESERVE_MIB: u64 = 1536;
+    let Some(free) = free_mib else {
+        return 0;
+    };
+    let budget = free.saturating_sub(RESERVE_MIB);
+    ((budget / MIB_PER_LAYER) as u32).min(LAYERS)
+}
+
+/// mmap the GGUF and keep the context small. Never mlock and never disable mmap.
+pub fn memory_args(help: &str) -> Vec<String> {
+    let mut args = Vec::new();
+    if help_has(help, "-c") || help_has(help, "--ctx-size") {
+        args.push("-c".into());
+        args.push(CLASSIFY_CONTEXT.into());
+    }
+    if help_has(help, "--load-mode") {
+        args.push("--load-mode".into());
+        args.push("mmap".into());
+    } else if help_has(help, "--mmap") {
+        args.push("--mmap".into());
+    }
+    if help_has(help, "--fit-ctx") {
+        args.push("--fit-ctx".into());
+        args.push(CLASSIFY_CONTEXT.into());
+    }
+    args
+}
+
+/// GPU offload stays inside VRAM. `--fit` chooses the layer count. `-ngl auto` is not combined
+/// with it, because that pins every layer and copies the weights beside the mmap.
 pub fn offload_args(backend: GpuBackend, help: &str) -> Vec<String> {
+    offload_args_with(backend, help, None)
+}
+
+pub fn offload_args_with(backend: GpuBackend, help: &str, free_mib: Option<u64>) -> Vec<String> {
     if backend == GpuBackend::Cpu {
         return Vec::new();
     }
@@ -718,11 +896,9 @@ pub fn offload_args(backend: GpuBackend, help: &str) -> Vec<String> {
     if help_has(help, "--fit") {
         args.push("--fit".into());
         args.push("on".into());
-    }
-    if help_has(help, "-ngl") || help_has(help, "--n-gpu-layers") {
-        // "auto" leaves the layer count unset so --fit can use the layers that fit.
+    } else if help_has(help, "-ngl") || help_has(help, "--n-gpu-layers") {
         args.push("-ngl".into());
-        args.push("auto".into());
+        args.push(gpu_layer_limit(free_mib).to_string());
     }
     args
 }
@@ -804,8 +980,16 @@ impl TextCompleter for LlamaRuntime {
         let help = self.cached_help()?;
         let mut cmd = Command::new(&self.cli);
         cmd.arg("-m").arg(&self.model);
-        cmd.arg("-n").arg("700");
-        for arg in offload_args(self.backend, &help) {
+        cmd.arg("-n").arg(CLASSIFY_PREDICT);
+        for arg in memory_args(&help) {
+            cmd.arg(arg);
+        }
+        let free_mib = if self.backend != GpuBackend::Cpu && !help_has(&help, "--fit") {
+            free_vram_mib()
+        } else {
+            None
+        };
+        for arg in offload_args_with(self.backend, &help, free_mib) {
             cmd.arg(arg);
         }
         if help_has(&help, "--temp") {
@@ -827,6 +1011,8 @@ impl TextCompleter for LlamaRuntime {
             let grammar_path = dir.join("schema.gbnf");
             fs::write(&grammar_path, classification_grammar()).map_err(|e| e.to_string())?;
             cmd.arg("--grammar-file").arg(&grammar_path);
+        } else {
+            return Err("llama.cpp cannot force the JSON schema, so the model was not run".into());
         }
         if help_has(&help, "-f") || help_has(&help, "--file") {
             cmd.arg("-f").arg(&prompt_path);
@@ -952,8 +1138,13 @@ pub fn ensure_model(
     }
     fs::create_dir_all(dest.parent().unwrap()).map_err(|e| e.to_string())?;
     let device = device_name(backend);
-    download_to(GGUF_URL, &dest, cancel, &|bytes, total| {
-        note(progress, "Downloading Llama 3.1 8B Instruct", bytes, total, device);
+    download_to(GGUF_URL, &dest, cancel, &|status, bytes, total| {
+        let label = if status.is_empty() {
+            "Downloading Llama 3.1 8B Instruct"
+        } else {
+            status
+        };
+        note(progress, label, bytes, total, device);
     })
     .map_err(|err| {
         format!(
@@ -1005,14 +1196,13 @@ fn install_backend(
     let (name, url) = cli_asset(backend);
     let device = device_name(backend);
     let archive = root.join(&name);
-    download_to(&url, &archive, cancel, &|bytes, total| {
-        note(
-            progress,
-            &format!("Downloading llama.cpp ({device})"),
-            bytes,
-            total,
-            device,
-        );
+    download_to(&url, &archive, cancel, &|status, bytes, total| {
+        let label = if status.is_empty() {
+            format!("Downloading llama.cpp ({device})")
+        } else {
+            status.to_string()
+        };
+        note(progress, &label, bytes, total, device);
     })?;
     extract_archive(&archive, &root, cancel)?;
     find_cli(&root).ok_or_else(|| format!("llama.cpp archive did not contain llama-cli ({url})"))
@@ -1095,44 +1285,244 @@ fn find_cli(root: &Path) -> Option<PathBuf> {
         .map(|entry| entry.into_path())
 }
 
+const DOWNLOAD_ATTEMPTS: u32 = 8;
+
+fn retry_pause(attempt: u32) -> Duration {
+    Duration::from_millis(400u64.saturating_mul(1u64 << attempt.min(4)))
+}
+
+fn partial_path(dest: &Path) -> PathBuf {
+    let mut name = dest.file_name().unwrap_or_default().to_os_string();
+    name.push(".partial");
+    dest.with_file_name(name)
+}
+
+fn file_len(path: &Path) -> u64 {
+    fs::metadata(path).map(|meta| meta.len()).unwrap_or(0)
+}
+
+fn expects_gguf(dest: &Path) -> bool {
+    dest.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("gguf"))
+}
+
+fn already_complete(dest: &Path) -> bool {
+    let len = file_len(dest);
+    len > 0 && (!expects_gguf(dest) || len >= GGUF_MIN_BYTES)
+}
+
+pub fn retryable_download_error(err: &str) -> bool {
+    if err == CANCELLED || err.contains(CANCELLED) {
+        return false;
+    }
+    let lower = err.to_ascii_lowercase();
+    if lower.contains("smaller than") {
+        return false;
+    }
+    if lower.contains("status code 4") && !lower.contains("status code 408") && !lower.contains("status code 429") {
+        return false;
+    }
+    lower.contains("connection")
+        || lower.contains("forcibly closed")
+        || lower.contains("10054")
+        || lower.contains("reset")
+        || lower.contains("broken pipe")
+        || lower.contains("timed out")
+        || lower.contains("timeout")
+        || lower.contains("tls")
+        || lower.contains("eof")
+        || lower.contains("read download")
+        || lower.contains("retry-download")
+}
+
+fn content_range_total(value: &str) -> Option<u64> {
+    let total = value.split('/').nth(1)?.trim();
+    if total == "*" {
+        None
+    } else {
+        total.parse().ok()
+    }
+}
+
+fn content_range_start(value: &str) -> Option<u64> {
+    let spec = value.split_whitespace().nth(1)?;
+    spec.split('-').next()?.parse().ok()
+}
+
+fn wait_retry(pause: Duration, cancel: &AtomicBool) -> Result<(), String> {
+    let step = Duration::from_millis(50);
+    let mut left = pause;
+    while !left.is_zero() {
+        if cancel.load(Ordering::SeqCst) {
+            return Err(CANCELLED.into());
+        }
+        let slice = left.min(step);
+        thread::sleep(slice);
+        left = left.saturating_sub(slice);
+    }
+    if cancel.load(Ordering::SeqCst) {
+        Err(CANCELLED.into())
+    } else {
+        Ok(())
+    }
+}
+
+fn adopt_incomplete_dest(dest: &Path, partial: &Path) -> Result<(), String> {
+    if !dest.is_file() || already_complete(dest) {
+        return Ok(());
+    }
+    if file_len(dest) > file_len(partial) {
+        if partial.exists() {
+            fs::remove_file(partial).ok();
+        }
+        fs::rename(dest, partial).map_err(|err| format!("keep partial download: {err}"))?;
+    }
+    Ok(())
+}
+
 fn download_to(
     url: &str,
     dest: &Path,
     cancel: &AtomicBool,
-    on_progress: &dyn Fn(u64, u64),
+    on_status: &dyn Fn(&str, u64, u64),
+) -> Result<(), String> {
+    download_with(url, dest, cancel, DOWNLOAD_ATTEMPTS, &retry_pause, on_status)
+}
+
+fn download_with(
+    url: &str,
+    dest: &Path,
+    cancel: &AtomicBool,
+    attempts: u32,
+    pause: &dyn Fn(u32) -> Duration,
+    on_status: &dyn Fn(&str, u64, u64),
 ) -> Result<(), String> {
     if cancel.load(Ordering::SeqCst) {
         return Err(CANCELLED.into());
     }
-    if dest.is_file() && fs::metadata(dest).map(|m| m.len() > 0).unwrap_or(false) {
-        if !dest.extension().is_some_and(|ext| ext == "gguf") || fs::metadata(dest).map(|m| m.len() >= GGUF_MIN_BYTES).unwrap_or(false)
-        {
-            return Ok(());
+    if already_complete(dest) {
+        return Ok(());
+    }
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+    }
+    let partial = partial_path(dest);
+    adopt_incomplete_dest(dest, &partial)?;
+    let last_total = Cell::new(0u64);
+    let mut last_err = String::new();
+    let attempts = attempts.max(1);
+    for attempt in 0..attempts {
+        if cancel.load(Ordering::SeqCst) {
+            return Err(CANCELLED.into());
+        }
+        let report = |status: &str, bytes: u64, total: u64| {
+            if total > 0 {
+                last_total.set(total);
+            }
+            let shown = if total > 0 { total } else { last_total.get() };
+            on_status(status, bytes, shown);
+        };
+        match download_once(url, dest, &partial, cancel, &report) {
+            Ok(()) => return Ok(()),
+            Err(err) if err == CANCELLED || err.contains(CANCELLED) => return Err(err),
+            Err(err) if retryable_download_error(&err) && attempt + 1 < attempts => {
+                last_err = err;
+                report("Download interrupted; resuming", file_len(&partial), last_total.get());
+                wait_retry(pause(attempt), cancel)?;
+            }
+            Err(err) => return Err(err),
         }
     }
-    let tmp = dest.with_extension("partial");
+    Err(last_err)
+}
+
+fn download_once(
+    url: &str,
+    dest: &Path,
+    partial: &Path,
+    cancel: &AtomicBool,
+    on_status: &dyn Fn(&str, u64, u64),
+) -> Result<(), String> {
+    if cancel.load(Ordering::SeqCst) {
+        return Err(CANCELLED.into());
+    }
+    let have = file_len(partial);
+    on_status("", have, 0);
     let agent = ureq::AgentBuilder::new()
         .timeout_connect(Duration::from_secs(30))
+        .timeout_read(Duration::from_secs(90))
         .timeout(Duration::from_secs(60 * 180))
         .build();
-    let response = agent.get(url).call().map_err(|err| format!("download {url} failed: {err}"))?;
-    let total = response.header("content-length").and_then(|value| value.parse().ok()).unwrap_or(0);
+    let request = if have > 0 {
+        agent.get(url).set("Range", &format!("bytes={have}-"))
+    } else {
+        agent.get(url)
+    };
+    let response = match request.call() {
+        Ok(response) => response,
+        Err(ureq::Error::Status(416, _)) if have > 0 => {
+            fs::remove_file(partial).ok();
+            return Err(format!("download {url} failed: range was rejected; retry-download"));
+        }
+        Err(err) => return Err(format!("download {url} failed: {err}")),
+    };
+    let status = response.status();
+    let content_range = response.header("content-range").unwrap_or("").to_string();
+    let content_length = response
+        .header("content-length")
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0);
+    let (append, total) = if status == 206 {
+        let start = content_range_start(&content_range).unwrap_or(have);
+        if start != have {
+            return Err(format!("download {url} failed: range was rejected; retry-download"));
+        }
+        let total = content_range_total(&content_range).unwrap_or(have.saturating_add(content_length));
+        (true, total)
+    } else {
+        (false, content_length)
+    };
+    if expects_gguf(dest) && total > 0 && total < GGUF_MIN_BYTES {
+        return Err(format!(
+            "download {url} failed: file is {total} bytes, smaller than Llama-3.1-8B-Instruct Q4_K_M"
+        ));
+    }
+    let mut file = if append {
+        OpenOptions::new().create(true).append(true).open(partial)
+    } else {
+        OpenOptions::new().create(true).write(true).truncate(true).open(partial)
+    }
+    .map_err(|err| format!("create {}: {err}", partial.display()))?;
+    let base = if append { have } else { 0 };
+    on_status("", base, total);
+    let last_emit = Cell::new(Instant::now() - Duration::from_secs(1));
     let mut reader = response.into_reader();
-    let mut file = fs::File::create(&tmp).map_err(|err| format!("create {}: {err}", tmp.display()))?;
-    let last_emit = std::cell::Cell::new(Instant::now() - Duration::from_secs(1));
     let copied = copy_cancellable(&mut reader, &mut file, cancel, &|bytes| {
-        if last_emit.get().elapsed() >= Duration::from_millis(200) || (total > 0 && bytes >= total) {
-            on_progress(bytes, total);
+        let done = base + bytes;
+        if last_emit.get().elapsed() >= Duration::from_millis(200) || (total > 0 && done >= total) {
+            on_status("", done, total);
             last_emit.set(Instant::now());
         }
     });
-    if let Err(err) = copied {
-        drop(file);
-        let _ = fs::remove_file(&tmp);
-        return Err(err);
+    file.flush().ok();
+    let written = match copied {
+        Ok(n) => n,
+        Err(err) => return Err(err),
+    };
+    let end = base + written;
+    if total > 0 && end < total {
+        return Err(format!("download {url} failed: connection closed before the file finished"));
+    }
+    if expects_gguf(dest) && end < GGUF_MIN_BYTES {
+        return Err(format!(
+            "download {url} failed: connection closed before Llama-3.1-8B-Instruct Q4_K_M finished"
+        ));
     }
     file.sync_all().ok();
-    fs::rename(&tmp, dest).map_err(|err| format!("rename download: {err}"))?;
+    drop(file);
+    if dest.exists() {
+        fs::remove_file(dest).ok();
+    }
+    fs::rename(partial, dest).map_err(|err| format!("rename download: {err}"))?;
     Ok(())
 }
 
@@ -1195,10 +1585,13 @@ fn extract_archive(archive: &Path, dest: &Path, cancel: &AtomicBool) -> Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::io::{Read, Write};
     use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Mutex;
+    use std::thread;
     use std::time::Duration;
 
     fn sample_ecef() -> TrajectoryClassification {
@@ -1266,6 +1659,9 @@ mod tests {
         assert!(!SYSTEM_PROMPT.contains("header_line_count"));
         assert!(!SYSTEM_PROMPT.contains("needs_manual_override"));
         assert!(!SYSTEM_PROMPT.contains("coordinate_system_supported"));
+        assert!(SYSTEM_PROMPT.contains("x-ecr") && SYSTEM_PROMPT.contains("y-ecr") && SYSTEM_PROMPT.contains("z-ecr"));
+        assert!(SYSTEM_PROMPT.contains("north, east, and down"));
+        assert!(SYSTEM_PROMPT.contains("Do not convert coordinates"));
         assert!(GGUF_URL.contains("Llama-3.1-8B-Instruct"));
         assert!(GGUF_FILENAME.contains("Q4_K_M"));
         assert!(!GGUF_URL.to_ascii_lowercase().contains("mistral"));
@@ -1460,11 +1856,80 @@ mod tests {
     fn gpu_offload_fits_layers_and_cpu_passes_none() {
         let help = "usage --fit [on|off] -ngl N --n-gpu-layers N --temp N";
         let cuda = offload_args(GpuBackend::Cuda, help);
-        assert_eq!(&cuda[0..2], ["--fit", "on"]);
-        assert_eq!(&cuda[2..4], ["-ngl", "auto"]);
+        assert_eq!(cuda, vec!["--fit".to_string(), "on".to_string()]);
+        assert!(!cuda.iter().any(|arg| arg == "-ngl" || arg == "auto" || arg == "all"));
         assert!(offload_args(GpuBackend::Vulkan, help).windows(2).any(|pair| pair == ["--fit", "on"]));
         assert!(offload_args(GpuBackend::Cpu, help).is_empty());
         assert!(offload_args(GpuBackend::Cuda, "usage --temp N").is_empty());
+        let capped = offload_args_with(GpuBackend::Cuda, "usage -ngl N", Some(8_192));
+        assert_eq!(capped, vec!["-ngl".to_string(), "32".to_string()]);
+        assert_eq!(offload_args_with(GpuBackend::Vulkan, "usage -ngl N", None), vec!["-ngl".to_string(), "0".to_string()]);
+        assert_eq!(gpu_layer_limit(None), 0);
+        assert_eq!(gpu_layer_limit(Some(2_000)), 2);
+    }
+
+    #[test]
+    fn llama_context_is_small_and_weights_stay_mmapd() {
+        let help = "usage -c --ctx-size N --mmap --no-mmap --load-mode --fit --fit-ctx N --json-schema-file F --grammar-file F";
+        let args = memory_args(help);
+        assert!(args.windows(2).any(|pair| pair == ["-c", "2048"]), "{args:?}");
+        assert!(args.windows(2).any(|pair| pair == ["--load-mode", "mmap"]), "{args:?}");
+        assert!(args.windows(2).any(|pair| pair == ["--fit-ctx", "2048"]), "{args:?}");
+        assert!(!args.iter().any(|arg| arg == "--no-mmap" || arg == "--mlock" || arg == "mlock"));
+        let mmap_only = memory_args("usage -c N --mmap --no-mmap");
+        assert!(mmap_only.iter().any(|arg| arg == "--mmap"), "{mmap_only:?}");
+        assert!(!mmap_only.iter().any(|arg| arg.contains("no-mmap") || arg.contains("mlock")));
+    }
+
+    #[test]
+    fn every_excerpt_including_named_headers_is_sent_to_the_model() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("samples")
+            .join("eglin_keywest_6dof.csv");
+        let text = fs::read_to_string(&path).unwrap();
+        let excerpt = excerpt_of(&text);
+        assert!(excerpt.lines().count() <= 50 && excerpt.lines().count() >= 20);
+        assert!(excerpt.starts_with("time,lat,lon,alt"));
+        let json = r#"{"header_lines":1,"delimiter":",","coordinate_system":"LLA","units":{"position":"m"},"columns":{"col_0":"time","col_1":"pos_lat","col_2":"pos_lon","col_3":"pos_alt"},"confidence_score":0.93,"unsupported_flag":false,"reasoning":"lat lon alt"}"#;
+        let saw = Mutex::new(String::new());
+        struct Watch<'a> {
+            json: &'a str,
+            saw: &'a Mutex<String>,
+            calls: Mutex<usize>,
+        }
+        impl TextCompleter for Watch<'_> {
+            fn complete(&self, system: &str, user: &str) -> Result<String, String> {
+                *self.calls.lock().unwrap() += 1;
+                assert!(system.contains("x-ecr"));
+                assert!(system.contains("Do not convert coordinates"));
+                *self.saw.lock().unwrap() = user.to_string();
+                Ok(self.json.to_string())
+            }
+        }
+        let model = Watch { json, saw: &saw, calls: Mutex::new(0) };
+        let class = classify_with(&model, &excerpt).unwrap();
+        assert_eq!(*model.calls.lock().unwrap(), 1);
+        assert!(saw.lock().unwrap().contains("time,lat,lon,alt"));
+        assert_eq!(class.header_lines, 1);
+        assert_eq!(class.delimiter, ",");
+        assert_eq!(class.coordinate_system, "LLA");
+        assert_eq!(class.columns.get("col_1").map(String::as_str), Some("pos_lat"));
+        assert!(class.units.velocity.is_none());
+        assert!(may_load(&class, false), "{class:?}");
+        let track = crate::parse::parse_with_classification(&text, &class, None).unwrap();
+        assert!(track.lla.len() / 3 >= 300);
+        assert!((track.lla[0] as f64 + 86.5254).abs() < 1e-2);
+        assert!((track.lla[1] as f64 - 30.4832).abs() < 1e-2);
+
+        let ecr = "time,x-ecr,z-ecr,y-ecr\n0,1,2,3\n";
+        let ned = "time,north,east,down\n0,1,2,3\n";
+        for excerpt in [ecr, ned] {
+            let model = Watch { json, saw: &saw, calls: Mutex::new(0) };
+            let _ = classify_with(&model, excerpt).unwrap();
+            assert_eq!(*model.calls.lock().unwrap(), 1);
+            assert!(saw.lock().unwrap().contains(excerpt.lines().next().unwrap()));
+        }
     }
 
     #[test]
@@ -1497,6 +1962,175 @@ mod tests {
         assert!(err.contains("cancelled"), "{err}");
         assert!(writer.len() < 1024 * 256 * 3);
         assert!(!writer.is_empty());
+    }
+
+    #[test]
+    fn connection_reset_is_retried_and_a_missing_file_is_not() {
+        let seen = "download https://huggingface.co/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF/resolve/main/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf failed: Connection Failed: tls connection init failed: An existing connection was forcibly closed by the remote host. (os error 10054)";
+        assert!(retryable_download_error(seen), "{seen}");
+        assert!(retryable_download_error("download http://example failed: connection closed before the file finished"));
+        assert!(!retryable_download_error("download http://example failed: example: status code 404"));
+        assert!(!retryable_download_error("classification cancelled"));
+        assert!(!retryable_download_error(
+            "download http://example failed: file is 12 bytes, smaller than Llama-3.1-8B-Instruct Q4_K_M"
+        ));
+    }
+
+    #[test]
+    fn download_resumes_after_the_connection_drops() {
+        let body: Vec<u8> = (0..180u8).map(|i| i.wrapping_mul(3)).collect();
+        let server = TestDownload::serve(body.clone(), DownloadScript::CutFirst { bytes: 40 });
+        let dest = temp_download("resume.zip");
+        download_with(&server.url, &dest, &AtomicBool::new(false), 4, &|_| Duration::ZERO, &|_, _, _| {}).unwrap();
+        let saved = fs::read(&dest).unwrap();
+        assert_eq!(saved, body);
+        let requests = server.requests.lock().unwrap();
+        assert!(requests.len() >= 2, "{requests:?}");
+        assert!(requests[1].to_ascii_lowercase().contains("range: bytes=40-"), "{}", requests[1]);
+    }
+
+    #[test]
+    fn download_keeps_a_partial_when_every_attempt_resets() {
+        let body = vec![9u8; 80];
+        let server = TestDownload::serve(body, DownloadScript::CutEvery { bytes: 16 });
+        let dest = temp_download("stuck.zip");
+        let err = download_with(&server.url, &dest, &AtomicBool::new(false), 3, &|_| Duration::ZERO, &|status, _, _| {
+            if !status.is_empty() {
+                assert!(status.contains("interrupted"), "{status}");
+            }
+        })
+        .unwrap_err();
+        assert!(retryable_download_error(&err), "{err}");
+        assert!(!dest.is_file());
+        let partial = partial_path(&dest);
+        assert!(file_len(&partial) > 0, "partial {}", file_len(&partial));
+    }
+
+    #[test]
+    fn existing_partial_is_continued_with_range() {
+        let body: Vec<u8> = (0..90).map(|i| 255 - i).collect();
+        let server = TestDownload::serve(body.clone(), DownloadScript::Whole);
+        let dest = temp_download("continue.zip");
+        let partial = partial_path(&dest);
+        fs::write(&partial, &body[..30]).unwrap();
+        download_with(&server.url, &dest, &AtomicBool::new(false), 2, &|_| Duration::ZERO, &|_, _, _| {}).unwrap();
+        assert_eq!(fs::read(&dest).unwrap(), body);
+        let requests = server.requests.lock().unwrap();
+        assert!(requests[0].to_ascii_lowercase().contains("range: bytes=30-"), "{}", requests[0]);
+    }
+
+    #[test]
+    fn editor_guess_stays_a_guess_when_the_model_does_not_answer() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("samples")
+            .join("eglin_keywest_6dof.csv");
+        let text = fs::read_to_string(&path).unwrap();
+        let class = partial_schema_guess(&text);
+        assert!(class.confidence_score <= 0.2, "{}", class.confidence_score);
+        assert!(!may_load(&class, false), "a header guess must not load as the model result");
+    }
+
+    fn temp_download(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("fauxrrt-dl-{}-{name}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir.join(name)
+    }
+
+    #[derive(Clone, Copy)]
+    enum DownloadScript {
+        Whole,
+        CutFirst { bytes: usize },
+        CutEvery { bytes: usize },
+    }
+
+    struct TestDownload {
+        url: String,
+        requests: Arc<Mutex<Vec<String>>>,
+        stop: Arc<AtomicBool>,
+        join: Option<thread::JoinHandle<()>>,
+    }
+
+    impl TestDownload {
+        fn serve(body: Vec<u8>, script: DownloadScript) -> Self {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            listener.set_nonblocking(true).unwrap();
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let stop = Arc::new(AtomicBool::new(false));
+            let requests_bg = Arc::clone(&requests);
+            let stop_bg = Arc::clone(&stop);
+            let join = thread::spawn(move || {
+                let mut served = 0usize;
+                while !stop_bg.load(Ordering::SeqCst) && served < 8 {
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            served += 1;
+                            let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                            let mut buf = [0u8; 4096];
+                            let n = stream.read(&mut buf).unwrap_or(0);
+                            let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                            requests_bg.lock().unwrap().push(req.clone());
+                            let start = header_range_start(&req).unwrap_or(0) as usize;
+                            if start > body.len() {
+                                let _ = stream.write_all(b"HTTP/1.1 416 Range Not Satisfiable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                                continue;
+                            }
+                            let slice = &body[start..];
+                            let cut = match script {
+                                DownloadScript::Whole => None,
+                                DownloadScript::CutFirst { bytes } if served == 1 => Some(bytes),
+                                DownloadScript::CutFirst { .. } => None,
+                                DownloadScript::CutEvery { bytes } => Some(bytes),
+                            };
+                            if start == 0 {
+                                let header = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+                                let _ = stream.write_all(header.as_bytes());
+                            } else {
+                                let end = body.len().saturating_sub(1);
+                                let header = format!(
+                                    "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {start}-{end}/{}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                    body.len(),
+                                    slice.len()
+                                );
+                                let _ = stream.write_all(header.as_bytes());
+                            }
+                            let send = cut.map(|n| n.min(slice.len())).unwrap_or(slice.len());
+                            let _ = stream.write_all(&slice[..send]);
+                            drop(stream);
+                        }
+                        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => thread::sleep(Duration::from_millis(5)),
+                        Err(_) => break,
+                    }
+                }
+            });
+            Self {
+                url: format!("http://127.0.0.1:{port}/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf"),
+                requests,
+                stop,
+                join: Some(join),
+            }
+        }
+    }
+
+    impl Drop for TestDownload {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            if let Some(handle) = self.join.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+
+    fn header_range_start(req: &str) -> Option<u64> {
+        for line in req.lines() {
+            let lower = line.to_ascii_lowercase();
+            let Some(rest) = lower.strip_prefix("range:") else { continue };
+            let spec = rest.trim().strip_prefix("bytes=")?;
+            return spec.split('-').next()?.trim().parse().ok();
+        }
+        None
     }
 
     fn slow_command() -> Command {

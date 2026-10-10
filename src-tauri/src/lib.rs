@@ -37,7 +37,7 @@ use mission::{
 };
 use classify::{
     classify_with, excerpt_of, file_origin, group_files, may_load, manual_reason, normalize_classification,
-    origin_from_text, ClassifyNote, GroupedFile, LlamaRuntime, SchemaAssignment, SchemaGroup,
+    origin_from_text, partial_schema_guess, ClassifyNote, GroupedFile, LlamaRuntime, SchemaAssignment, SchemaGroup,
     TrajectoryClassification, CANCELLED,
 };
 use parse::{parse_path_with, parse_text, parse_with_classification, read_trajectory_text, ParsedTrack};
@@ -1351,38 +1351,91 @@ fn classify_paths(app: &AppHandle, files: Vec<PathBuf>, cancel: &Arc<AtomicBool>
             file_count: 0,
         });
     }
-    let data_dir = app.path().app_data_dir().map_err(|err| err.to_string())?;
-    let runtime = LlamaRuntime::ensure(&data_dir, cancel, &|note| emit_note(app, total, &note))?;
-    let mut classified = Vec::new();
     let mut errors = Vec::new();
-    for (i, path) in files.iter().enumerate() {
+    let mut ready = Vec::new();
+    let mut pending = Vec::new();
+    for path in &files {
         if cancel.load(Ordering::SeqCst) {
             return Err(CANCELLED.into());
         }
-        let name = file_name(path);
-        emit_progress(
-            app,
-            ProgressEvent {
-                done: i + 1,
-                total,
-                file: format!("Classifying {name}"),
-                bytes: 0,
-                bytes_total: 0,
-                device: runtime.device.clone(),
-            },
-        );
-        match classify_file(&runtime, path) {
-            Ok(item) => classified.push(item),
+        match read_trajectory_text(path) {
+            Ok(text) => pending.push((path.clone(), text)),
+            Err(err) => errors.push(err),
+        }
+    }
+    let mut editor = Vec::new();
+    if !pending.is_empty() {
+        let data_dir = app.path().app_data_dir().map_err(|err| err.to_string())?;
+        match LlamaRuntime::ensure(&data_dir, cancel, &|note| emit_note(app, total, &note)) {
             Err(err) if err == CANCELLED || err.contains(CANCELLED) => return Err(CANCELLED.into()),
-            Err(err) => errors.push(format!("{name}: {err}")),
+            Err(err) => {
+                errors.push(err.clone());
+                for (path, text) in pending {
+                    editor.push((grouped_classification(&path, &text, partial_schema_guess(&text)), err.clone()));
+                }
+            }
+            Ok(runtime) => {
+                for (i, (path, text)) in pending.iter().enumerate() {
+                    if cancel.load(Ordering::SeqCst) {
+                        return Err(CANCELLED.into());
+                    }
+                    let name = file_name(path);
+                    emit_progress(
+                        app,
+                        ProgressEvent {
+                            done: i + 1,
+                            total,
+                            file: format!("Classifying {name}"),
+                            bytes: 0,
+                            bytes_total: 0,
+                            device: runtime.device.clone(),
+                        },
+                    );
+                    match classify_with(&runtime, &excerpt_of(text)) {
+                        Ok(class) => ready.push(grouped_classification(path, text, class)),
+                        Err(err) if err == CANCELLED || err.contains(CANCELLED) => return Err(CANCELLED.into()),
+                        Err(err) => {
+                            let message = format!("{name}: {err}");
+                            errors.push(message.clone());
+                            editor.push((grouped_classification(path, text, partial_schema_guess(text)), message));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let mut groups = group_files(ready);
+    if !editor.is_empty() {
+        let note = editor.iter().map(|(_, message)| message.clone()).collect::<Vec<_>>().join("\n");
+        let items = editor.into_iter().map(|(item, _)| item).collect();
+        for mut group in group_files(items) {
+            group.editor_required = true;
+            group.needs_manual = true;
+            group.manual_reason = note.clone();
+            groups.push(group);
         }
     }
     Ok(ClassifyResult {
-        groups: group_files(classified),
+        groups,
         errors,
         elapsed_ms: started.elapsed().as_millis() as u64,
         file_count: total,
     })
+}
+
+fn grouped_classification(path: &Path, text: &str, class: TrajectoryClassification) -> (GroupedFile, TrajectoryClassification) {
+    let origin = origin_from_text(text, class.header_lines);
+    (
+        GroupedFile {
+            path: path.to_string_lossy().into_owned(),
+            name: file_name(path),
+            excerpt: excerpt_of(text),
+            origin_lat: origin.map(|item| item.0),
+            origin_lon: origin.map(|item| item.1),
+            origin_alt_m: origin.map(|item| item.2),
+        },
+        class,
+    )
 }
 
 fn emit_note(app: &AppHandle, total: usize, note: &ClassifyNote) {
@@ -1401,27 +1454,6 @@ fn emit_note(app: &AppHandle, total: usize, note: &ClassifyNote) {
 
 fn emit_progress(app: &AppHandle, event: ProgressEvent) {
     let _ = app.emit("load-progress", event);
-}
-
-fn classify_file(
-    runtime: &LlamaRuntime,
-    path: &Path,
-) -> Result<(GroupedFile, TrajectoryClassification), String> {
-    let text = read_trajectory_text(path)?;
-    let excerpt = excerpt_of(&text);
-    let class = classify_with(runtime, &excerpt)?;
-    let origin = origin_from_text(&text, class.header_lines);
-    Ok((
-        GroupedFile {
-            path: path.to_string_lossy().into_owned(),
-            name: file_name(path),
-            excerpt,
-            origin_lat: origin.map(|item| item.0),
-            origin_lon: origin.map(|item| item.1),
-            origin_alt_m: origin.map(|item| item.2),
-        },
-        class,
-    ))
 }
 
 fn file_name(path: &Path) -> String {
