@@ -1023,6 +1023,7 @@ async fn compute_vessel_risk(state: State<'_, AppState>) -> Result<vessel::Vesse
         let (objects, boats) = vessel_inputs(&store);
         (objects, boats, store.vessel.clone())
     };
+    // Cell risk and the order-of-magnitude isolines are both built off the UI thread.
     tauri::async_runtime::spawn_blocking(move || vessel::compute_vessel_risk(&objects, &params, &boats))
         .await
         .map_err(|e| format!("vessel risk: {e}"))?

@@ -13,6 +13,12 @@
 //! applied to the trajectory risk matrix. A fixed Gaussian bandwidth is not
 //! used. When the impact sample has no measurable spread, the risk matrix is
 //! left unchanged because a bandwidth is not identifiable.
+//!
+//! Isolines are only a display of that smoothed `Risk(g)` field. Default
+//! levels are the powers of ten that fall in the risk values actually
+//! present (`10^-1`, `10^-2`, `10^-3`, …). They are not linear steps, and
+//! drawing them does not change cell risk, collective risk, or per-boat
+//! individual risk.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -32,6 +38,8 @@ const WEIGHT_TOL: f64 = 1.0e-6;
 const BOTEV_N: usize = 128;
 const DRAW_LIMIT: usize = 2_500;
 const DRAW_MIN_RISK: f64 = 1.0e-6;
+/// Longest side of the marching-squares raster used to trace isolines.
+const ISOLINE_MAX_N: usize = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -166,6 +174,16 @@ pub struct RiskCell {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct RiskIsoline {
+    /// Contour value of `Risk(g)`. A power of ten inside the present range.
+    pub level: f64,
+    /// Map label, such as `1e-2`.
+    pub label: String,
+    /// Lon, lat pairs in degrees. A closed ring repeats its first point.
+    pub line: Vec<f64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct VesselRisk {
     pub cells: Vec<RiskCell>,
     pub collective: f64,
@@ -177,6 +195,8 @@ pub struct VesselRisk {
     pub bandwidth_east_m: Option<f64>,
     pub bandwidth_north_m: Option<f64>,
     pub smoothed: bool,
+    /// Order-of-magnitude contours of the smoothed risk field. Display only.
+    pub isolines: Vec<RiskIsoline>,
 }
 
 /// Average hexagon area at [`H3_RES`]. Every risk cell uses this one A_g.
@@ -381,6 +401,9 @@ pub fn compute_vessel_risk(objects: &[ObjectInput], params: &VesselParams, boats
     let risk = combine_objects(&object_fields);
     let (boat_scores, collective) = score_boats(&risk, boats);
     let cells = draw_cells(&risk);
+    // Contours read the finished field. They are built here so the work stays
+    // on the blocking pool with the rest of the risk run.
+    let isolines = risk_isolines(&risk);
 
     Ok(VesselRisk {
         cells,
@@ -393,6 +416,7 @@ pub fn compute_vessel_risk(objects: &[ObjectInput], params: &VesselParams, boats
         bandwidth_east_m: bw_e,
         bandwidth_north_m: bw_n,
         smoothed,
+        isolines,
     })
 }
 
@@ -535,6 +559,346 @@ fn draw_cells(risk: &HashMap<u64, f64>) -> Vec<RiskCell> {
         });
     }
     cells
+}
+
+/// Powers of ten inside `[min_risk, max_risk]`. A span that stays inside one
+/// decade returns nothing: the default is not a linear subdivision.
+fn decade_levels(min_risk: f64, max_risk: f64) -> Vec<f64> {
+    if !min_risk.is_finite()
+        || !max_risk.is_finite()
+        || min_risk <= 0.0
+        || max_risk + max_risk * 1e-12 < min_risk
+    {
+        return Vec::new();
+    }
+    let mut k = min_risk.log10().floor() as i32 - 1;
+    let mut levels = Vec::new();
+    for _ in 0..36 {
+        let level = 10f64.powi(k);
+        if level > max_risk * (1.0 + 1e-6) && level > max_risk + 1e-15 {
+            break;
+        }
+        if level >= min_risk * (1.0 - 1e-6) && level <= max_risk * (1.0 + 1e-6) {
+            levels.push(level);
+        }
+        k += 1;
+    }
+    levels
+}
+
+fn format_risk_level(level: f64) -> String {
+    if !level.is_finite() || level <= 0.0 {
+        return String::new();
+    }
+    let exp = level.log10().round() as i32;
+    let snapped = 10f64.powi(exp);
+    if (level - snapped).abs() > snapped * 1e-6 {
+        return format!("{level:.2e}");
+    }
+    if exp == 0 {
+        "1".to_string()
+    } else {
+        format!("1e{exp}")
+    }
+}
+
+fn present_risk_range(risk: &HashMap<u64, f64>) -> Option<(f64, f64)> {
+    let mut min_r = f64::INFINITY;
+    let mut max_r = 0.0_f64;
+    for value in risk.values() {
+        if value.is_finite() && *value > 0.0 {
+            min_r = min_r.min(*value);
+            max_r = max_r.max(*value);
+        }
+    }
+    if min_r.is_finite() && max_r >= min_r {
+        Some((min_r, max_r))
+    } else {
+        None
+    }
+}
+
+struct RiskRaster {
+    frame: LocalFrame,
+    grid: Vec<f64>,
+    nx: usize,
+    ny: usize,
+    spacing: f64,
+    origin: [f64; 2],
+}
+
+fn rasterize_risk(risk: &HashMap<u64, f64>) -> Option<RiskRaster> {
+    let mut pts = Vec::new();
+    for (cell, value) in risk {
+        if !value.is_finite() || *value <= 0.0 {
+            continue;
+        }
+        let Ok(idx) = CellIndex::try_from(*cell) else {
+            continue;
+        };
+        let ll = LatLng::from(idx);
+        pts.push([ll.lng(), ll.lat()]);
+    }
+    if pts.is_empty() {
+        return None;
+    }
+    let frame = LocalFrame::from_lonlat(&pts)?;
+    let mut min_e = f64::INFINITY;
+    let mut max_e = f64::NEG_INFINITY;
+    let mut min_n = f64::INFINITY;
+    let mut max_n = f64::NEG_INFINITY;
+    for p in &pts {
+        let [east, north] = frame.to_metres(p[0], p[1]);
+        min_e = min_e.min(east);
+        max_e = max_e.max(east);
+        min_n = min_n.min(north);
+        max_n = max_n.max(north);
+    }
+    let edge = H3_RES.edge_length_m().max(1.0);
+    let pad = edge * 3.0;
+    min_e -= pad;
+    max_e += pad;
+    min_n -= pad;
+    max_n += pad;
+    let span_e = (max_e - min_e).max(edge);
+    let span_n = (max_n - min_n).max(edge);
+    let mut spacing = (edge * 0.5).max(1.0);
+    let mut nx = ((span_e / spacing).ceil() as usize) + 1;
+    let mut ny = ((span_n / spacing).ceil() as usize) + 1;
+    if nx > ISOLINE_MAX_N || ny > ISOLINE_MAX_N {
+        let need = (span_e / (ISOLINE_MAX_N - 1) as f64).max(span_n / (ISOLINE_MAX_N - 1) as f64);
+        spacing = need.max(spacing);
+        nx = (((span_e / spacing).ceil() as usize) + 1).clamp(2, ISOLINE_MAX_N);
+        ny = (((span_n / spacing).ceil() as usize) + 1).clamp(2, ISOLINE_MAX_N);
+    }
+    let mut grid = vec![0.0; nx * ny];
+    for x in 0..nx {
+        let east = min_e + x as f64 * spacing;
+        for y in 0..ny {
+            let north = min_n + y as f64 * spacing;
+            let (lon, lat) = frame.to_lonlat(east, north);
+            if let Some(cell) = cell_index(lon, lat) {
+                if let Some(value) = risk.get(&u64::from(cell)) {
+                    if value.is_finite() {
+                        grid[y * nx + x] = value.clamp(0.0, 1.0);
+                    }
+                }
+            }
+        }
+    }
+    Some(RiskRaster {
+        frame,
+        grid,
+        nx,
+        ny,
+        spacing,
+        origin: [min_e, min_n],
+    })
+}
+
+fn edge_point(
+    x: usize,
+    y: usize,
+    edge: u8,
+    corners: [f64; 4],
+    level: f64,
+    spacing: f64,
+    origin: [f64; 2],
+) -> [f64; 2] {
+    let (ax, ay, bx, by, va, vb) = match edge {
+        0 => (0.0, 0.0, 1.0, 0.0, corners[0], corners[1]),
+        1 => (1.0, 0.0, 1.0, 1.0, corners[1], corners[2]),
+        2 => (0.0, 1.0, 1.0, 1.0, corners[3], corners[2]),
+        _ => (0.0, 0.0, 0.0, 1.0, corners[0], corners[3]),
+    };
+    let denom = vb - va;
+    let t = if denom.abs() < 1e-15 {
+        0.5
+    } else {
+        ((level - va) / denom).clamp(0.0, 1.0)
+    };
+    let fx = x as f64 + ax + (bx - ax) * t;
+    let fy = y as f64 + ay + (by - ay) * t;
+    [origin[0] + fx * spacing, origin[1] + fy * spacing]
+}
+
+fn contour_segments(raster: &RiskRaster, level: f64) -> Vec<[[f64; 2]; 2]> {
+    let nx = raster.nx;
+    let ny = raster.ny;
+    let at = |x: usize, y: usize| raster.grid[y * nx + x];
+    let mut segs = Vec::new();
+    for x in 0..nx.saturating_sub(1) {
+        for y in 0..ny.saturating_sub(1) {
+            let corners = [at(x, y), at(x + 1, y), at(x + 1, y + 1), at(x, y + 1)];
+            let mut case = 0u8;
+            if corners[0] >= level {
+                case |= 1;
+            }
+            if corners[1] >= level {
+                case |= 2;
+            }
+            if corners[2] >= level {
+                case |= 4;
+            }
+            if corners[3] >= level {
+                case |= 8;
+            }
+            if case == 0 || case == 15 {
+                continue;
+            }
+            let mut pairs: Vec<(u8, u8)> = Vec::new();
+            match case {
+                1 | 14 => pairs.push((3, 0)),
+                2 | 13 => pairs.push((0, 1)),
+                3 | 12 => pairs.push((3, 1)),
+                4 | 11 => pairs.push((1, 2)),
+                5 => {
+                    let center = 0.25 * corners.iter().sum::<f64>();
+                    if center >= level {
+                        pairs.push((3, 2));
+                        pairs.push((0, 1));
+                    } else {
+                        pairs.push((3, 0));
+                        pairs.push((1, 2));
+                    }
+                }
+                6 | 9 => pairs.push((0, 2)),
+                7 | 8 => pairs.push((3, 2)),
+                10 => {
+                    let center = 0.25 * corners.iter().sum::<f64>();
+                    if center >= level {
+                        pairs.push((3, 0));
+                        pairs.push((1, 2));
+                    } else {
+                        pairs.push((0, 1));
+                        pairs.push((3, 2));
+                    }
+                }
+                _ => {}
+            }
+            for (e0, e1) in pairs {
+                let p0 = edge_point(x, y, e0, corners, level, raster.spacing, raster.origin);
+                let p1 = edge_point(x, y, e1, corners, level, raster.spacing, raster.origin);
+                segs.push([p0, p1]);
+            }
+        }
+    }
+    segs
+}
+
+fn point_key(p: [f64; 2]) -> (i64, i64) {
+    (
+        (p[0] * 1_000.0).round() as i64,
+        (p[1] * 1_000.0).round() as i64,
+    )
+}
+
+fn unlink(adj: &mut HashMap<(i64, i64), Vec<(i64, i64)>>, from: (i64, i64), to: (i64, i64)) {
+    if let Some(list) = adj.get_mut(&from) {
+        if let Some(i) = list.iter().position(|n| *n == to) {
+            list.swap_remove(i);
+        }
+    }
+}
+
+fn stitch_segments(segs: &[[[f64; 2]; 2]]) -> Vec<Vec<[f64; 2]>> {
+    let mut points: HashMap<(i64, i64), [f64; 2]> = HashMap::new();
+    let mut adj: HashMap<(i64, i64), Vec<(i64, i64)>> = HashMap::new();
+    for seg in segs {
+        let ka = point_key(seg[0]);
+        let kb = point_key(seg[1]);
+        if ka == kb {
+            continue;
+        }
+        points.entry(ka).or_insert(seg[0]);
+        points.entry(kb).or_insert(seg[1]);
+        adj.entry(ka).or_default().push(kb);
+        adj.entry(kb).or_default().push(ka);
+    }
+    let mut lines = Vec::new();
+    let mut guard_outer = 0;
+    while adj.values().any(|v| !v.is_empty()) {
+        guard_outer += 1;
+        if guard_outer > segs.len() + 2 {
+            break;
+        }
+        let start = adj
+            .iter()
+            .find(|(_, v)| v.len() == 1)
+            .or_else(|| adj.iter().find(|(_, v)| !v.is_empty()))
+            .map(|(k, _)| *k);
+        let Some(start) = start else {
+            break;
+        };
+        let Some(start_pt) = points.get(&start).copied() else {
+            break;
+        };
+        let mut line = vec![start_pt];
+        let mut cur = start;
+        let mut guard = 0;
+        while let Some(nxt) = adj.get(&cur).and_then(|v| v.first().copied()) {
+            unlink(&mut adj, cur, nxt);
+            unlink(&mut adj, nxt, cur);
+            if let Some(pt) = points.get(&nxt).copied() {
+                line.push(pt);
+            }
+            cur = nxt;
+            guard += 1;
+            if cur == start || guard > segs.len() + 2 {
+                break;
+            }
+        }
+        if line.len() >= 2 {
+            lines.push(line);
+        }
+    }
+    lines
+}
+
+fn path_length(path: &[[f64; 2]]) -> f64 {
+    path.windows(2)
+        .map(|w| {
+            let de = w[1][0] - w[0][0];
+            let dn = w[1][1] - w[0][1];
+            (de * de + dn * dn).sqrt()
+        })
+        .sum()
+}
+
+/// Contours of the smoothed `Risk(g)` map. Levels are one order of magnitude
+/// apart and cover only the risk values present in `risk`.
+fn risk_isolines(risk: &HashMap<u64, f64>) -> Vec<RiskIsoline> {
+    let Some((min_r, max_r)) = present_risk_range(risk) else {
+        return Vec::new();
+    };
+    let levels = decade_levels(min_r, max_r);
+    if levels.is_empty() {
+        return Vec::new();
+    }
+    let Some(raster) = rasterize_risk(risk) else {
+        return Vec::new();
+    };
+    let mut lines = Vec::new();
+    for level in levels {
+        let segs = contour_segments(&raster, level);
+        for path in stitch_segments(&segs) {
+            if path_length(&path) < raster.spacing * 2.0 {
+                continue;
+            }
+            let mut flat = Vec::with_capacity(path.len() * 2);
+            for p in &path {
+                let (lon, lat) = raster.frame.to_lonlat(p[0], p[1]);
+                flat.push(lon);
+                flat.push(lat);
+            }
+            lines.push(RiskIsoline {
+                level,
+                label: format_risk_level(level),
+                line: flat,
+            });
+        }
+    }
+    lines
 }
 
 struct LocalFrame {
@@ -1249,5 +1613,209 @@ mod tests {
         for (a, b) in data.iter().zip(back) {
             assert!((a - b).abs() < 1e-8, "{a} vs {b}");
         }
+    }
+
+    #[test]
+    fn isoline_levels_are_orders_of_magnitude() {
+        let levels = decade_levels(1.5e-4, 0.42);
+        assert_eq!(levels.len(), 3, "{levels:?}");
+        for (got, exp) in levels.iter().copied().zip([1e-3, 1e-2, 1e-1]) {
+            assert!((got / exp - 1.0).abs() < 1e-9, "{got} vs {exp}");
+        }
+        let gap_lo = levels[1] - levels[0];
+        let gap_hi = levels[2] - levels[1];
+        assert!(
+            gap_hi > gap_lo * 5.0,
+            "gaps {gap_lo} and {gap_hi} are linear"
+        );
+        assert!((levels[1] / levels[0] - 10.0).abs() < 1e-6);
+        assert!(
+            decade_levels(0.02, 0.08).is_empty(),
+            "one decade is not subdivided linearly"
+        );
+        assert!(decade_levels(0.05, 0.05).is_empty());
+        let ends = decade_levels(1e-2, 1e-1);
+        assert_eq!(ends.len(), 2, "{ends:?}");
+        assert!((ends[0] - 1e-2).abs() < 1e-12);
+        assert!((ends[1] - 1e-1).abs() < 1e-12);
+        assert_eq!(format_risk_level(1e-2), "1e-2");
+        assert_eq!(format_risk_level(1e-1), "1e-1");
+        assert_eq!(format_risk_level(1.0), "1");
+    }
+
+    #[test]
+    fn marching_squares_puts_the_line_between_high_and_low() {
+        let frame = LocalFrame::from_lonlat(&[[-90.0, 29.0], [-89.9, 29.1]]).unwrap();
+        let nx = 6;
+        let ny = 5;
+        let mut grid = vec![0.0; nx * ny];
+        for y in 0..ny {
+            for x in 0..nx {
+                grid[y * nx + x] = if x <= 2 { 0.5 } else { 0.001 };
+            }
+        }
+        let raster = RiskRaster {
+            frame,
+            grid,
+            nx,
+            ny,
+            spacing: 100.0,
+            origin: [0.0, 0.0],
+        };
+        let level = 0.1;
+        let t = (level - 0.5) / (0.001 - 0.5);
+        let east = (2.0 + t) * 100.0;
+        let segs = contour_segments(&raster, level);
+        assert!(!segs.is_empty());
+        for seg in &segs {
+            for p in seg {
+                assert!((p[0] - east).abs() < 0.5, "east {} wanted {east}", p[0]);
+            }
+        }
+        let lines = stitch_segments(&segs);
+        assert_eq!(lines.len(), 1, "one vertical contour, got {}", lines.len());
+        let north: Vec<f64> = lines[0].iter().map(|p| p[1]).collect();
+        let min_n = north.iter().copied().fold(f64::INFINITY, f64::min);
+        let max_n = north.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        assert!(min_n < 50.0, "{min_n}");
+        assert!(max_n > 350.0, "{max_n}");
+    }
+
+    #[test]
+    fn smoothed_field_isolines_follow_decade_rings() {
+        let center = cell_index(-90.0, 29.0).unwrap();
+        let center_ll = LatLng::from(center);
+        let neighbor = center.edges().next().unwrap().destination();
+        let step = center_ll.distance_rads(LatLng::from(neighbor));
+        let mut risk = HashMap::new();
+        let outer: Vec<CellIndex> = center.grid_disk(7);
+        for cell in &outer {
+            risk.insert(u64::from(*cell), 0.005);
+        }
+        let mid: Vec<CellIndex> = center.grid_disk(4);
+        for cell in &mid {
+            risk.insert(u64::from(*cell), 0.05);
+        }
+        let high: Vec<CellIndex> = center.grid_disk(1);
+        for cell in &high {
+            risk.insert(u64::from(*cell), 0.4);
+        }
+        let lines = risk_isolines(&risk);
+        let mut levels: Vec<f64> = lines.iter().map(|l| l.level).collect();
+        levels.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        levels.dedup_by(|a, b| (*a - *b).abs() < 1e-12);
+        assert_eq!(levels.len(), 2, "{levels:?}");
+        assert!((levels[0] - 0.01).abs() < 1e-12);
+        assert!((levels[1] - 0.1).abs() < 1e-12);
+        assert!(lines.iter().all(|l| l.label == format_risk_level(l.level)));
+        assert!(lines.iter().all(|l| l.label == "1e-2" || l.label == "1e-1"));
+
+        let radii = |level: f64| {
+            let mut min_r = f64::INFINITY;
+            let mut max_r = 0.0_f64;
+            for line in lines.iter().filter(|l| (l.level - level).abs() < 1e-12) {
+                for pair in line.line.chunks(2) {
+                    let ll = LatLng::new(pair[1], pair[0]).unwrap();
+                    let d = center_ll.distance_rads(ll) / step;
+                    min_r = min_r.min(d);
+                    max_r = max_r.max(d);
+                }
+            }
+            (min_r, max_r)
+        };
+        let (inner_min, inner_max) = radii(0.1);
+        let (outer_min, outer_max) = radii(0.01);
+        assert!(
+            inner_min > 0.7 && inner_max < 2.6,
+            "1e-1 ring {inner_min}..{inner_max} step"
+        );
+        assert!(
+            outer_min > 3.2 && outer_max < 6.2,
+            "1e-2 ring {outer_min}..{outer_max} step"
+        );
+        assert!(
+            inner_max < outer_min,
+            "higher risk sits inside the lower contour"
+        );
+    }
+
+    #[test]
+    fn uniform_decade_is_labeled_on_the_outline() {
+        let center = cell_index(-90.0, 29.0).unwrap();
+        let mut risk = HashMap::new();
+        let disk: Vec<CellIndex> = center.grid_disk(2);
+        for cell in disk {
+            risk.insert(u64::from(cell), 1e-2);
+        }
+        let lines = risk_isolines(&risk);
+        assert!(!lines.is_empty());
+        assert!(lines
+            .iter()
+            .all(|l| (l.level - 1e-2).abs() < 1e-12 && l.label == "1e-2"));
+    }
+
+    #[test]
+    fn isolines_do_not_change_cell_or_boat_risk() {
+        let a_g = cell_area_m2();
+        let params = VesselParams {
+            ke_threshold_j: 0.0,
+            a_proj_m2: 0.2 * a_g,
+            p_proj_m: 0.0,
+            max_trials: 4,
+            default_mass_kg: 10.0,
+            default_radius_m: 0.0,
+        };
+        let place = (-90.25, 29.10);
+        let cloud = vec![
+            vertical(place.0, place.1, 10.0, 0.0, 50.0),
+            vertical(place.0, place.1, 10.0, 0.0, 50.0),
+        ];
+        let boats = [
+            BoatQuery {
+                id: 1,
+                name: "On the cell".into(),
+                lon: place.0,
+                lat: place.1,
+                people: Some(10),
+            },
+            BoatQuery {
+                id: 2,
+                name: "Elsewhere".into(),
+                lon: -88.40,
+                lat: 30.80,
+                people: Some(4),
+            },
+        ];
+        let result = compute_vessel_risk(
+            &[ObjectInput {
+                name: "Vehicle".into(),
+                trajectories: vec![TrajectoryInput {
+                    weight: 1.0,
+                    trials: vec![cloud],
+                }],
+            }],
+            &params,
+            &boats,
+        )
+        .unwrap();
+        let cell = u64::from(cell_index(place.0, place.1).unwrap());
+        let drawn = result.cells.iter().find(|c| {
+            cell_index_from_h3(&c.h3)
+                .map(|idx| u64::from(idx) == cell)
+                .unwrap_or(false)
+        });
+        assert!((drawn.unwrap().risk - 0.36).abs() < 1e-6);
+        assert!(
+            (result.collective - 0.18).abs() < 1e-9,
+            "{}",
+            result.collective
+        );
+        assert!((result.boats[0].strike - 0.36).abs() < 1e-9);
+        assert!(
+            (result.boats[0].individual.unwrap() - result.boats[0].strike * 10.0).abs() < 1e-12
+        );
+        assert!((result.boats[1].strike).abs() < 1e-12);
+        assert!((result.boats[1].individual.unwrap() - 0.0).abs() < 1e-12);
+        assert!(result.isolines.is_empty(), "0.36 sits inside one decade");
     }
 }

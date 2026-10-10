@@ -923,12 +923,95 @@ export function clearVesselRisk() {
   }
 }
 
+let isolineLines = null;
+let isolineLabels = null;
+let showIsolines = true;
+
+export function setRiskIsolines(lines) {
+  const Cesium = window.Cesium;
+  clearRiskIsolines();
+  if (!viewer || !lines?.length) {
+    requestRender();
+    return;
+  }
+  isolineLines = viewer.scene.primitives.add(new Cesium.PolylineCollection());
+  isolineLabels = viewer.scene.primitives.add(new Cesium.LabelCollection());
+  for (const line of lines) {
+    const flat = line.line || [];
+    if (flat.length < 4) continue;
+    const heights = [];
+    for (let i = 0; i + 1 < flat.length; i += 2) {
+      heights.push(flat[i], flat[i + 1], 120);
+    }
+    const positions = Cesium.Cartesian3.fromDegreesArrayHeights(heights);
+    const color = isolineColor(Cesium, Number(line.level));
+    isolineLines.add({
+      positions,
+      width: 2.5,
+      material: colorMaterial(Cesium, color),
+    });
+    isolineLabels.add({
+      position: positions[Math.floor(positions.length / 2)],
+      text: line.label || formatIsolineLabel(line.level),
+      font: "600 13px sans-serif",
+      fillColor: Cesium.Color.WHITE,
+      outlineColor: Cesium.Color.BLACK,
+      outlineWidth: 3,
+      style: Cesium.LabelStyle.FILL_AND_OUTLINE,
+      disableDepthTestDistance: Number.POSITIVE_INFINITY,
+      pixelOffset: new Cesium.Cartesian2(10, -8),
+      showBackground: false,
+    });
+  }
+  isolineLines.show = showIsolines;
+  isolineLabels.show = showIsolines;
+  requestRender();
+}
+
+export function setRiskIsolinesVisible(visible) {
+  showIsolines = Boolean(visible);
+  if (isolineLines) isolineLines.show = showIsolines;
+  if (isolineLabels) isolineLabels.show = showIsolines;
+  requestRender();
+}
+
+export function clearRiskIsolines() {
+  if (isolineLines && viewer) {
+    viewer.scene.primitives.remove(isolineLines);
+    isolineLines = null;
+  }
+  if (isolineLabels && viewer) {
+    viewer.scene.primitives.remove(isolineLabels);
+    isolineLabels = null;
+  }
+}
+
+function isolineColor(Cesium, level) {
+  const exp = Math.log10(Math.max(level, 1e-12));
+  const t = Math.min(1, Math.max(0, (exp + 4) / 4));
+  return Cesium.Color.fromBytes(
+    255,
+    Math.round(214 - 130 * t),
+    Math.round(70 + 50 * (1 - t)),
+    235,
+  );
+}
+
+function formatIsolineLabel(level) {
+  if (!Number.isFinite(level) || level <= 0) return "";
+  const exp = Math.round(Math.log10(level));
+  const snapped = 10 ** exp;
+  if (Math.abs(level - snapped) > snapped * 1e-6) return level.toExponential(1);
+  return exp === 0 ? "1" : `1e${exp}`;
+}
+
 export function clearRiskOverlay() {
   lastImpacts = [];
   lastGrid = null;
   if (impactPoints) impactPoints.removeAll();
   clearKde();
   clearVesselRisk();
+  clearRiskIsolines();
   rebuildIipHull();
 }
 

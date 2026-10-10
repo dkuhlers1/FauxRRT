@@ -32,6 +32,8 @@ import {
   setSurfaceWindVisible,
   setTerminateHull,
   setTerminateHullVisible,
+  setRiskIsolines,
+  setRiskIsolinesVisible,
   setVesselRiskCells,
   setVesselRiskVisible,
   setVisible,
@@ -152,6 +154,7 @@ const els = {
   showImpacts: document.getElementById("show-impacts"),
   showKde: document.getElementById("show-kde"),
   showVessel: document.getElementById("show-vessel-risk"),
+  showIsolines: document.getElementById("show-risk-isolines"),
   vesselKe: document.getElementById("vessel-ke"),
   vesselArea: document.getElementById("vessel-area"),
   vesselPerim: document.getElementById("vessel-perim"),
@@ -195,6 +198,10 @@ els.showKde?.addEventListener("change", () => {
 });
 els.showVessel?.addEventListener("change", () => {
   setVesselRiskVisible(els.showVessel.checked);
+  persistMissionUi();
+});
+els.showIsolines?.addEventListener("change", () => {
+  setRiskIsolinesVisible(els.showIsolines.checked);
   persistMissionUi();
 });
 for (const input of [els.vesselKe, els.vesselArea, els.vesselPerim, els.vesselTrials]) {
@@ -692,6 +699,9 @@ function renderBoats() {
     const bits = [`H3 res ${vesselResult.resolution}`, `A_g ${Math.round(vesselResult.area_m2).toLocaleString()} m²`];
     if (vesselResult.bandwidth_east_m != null) {
       bits.push(`Botev ${Math.round(vesselResult.bandwidth_east_m)}×${Math.round(vesselResult.bandwidth_north_m)} m`);
+    }
+    if (vesselResult.isolines?.length) {
+      bits.push(`${vesselResult.isolines.length} isolines`);
     }
     const notes = vesselResult.notes || [];
     els.vesselStatus.textContent = [...bits, ...notes].join(" · ");
@@ -3773,7 +3783,9 @@ async function runVessel(seq) {
     if (seq !== vesselSeq) return;
     vesselResult = result;
     setVesselRiskCells(result.cells || []);
+    setRiskIsolines(result.isolines || []);
     setVesselRiskVisible(els.showVessel?.checked !== false);
+    setRiskIsolinesVisible(els.showIsolines?.checked !== false);
     renderBoats();
   } catch (err) {
     if (seq !== vesselSeq) return;
@@ -3828,6 +3840,7 @@ async function refreshOverlays(opts = {}) {
     setImpactPoints([]);
     await setKdeGrid(null);
     setVesselRiskCells([]);
+    setRiskIsolines([]);
     vesselResult = null;
     clearBoatScores();
     setImpactStatus("");
@@ -3930,6 +3943,7 @@ function currentMissionUi() {
     show_kde: Boolean(els.showKde?.checked),
     show_boats: Boolean(els.showBoats?.checked),
     show_vessel_risk: Boolean(els.showVessel?.checked),
+    show_risk_isolines: els.showIsolines ? Boolean(els.showIsolines.checked) : true,
     show_iip_boundary: Boolean(els.showIipBoundary?.checked),
     show_terminate_boundary: Boolean(els.showTerminateBoundary?.checked),
     kde_object_name: null,
@@ -4056,6 +4070,10 @@ function applyMissionUi(ui) {
   if (els.showVessel && ui.show_vessel_risk != null) {
     els.showVessel.checked = ui.show_vessel_risk;
     setVesselRiskVisible(ui.show_vessel_risk);
+  }
+  if (els.showIsolines && ui.show_risk_isolines != null) {
+    els.showIsolines.checked = ui.show_risk_isolines;
+    setRiskIsolinesVisible(ui.show_risk_isolines);
   }
   if (els.showIipBoundary && ui.show_iip_boundary != null) {
     els.showIipBoundary.checked = ui.show_iip_boundary;
