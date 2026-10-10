@@ -1,15 +1,15 @@
 //! Local schema classification for trajectory text files.
 //!
-//! The model is Meta Llama 3.1 8B Instruct, quantized GGUF, run with llama.cpp.
-//! Weights are downloaded on first use and are not part of the repository.
+//! The model is Meta Llama 3.1 8B Instruct, quantized GGUF, served by one resident
+//! llama-server process. Weights are downloaded on first use and are not part of the repository.
 
 use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -28,8 +28,10 @@ const GGUF_MIN_BYTES: u64 = 4_500_000_000;
 
 const LLAMA_TAG: &str = "b11538";
 const LLAMA_RELEASE: &str = "https://github.com/ggml-org/llama.cpp/releases/download/b11538";
-/// One classification call. Long enough for an 8B model on CPU, short enough that a hung llama-cli ends.
+/// One classification call. Long enough for an 8B model on CPU, short enough that a hung llama-server ends.
 pub const INFERENCE_TIMEOUT: Duration = Duration::from_secs(8 * 60);
+/// Loading the GGUF into GPU memory. This is paid once per app session, not once per file.
+const SERVER_START_TIMEOUT: Duration = Duration::from_secs(180);
 pub const CANCELLED: &str = "classification cancelled";
 
 pub const SYSTEM_PROMPT: &str = r#"You classify trajectory state text files. Return one JSON object and nothing else. No markdown and no conversation.
@@ -1050,14 +1052,22 @@ pub fn device_name(backend: GpuBackend) -> &'static str {
     }
 }
 
-pub fn device_message(backend: GpuBackend, fell_back: bool) -> &'static str {
+pub fn device_label(backend: GpuBackend, layers: u32) -> String {
+    format!("{}, {layers} layers", device_name(backend))
+}
+
+/// Status text for the Trajectories panel. `layers` is the count actually loaded.
+/// The label (`CUDA, 32 layers`) is a substring so the progress line does not print it twice.
+pub fn device_message(backend: GpuBackend, layers: u32, fell_back: bool) -> String {
     if fell_back {
-        "GPU runtime failed; classifying on CPU"
+        let label = device_label(GpuBackend::Cpu, layers);
+        format!("GPU runtime failed; classifying on {label}")
     } else {
+        let label = device_label(backend, layers);
         match backend {
-            GpuBackend::Cuda => "Running on CUDA",
-            GpuBackend::Vulkan => "Running on Vulkan",
-            GpuBackend::Cpu => "No GPU found; classifying on CPU",
+            GpuBackend::Cuda => format!("Running on {label}"),
+            GpuBackend::Vulkan => format!("Running on {label}"),
+            GpuBackend::Cpu => format!("No GPU found; classifying on {label}"),
         }
     }
 }
@@ -1069,17 +1079,36 @@ pub const CLASSIFY_CONTEXT: &str = "2048";
 /// The classification object is a few hundred tokens. A long generation is prose, not a schema.
 pub const CLASSIFY_PREDICT: &str = "384";
 
-/// How many Llama 3.1 8B layers fit in free VRAM. Q4_K_M is about 160 MiB of weights per layer.
-/// Unknown memory means zero layers so the GGUF stays mmap'd instead of being copied into RAM.
-pub fn gpu_layer_limit(free_mib: Option<u64>) -> u32 {
-    const LAYERS: u32 = 32;
-    const MIB_PER_LAYER: u64 = 160;
-    const RESERVE_MIB: u64 = 1536;
-    let Some(free) = free_mib else {
+/// Llama 3.1 8B repeating layers. `-ngl` gets this count (or fewer when VRAM is known and tight).
+pub const MODEL_LAYERS: u32 = 32;
+const MIB_PER_LAYER: u64 = 160;
+const RESERVE_MIB: u64 = 1536;
+
+/// GPU layers to pass as `-ngl`.
+///
+/// CUDA and Vulkan always get a non-zero count. Unknown free VRAM offloads every layer:
+/// `nvidia-smi` often prints nothing useful for free memory on Windows (WDDM), and treating
+/// that as zero layers is what left VRAM flat. A GPU that cannot initialize is a failed
+/// server start, and that is the only path to `-ngl 0`.
+pub fn gpu_layers(backend: GpuBackend, free_mib: Option<u64>) -> u32 {
+    if backend == GpuBackend::Cpu {
         return 0;
+    }
+    let Some(free) = free_mib else {
+        return MODEL_LAYERS;
     };
     let budget = free.saturating_sub(RESERVE_MIB);
-    ((budget / MIB_PER_LAYER) as u32).min(LAYERS)
+    ((budget / MIB_PER_LAYER) as u32).clamp(1, MODEL_LAYERS)
+}
+
+/// CPU is used when no GPU was found, or when the GPU backend failed to start.
+/// A missing VRAM reading is not an init failure.
+pub fn backend_after_init(preferred: GpuBackend, init_ok: bool) -> (GpuBackend, bool) {
+    if init_ok || preferred == GpuBackend::Cpu {
+        (preferred, false)
+    } else {
+        (GpuBackend::Cpu, true)
+    }
 }
 
 /// mmap the GGUF and keep the context at 2048. Never mlock and never disable mmap.
@@ -1115,77 +1144,541 @@ pub fn memory_args_with(help: &str, tight: bool) -> Vec<String> {
     args
 }
 
-/// A finite layer count. `-ngl auto` is the llama.cpp default and copies every layer beside the
-/// mmap. Unknown free memory, the CPU build, and the tight retry all stay at zero layers.
-/// `--fit` is not turned on here; [`memory_args`] turns it off so context cannot grow.
+/// `-ngl` for a one-shot help check. The resident server always passes `-ngl` itself.
+/// There is no tight retry that forces zero layers: that was the silent CPU fallback.
 pub fn offload_args(backend: GpuBackend, help: &str) -> Vec<String> {
-    offload_args_with(backend, help, None, false)
+    offload_args_with(backend, help, None)
 }
 
-pub fn offload_args_with(backend: GpuBackend, help: &str, free_mib: Option<u64>, tight: bool) -> Vec<String> {
+pub fn offload_args_with(backend: GpuBackend, help: &str, free_mib: Option<u64>) -> Vec<String> {
     let has_ngl = help_has(help, "-ngl") || help_has(help, "--n-gpu-layers");
     if !has_ngl {
         return Vec::new();
     }
-    let layers = if backend == GpuBackend::Cpu || tight {
-        0
-    } else {
-        gpu_layer_limit(free_mib)
+    vec!["-ngl".into(), gpu_layers(backend, free_mib).to_string()]
+}
+
+/// Arguments for one long-lived `llama-server`. Context stays 2048 and `--fit off` so the KV
+/// cache cannot grow toward the model's 131072-token default. `-ngl` is never `auto`.
+pub fn server_args(backend: GpuBackend, help: &str, model: &Path, port: u16, free_mib: Option<u64>) -> Vec<String> {
+    let mut args = vec!["-m".into(), model.display().to_string()];
+    args.extend(memory_args(help));
+    push_flag(&mut args, "-c", CLASSIFY_CONTEXT);
+    push_flag(&mut args, "--fit", "off");
+    let ngl = match free_mib {
+        None => offload_args(backend, "-ngl"),
+        Some(free) => offload_args_with(backend, "-ngl", Some(free)),
     };
-    vec!["-ngl".into(), layers.to_string()]
+    args.extend(ngl);
+    push_flag(&mut args, "--host", "127.0.0.1");
+    push_flag(&mut args, "--port", &port.to_string());
+    if help_has(help, "-np") || help_has(help, "--parallel") {
+        push_flag(&mut args, "-np", "1");
+    }
+    args
 }
 
-pub struct LlamaRuntime {
-    pub cli: PathBuf,
-    pub model: PathBuf,
-    pub device: String,
-    pub backend: GpuBackend,
-    pub cancel: Arc<AtomicBool>,
-    help: Mutex<Option<String>>,
+fn push_flag(args: &mut Vec<String>, flag: &str, value: &str) {
+    if args.iter().any(|arg| arg == flag) {
+        return;
+    }
+    args.push(flag.into());
+    args.push(value.into());
 }
 
-impl LlamaRuntime {
-    #[cfg(test)]
-    pub fn from_paths(cli: PathBuf, model: PathBuf) -> Self {
+/// JSON body for one classification. The prompt is the header sample; the grammar stops the
+/// completion at the closing brace so `n_predict` is only a ceiling.
+pub fn completion_request(system: &str, user: &str) -> Value {
+    serde_json::json!({
+        "prompt": llama_prompt(system, user),
+        "n_predict": CLASSIFY_PREDICT.parse::<u64>().unwrap_or(384),
+        "temperature": 0,
+        "grammar": classification_grammar(),
+        "cache_prompt": true,
+        "stop": ["<|eot_id|>"],
+    })
+}
+
+#[derive(Clone)]
+struct ServerSpec {
+    program: PathBuf,
+    model: PathBuf,
+    backend: GpuBackend,
+    help: String,
+    free_mib: Option<u64>,
+    fell_back: bool,
+    extra_env: Vec<(String, String)>,
+}
+
+struct ServerInfo {
+    program: PathBuf,
+    model: PathBuf,
+    backend: GpuBackend,
+    layers: u32,
+    help: String,
+    port: u16,
+    fell_back: bool,
+    free_mib: Option<u64>,
+}
+
+struct RunningServer {
+    child: Child,
+    port: u16,
+    backend: GpuBackend,
+    layers: u32,
+    program: PathBuf,
+    model: PathBuf,
+    help: String,
+    free_mib: Option<u64>,
+    fell_back: bool,
+    stderr: Arc<Mutex<Vec<u8>>>,
+    stdout: Arc<Mutex<Vec<u8>>>,
+    stderr_thread: Option<thread::JoinHandle<()>>,
+    stdout_thread: Option<thread::JoinHandle<()>>,
+}
+
+impl RunningServer {
+    fn info(&self) -> ServerInfo {
+        ServerInfo {
+            program: self.program.clone(),
+            model: self.model.clone(),
+            backend: self.backend,
+            layers: self.layers,
+            help: self.help.clone(),
+            port: self.port,
+            fell_back: self.fell_back,
+            free_mib: self.free_mib,
+        }
+    }
+}
+
+/// One llama-server process for the whole app session. A second classification reuses it.
+pub struct LlamaServerPool {
+    gate: Mutex<()>,
+    slot: Mutex<Option<RunningServer>>,
+    launches: AtomicU32,
+}
+
+impl LlamaServerPool {
+    pub fn new() -> Self {
         Self {
-            cli,
-            model,
-            device: device_name(GpuBackend::Cpu).into(),
-            backend: GpuBackend::Cpu,
-            cancel: Arc::new(AtomicBool::new(false)),
-            help: Mutex::new(None),
+            gate: Mutex::new(()),
+            slot: Mutex::new(None),
+            launches: AtomicU32::new(0),
         }
     }
 
-    /// Download the GGUF and a matching llama.cpp build. Call this only from a background task.
+    #[cfg(test)]
+    pub fn launch_count(&self) -> u32 {
+        self.launches.load(Ordering::SeqCst)
+    }
+
+    /// A healthy server, if one is already holding the model.
+    fn current(&self) -> Option<ServerInfo> {
+        let (port, info) = {
+            let slot = self.slot.lock().unwrap_or_else(|err| err.into_inner());
+            let running = slot.as_ref()?;
+            (running.port, running.info())
+        };
+        health_ok(port).then_some(info)
+    }
+
+    pub fn shutdown(&self) {
+        let _gate = self.gate.lock().unwrap_or_else(|err| err.into_inner());
+        self.stop_slot();
+    }
+
+    /// Start `preferred` unless this model is already being served.
+    /// A GPU that exits before `/health` starts `cpu_spec` instead. Cancel does not.
+    fn start_or_fallback(
+        &self,
+        preferred: &ServerSpec,
+        cpu_spec: impl FnOnce() -> Result<ServerSpec, String>,
+        cancel: &AtomicBool,
+    ) -> Result<ServerInfo, String> {
+        if let Some(info) = self.current_for_model(&preferred.model) {
+            return Ok(info);
+        }
+        if preferred.backend == GpuBackend::Cpu {
+            return self.start(preferred, cancel);
+        }
+        match self.start(preferred, cancel) {
+            Ok(info) => Ok(info),
+            Err(err) if err == CANCELLED || cancel.load(Ordering::SeqCst) => Err(CANCELLED.into()),
+            Err(gpu_err) => {
+                let (fallback, fell_back) = backend_after_init(preferred.backend, false);
+                let _ = fallback;
+                if !fell_back {
+                    return Err(gpu_err);
+                }
+                let mut cpu = cpu_spec()?;
+                cpu.backend = GpuBackend::Cpu;
+                cpu.fell_back = true;
+                self.start(&cpu, cancel)
+                    .map_err(|err| format!("{gpu_err}; CPU llama-server failed: {err}"))
+            }
+        }
+    }
+
+    fn infer(&self, spec: &ServerSpec, system: &str, user: &str, cancel: &AtomicBool) -> Result<String, String> {
+        let info = self.start(spec, cancel)?;
+        match post_completion(info.port, &completion_request(system, user), cancel) {
+            Ok(text) => Ok(text),
+            Err(err) if err == CANCELLED || cancel.load(Ordering::SeqCst) => Err(CANCELLED.into()),
+            Err(err) => Err(err),
+        }
+    }
+
+    fn current_for_model(&self, model: &Path) -> Option<ServerInfo> {
+        let (port, info) = {
+            let slot = self.slot.lock().unwrap_or_else(|err| err.into_inner());
+            let running = slot.as_ref()?;
+            if running.model.as_path() != model {
+                return None;
+            }
+            (running.port, running.info())
+        };
+        health_ok(port).then_some(info)
+    }
+
+    fn start(&self, spec: &ServerSpec, cancel: &AtomicBool) -> Result<ServerInfo, String> {
+        if cancel.load(Ordering::SeqCst) {
+            return Err(CANCELLED.into());
+        }
+        let _gate = self.gate.lock().unwrap_or_else(|err| err.into_inner());
+        if let Some(info) = self.current_for_model(&spec.model) {
+            return Ok(info);
+        }
+        self.stop_slot();
+        if cancel.load(Ordering::SeqCst) {
+            return Err(CANCELLED.into());
+        }
+        let port = free_local_port()?;
+        let running = spawn_server(spec, port)?;
+        self.launches.fetch_add(1, Ordering::SeqCst);
+        {
+            let mut slot = self.slot.lock().unwrap_or_else(|err| err.into_inner());
+            *slot = Some(running);
+        }
+        drop(_gate);
+        self.wait_until_ready(port, cancel)?;
+        self.slot
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .as_ref()
+            .map(RunningServer::info)
+            .ok_or_else(|| CANCELLED.into())
+    }
+
+    fn wait_until_ready(&self, port: u16, cancel: &AtomicBool) -> Result<(), String> {
+        let started = Instant::now();
+        loop {
+            if cancel.load(Ordering::SeqCst) {
+                self.shutdown();
+                return Err(CANCELLED.into());
+            }
+            let exited = {
+                let mut slot = self.slot.lock().unwrap_or_else(|err| err.into_inner());
+                let Some(running) = slot.as_mut() else {
+                    return Err(if cancel.load(Ordering::SeqCst) {
+                        CANCELLED.into()
+                    } else {
+                        "llama-server stopped before it was ready".into()
+                    });
+                };
+                if running.port != port {
+                    return Err(CANCELLED.into());
+                }
+                match running.child.try_wait() {
+                    Ok(Some(status)) => Some(status.code()),
+                    Ok(None) => None,
+                    Err(err) => return Err(format!("llama-server failed: {err}")),
+                }
+            };
+            if let Some(code) = exited {
+                let tail = self.copy_logs();
+                self.shutdown();
+                if cancel.load(Ordering::SeqCst) {
+                    return Err(CANCELLED.into());
+                }
+                return Err(server_failure(&format!("llama-server exited ({code:?}): {tail}")));
+            }
+            if health_ok(port) {
+                return Ok(());
+            }
+            if started.elapsed() >= SERVER_START_TIMEOUT {
+                let tail = self.copy_logs();
+                self.shutdown();
+                return Err(format!("llama-server did not become ready: {tail}"));
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    fn copy_logs(&self) -> String {
+        let slot = self.slot.lock().unwrap_or_else(|err| err.into_inner());
+        let Some(running) = slot.as_ref() else {
+            return String::new();
+        };
+        let err = tail_text(&running.stderr);
+        let out = tail_text(&running.stdout);
+        format!("{err}\n{out}").trim().to_string()
+    }
+
+    fn stop_slot(&self) {
+        let running = self.slot.lock().unwrap_or_else(|err| err.into_inner()).take();
+        if let Some(running) = running {
+            stop_running(running);
+        }
+    }
+}
+
+impl Drop for LlamaServerPool {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+fn tail_text(buf: &Mutex<Vec<u8>>) -> String {
+    let guard = buf.lock().unwrap_or_else(|err| err.into_inner());
+    let text = strip_ansi(&decode_process_text(&guard));
+    let start = text.len().saturating_sub(1500);
+    text[start..].trim().to_string()
+}
+
+fn stop_running(mut running: RunningServer) {
+    let _ = running.child.kill();
+    let _ = running.child.wait();
+    if let Some(handle) = running.stderr_thread.take() {
+        let _ = handle.join();
+    }
+    if let Some(handle) = running.stdout_thread.take() {
+        let _ = handle.join();
+    }
+}
+
+fn spawn_server(spec: &ServerSpec, port: u16) -> Result<RunningServer, String> {
+    let layers = gpu_layers(spec.backend, spec.free_mib);
+    let mut cmd = Command::new(&spec.program);
+    cmd.args(server_args(spec.backend, &spec.help, &spec.model, port, spec.free_mib));
+    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    if let Some(dir) = spec.program.parent() {
+        cmd.current_dir(dir);
+        #[cfg(unix)]
+        {
+            let dir = dir.to_string_lossy().to_string();
+            let joined = match std::env::var("LD_LIBRARY_PATH") {
+                Ok(existing) if !existing.is_empty() => format!("{dir}:{existing}"),
+                _ => dir,
+            };
+            cmd.env("LD_LIBRARY_PATH", joined);
+        }
+    }
+    for (key, value) in &spec.extra_env {
+        cmd.env(key, value);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    let mut child = cmd.spawn().map_err(|err| format!("could not start llama-server: {err}"))?;
+    let stdout = child.stdout.take().unwrap();
+    let stderr = child.stderr.take().unwrap();
+    let stderr_buf = Arc::new(Mutex::new(Vec::new()));
+    let stdout_buf = Arc::new(Mutex::new(Vec::new()));
+    let stderr_for_thread = Arc::clone(&stderr_buf);
+    let stdout_for_thread = Arc::clone(&stdout_buf);
+    let stderr_thread = thread::spawn(move || drain_tail(stderr, stderr_for_thread));
+    let stdout_thread = thread::spawn(move || drain_tail(stdout, stdout_for_thread));
+    Ok(RunningServer {
+        child,
+        port,
+        backend: spec.backend,
+        layers,
+        program: spec.program.clone(),
+        model: spec.model.clone(),
+        help: spec.help.clone(),
+        free_mib: spec.free_mib,
+        fell_back: spec.fell_back,
+        stderr: stderr_buf,
+        stdout: stdout_buf,
+        stderr_thread: Some(stderr_thread),
+        stdout_thread: Some(stdout_thread),
+    })
+}
+
+fn drain_tail(mut reader: impl Read + Send, slot: Arc<Mutex<Vec<u8>>>) {
+    let mut buf = [0u8; 4096];
+    loop {
+        match reader.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                let mut guard = slot.lock().unwrap_or_else(|err| err.into_inner());
+                guard.extend_from_slice(&buf[..n]);
+                if guard.len() > 8192 {
+                    let drop_n = guard.len() - 8192;
+                    guard.drain(..drop_n);
+                }
+            }
+        }
+    }
+}
+
+fn free_local_port() -> Result<u16, String> {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").map_err(|err| format!("could not reserve a port: {err}"))?;
+    let port = listener.local_addr().map_err(|err| err.to_string())?.port();
+    drop(listener);
+    Ok(port)
+}
+
+fn health_ok(port: u16) -> bool {
+    let url = format!("http://127.0.0.1:{port}/health");
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_millis(200))
+        .timeout_read(Duration::from_millis(500))
+        .build();
+    match agent.get(&url).call() {
+        Ok(response) => response.into_string().unwrap_or_default().to_ascii_lowercase().contains("ok"),
+        Err(_) => false,
+    }
+}
+
+fn post_completion(port: u16, body: &Value, cancel: &AtomicBool) -> Result<String, String> {
+    if cancel.load(Ordering::SeqCst) {
+        return Err(CANCELLED.into());
+    }
+    let url = format!("http://127.0.0.1:{port}/completion");
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(2))
+        .timeout_read(INFERENCE_TIMEOUT)
+        .build();
+    let result = agent.post(&url).send_json(body);
+    if cancel.load(Ordering::SeqCst) {
+        return Err(CANCELLED.into());
+    }
+    match result {
+        Ok(response) => {
+            let text = response.into_string().map_err(|err| err.to_string())?;
+            completion_text(&text)
+        }
+        Err(ureq::Error::Status(code, response)) => {
+            let text = response.into_string().unwrap_or_default();
+            Err(server_failure(&format!("HTTP {code}: {text}")))
+        }
+        Err(err) => Err(server_failure(&err.to_string())),
+    }
+}
+
+fn server_failure(detail: &str) -> String {
+    if runtime_failure(detail) {
+        format!("llama-server could not initialize the model: {detail}")
+    } else {
+        format!("llama-server failed: {detail}")
+    }
+}
+
+fn completion_text(body: &str) -> Result<String, String> {
+    let value: Value = serde_json::from_str(body).map_err(|err| format!("llama-server returned non-JSON: {err}"))?;
+    if let Some(content) = value.get("content").and_then(|item| item.as_str()) {
+        if !content.trim().is_empty() {
+            return Ok(content.to_string());
+        }
+    }
+    if let Some(message) = value.pointer("/error/message").and_then(|item| item.as_str()) {
+        return Err(format!("llama-server error: {message}"));
+    }
+    Err(format!("llama-server returned no completion: {body}"))
+}
+
+pub struct LlamaRuntime {
+    pool: Arc<LlamaServerPool>,
+    spec: ServerSpec,
+    pub backend: GpuBackend,
+    pub layers: u32,
+    cancel: Arc<AtomicBool>,
+}
+
+impl LlamaRuntime {
+    pub fn status_device(&self) -> String {
+        device_label(self.backend, self.layers)
+    }
+
+    fn from_info(pool: Arc<LlamaServerPool>, info: ServerInfo, cancel: Arc<AtomicBool>) -> Self {
+        let backend = info.backend;
+        let layers = info.layers;
+        let spec = ServerSpec {
+            program: info.program,
+            model: info.model,
+            backend,
+            help: info.help,
+            free_mib: info.free_mib,
+            fell_back: info.fell_back,
+            extra_env: Vec::new(),
+        };
+        Self {
+            pool,
+            spec,
+            backend,
+            layers,
+            cancel,
+        }
+    }
+
+    /// Download the GGUF if needed and make sure one llama-server is serving it.
+    /// A server that is already healthy is reused, including across later file picks.
+    /// Call this only from a background task.
     pub fn ensure(
         data_dir: &Path,
         cancel: &Arc<AtomicBool>,
         progress: &dyn Fn(ClassifyNote),
+        pool: &Arc<LlamaServerPool>,
     ) -> Result<Self, String> {
+        if cancel.load(Ordering::SeqCst) {
+            return Err(CANCELLED.into());
+        }
+        if let Some(info) = pool.current() {
+            let label = device_label(info.backend, info.layers);
+            note(progress, &device_message(info.backend, info.layers, info.fell_back), 0, 0, &label);
+            return Ok(Self::from_info(Arc::clone(pool), info, Arc::clone(cancel)));
+        }
         let probed = probe_backend();
-        note(progress, device_message(probed, false), 0, 0, device_name(probed));
+        note(progress, &format!("Preparing {} llama-server", device_name(probed)), 0, 0, device_name(probed));
         let model = ensure_model(data_dir, cancel, progress, probed)?;
-        let (cli, backend, fell_back) = ensure_cli(data_dir, probed, cancel, progress)?;
-        if fell_back {
-            note(progress, device_message(backend, true), 0, 0, device_name(backend));
-        }
-        Ok(Self {
-            cli,
-            model,
-            device: device_name(backend).into(),
+        let (program, help, backend, binary_fell_back) = ensure_server(data_dir, probed, cancel, progress)?;
+        let free_mib = if backend != GpuBackend::Cpu { free_vram_mib() } else { None };
+        let layers = gpu_layers(backend, free_mib);
+        let label = device_label(backend, layers);
+        note(progress, &format!("Starting {label}"), 0, 0, &label);
+        let spec = ServerSpec {
+            program,
+            model: model.clone(),
             backend,
-            cancel: Arc::clone(cancel),
-            help: Mutex::new(None),
-        })
-    }
-
-    fn cached_help(&self) -> Result<String, String> {
-        let mut slot = self.help.lock().unwrap_or_else(|err| err.into_inner());
-        if slot.is_none() {
-            *slot = Some(cli_help(&self.cli, &self.cancel)?);
-        }
-        Ok(slot.clone().unwrap_or_default())
+            help,
+            free_mib,
+            fell_back: binary_fell_back,
+            extra_env: Vec::new(),
+        };
+        let info = pool.start_or_fallback(
+            &spec,
+            || {
+                let (program, help, backend, _) = ensure_server(data_dir, GpuBackend::Cpu, cancel, progress)?;
+                Ok(ServerSpec {
+                    program,
+                    model,
+                    backend,
+                    help,
+                    free_mib: None,
+                    fell_back: true,
+                    extra_env: Vec::new(),
+                })
+            },
+            cancel,
+        )?;
+        let label = device_label(info.backend, info.layers);
+        note(progress, &device_message(info.backend, info.layers, info.fell_back), 0, 0, &label);
+        Ok(Self::from_info(Arc::clone(pool), info, Arc::clone(cancel)))
     }
 }
 
@@ -1200,71 +1693,16 @@ fn note(progress: &dyn Fn(ClassifyNote), label: &str, bytes: u64, bytes_total: u
 
 impl TextCompleter for LlamaRuntime {
     fn complete(&self, system: &str, user: &str) -> Result<String, String> {
-        self.complete_once(system, user, false)
-    }
-}
-
-impl LlamaRuntime {
-    /// One llama-cli completion. A memory error is not model text: retry once with no GPU layers
-    /// and a smaller batch. The grammar is what forces the classification JSON. The JSON schema
-    /// converter can reject the schema and exit with an error string, which then fails the
-    /// "JSON object" check on both attempts.
-    fn complete_once(&self, system: &str, user: &str, tight: bool) -> Result<String, String> {
         if self.cancel.load(Ordering::SeqCst) {
             return Err(CANCELLED.into());
         }
-        let dir = std::env::temp_dir().join(format!("fauxrrt-llama-{}", std::process::id()));
-        fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-        let prompt_path = dir.join("prompt.txt");
-        fs::write(&prompt_path, llama_prompt(system, user)).map_err(|e| e.to_string())?;
-        let help = self.cached_help()?;
-        let mut cmd = Command::new(&self.cli);
-        cmd.arg("-m").arg(&self.model);
-        cmd.arg("-n").arg(CLASSIFY_PREDICT);
-        for arg in memory_args_with(&help, tight) {
-            cmd.arg(arg);
-        }
-        let free_mib = if self.backend != GpuBackend::Cpu && !tight {
-            free_vram_mib()
-        } else {
-            None
-        };
-        for arg in offload_args_with(self.backend, &help, free_mib, tight) {
-            cmd.arg(arg);
-        }
-        for arg in session_args(&help) {
-            cmd.arg(arg);
-        }
-        push_json_constraint(&mut cmd, &help, &dir)?;
-        if help_has(&help, "-f") || help_has(&help, "--file") {
-            cmd.arg("-f").arg(&prompt_path);
-        } else {
-            let prompt = fs::read_to_string(&prompt_path).unwrap_or_default();
-            cmd.arg("-p").arg(prompt);
-        }
-        let output = run_bounded(cmd, INFERENCE_TIMEOUT, &self.cancel)?;
-        let stdout = strip_ansi(&decode_process_text(&output.stdout));
-        let stderr = strip_ansi(&decode_process_text(&output.stderr));
-        if accept_output(&stdout).is_ok() {
-            return Ok(stdout);
-        }
-        let combined = format!("{stdout}\n{stderr}");
-        if !tight && runtime_failure(&combined) {
-            return self.complete_once(system, user, true);
-        }
-        if stdout.trim().is_empty() || runtime_failure(&stdout) || runtime_failure(&stderr) {
-            let tail = stderr
-                .lines()
-                .chain(stdout.lines())
-                .rev()
-                .find(|line| !line.trim().is_empty())
-                .unwrap_or("no llama.cpp output");
-            return Err(format!("llama.cpp failed: {tail}"));
-        }
-        Ok(stdout)
+        self.pool.infer(&self.spec, system, user, &self.cancel)
     }
 }
 
+/// llama-cli interactive flags. The resident server does not use them; unknown flags would
+/// make llama-server exit and look like a GPU init failure.
+#[allow(dead_code)]
 fn session_args(help: &str) -> Vec<String> {
     let mut args = Vec::new();
     if help_has(help, "--simple-io") {
@@ -1301,22 +1739,12 @@ fn session_args(help: &str) -> Vec<String> {
     args
 }
 
-/// Grammar forces every token of the completion. `--json-schema-file` is only the fallback
-/// when this llama.cpp build has no grammar file flag.
-fn push_json_constraint(cmd: &mut Command, help: &str, dir: &Path) -> Result<(), String> {
-    if help_has(help, "--grammar-file") {
-        let grammar_path = dir.join("schema.gbnf");
-        fs::write(&grammar_path, classification_grammar()).map_err(|e| e.to_string())?;
-        cmd.arg("--grammar-file").arg(&grammar_path);
-        return Ok(());
-    }
-    if help_has(help, "--json-schema-file") {
-        let schema_path = dir.join("schema.json");
-        fs::write(&schema_path, JSON_SCHEMA).map_err(|e| e.to_string())?;
-        cmd.arg("--json-schema-file").arg(&schema_path);
-        return Ok(());
-    }
-    Err("llama.cpp cannot force the classification JSON, so the model was not run".into())
+/// The HTTP completion sends [`classification_grammar`] on every request. The JSON schema
+/// converter in llama.cpp can reject this schema and exit with an error string, so it is not
+/// sent. The text stays here as the shape the grammar is enforcing.
+#[allow(dead_code)]
+fn classification_schema() -> &'static str {
+    JSON_SCHEMA
 }
 
 fn llama_prompt(system: &str, user: &str) -> String {
@@ -1440,31 +1868,43 @@ pub fn ensure_model(
     Ok(dest)
 }
 
-fn ensure_cli(
+fn server_override() -> Option<PathBuf> {
+    if let Ok(path) = std::env::var("FAUXRRT_LLAMA_SERVER") {
+        return Some(PathBuf::from(path));
+    }
+    let Ok(cli) = std::env::var("FAUXRRT_LLAMA_CLI") else {
+        return None;
+    };
+    let cli = PathBuf::from(cli);
+    let name = if cfg!(windows) { "llama-server.exe" } else { "llama-server" };
+    cli.parent().map(|dir| dir.join(name)).filter(|path| path.is_file())
+}
+
+/// llama-server binary, its `--help` text, the backend it will run, and whether the GPU
+/// binary failed to launch (missing CUDA/Vulkan loader) before the model was loaded.
+fn ensure_server(
     data_dir: &Path,
     probed: GpuBackend,
     cancel: &AtomicBool,
     progress: &dyn Fn(ClassifyNote),
-) -> Result<(PathBuf, GpuBackend, bool), String> {
-    if let Ok(path) = std::env::var("FAUXRRT_LLAMA_CLI") {
-        let path = PathBuf::from(path);
+) -> Result<(PathBuf, String, GpuBackend, bool), String> {
+    if let Some(path) = server_override() {
         if !path.is_file() {
-            return Err(format!("FAUXRRT_LLAMA_CLI is not a file: {}", path.display()));
+            return Err(format!("FAUXRRT_LLAMA_SERVER is not a file: {}", path.display()));
         }
         let help = cli_help(&path, cancel)?;
-        let backend = if offload_args(probed, &help).is_empty() {
-            GpuBackend::Cpu
-        } else {
-            probed
-        };
-        return Ok((path, backend, probed != GpuBackend::Cpu && backend == GpuBackend::Cpu));
+        // Keep the probed GPU even when --help is hard to parse. A binary that cannot
+        // offload fails at server start, and that is the visible CPU fallback.
+        return Ok((path, help, probed, false));
     }
     let primary = install_backend(data_dir, probed, cancel, progress)?;
     if probed != GpuBackend::Cpu && !cli_launches(&primary, cancel)? {
         let cpu = install_backend(data_dir, GpuBackend::Cpu, cancel, progress)?;
-        return Ok((cpu, GpuBackend::Cpu, true));
+        let help = cli_help(&cpu, cancel)?;
+        return Ok((cpu, help, GpuBackend::Cpu, true));
     }
-    Ok((primary, probed, false))
+    let help = cli_help(&primary, cancel)?;
+    Ok((primary, help, probed, false))
 }
 
 fn install_backend(
@@ -1474,7 +1914,7 @@ fn install_backend(
     progress: &dyn Fn(ClassifyNote),
 ) -> Result<PathBuf, String> {
     let root = data_dir.join("llama.cpp").join(backend_dir_name(backend));
-    if let Some(found) = find_cli(&root) {
+    if let Some(found) = find_server(&root) {
         return Ok(found);
     }
     fs::create_dir_all(&root).map_err(|e| e.to_string())?;
@@ -1490,7 +1930,7 @@ fn install_backend(
         note(progress, &label, bytes, total, device);
     })?;
     extract_archive(&archive, &root, cancel)?;
-    find_cli(&root).ok_or_else(|| format!("llama.cpp archive did not contain llama-cli ({url})"))
+    find_server(&root).ok_or_else(|| format!("llama.cpp archive did not contain llama-server ({url})"))
 }
 
 pub fn cli_asset(backend: GpuBackend) -> (String, String) {
@@ -1561,8 +2001,8 @@ fn cli_launches(path: &Path, cancel: &AtomicBool) -> Result<bool, String> {
     }
 }
 
-fn find_cli(root: &Path) -> Option<PathBuf> {
-    let names = ["llama-cli", "llama-cli.exe"];
+fn find_server(root: &Path) -> Option<PathBuf> {
+    let names = ["llama-server", "llama-server.exe"];
     walkdir::WalkDir::new(root)
         .into_iter()
         .filter_map(|entry| entry.ok())
@@ -2109,19 +2549,48 @@ mod tests {
 
     #[test]
     fn live_llama_is_optional() {
-        let model = std::env::var("FAUXRRT_LLAMA_MODEL").ok();
-        let cli = std::env::var("FAUXRRT_LLAMA_CLI").ok();
-        let (Some(model), Some(cli)) = (model, cli) else {
-            return;
+        let model = match std::env::var("FAUXRRT_LLAMA_MODEL") {
+            Ok(path) if Path::new(&path).is_file() => path,
+            _ => return,
         };
-        if !Path::new(&model).is_file() || !Path::new(&cli).is_file() {
-            return;
-        }
-        let runtime = LlamaRuntime::from_paths(PathBuf::from(cli), PathBuf::from(model));
+        let server = match std::env::var("FAUXRRT_LLAMA_SERVER") {
+            Ok(path) if Path::new(&path).is_file() => path,
+            _ => return,
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        let help = cli_help(Path::new(&server), &cancel).unwrap_or_default();
+        let backend = probe_backend();
+        let pool = Arc::new(LlamaServerPool::new());
+        let spec = ServerSpec {
+            program: PathBuf::from(server),
+            model: PathBuf::from(&model),
+            backend,
+            help: help.clone(),
+            free_mib: if backend != GpuBackend::Cpu { free_vram_mib() } else { None },
+            fell_back: false,
+            extra_env: Vec::new(),
+        };
+        let info = pool
+            .start_or_fallback(
+                &spec,
+                || {
+                    Ok(ServerSpec {
+                        backend: GpuBackend::Cpu,
+                        free_mib: None,
+                        fell_back: true,
+                        help,
+                        ..spec.clone()
+                    })
+                },
+                &cancel,
+            )
+            .expect("live llama-server");
+        let runtime = LlamaRuntime::from_info(Arc::clone(&pool), info, cancel);
         let excerpt = "time,lat,lon,alt\n0,32.4,-106.4,1000\n1,32.41,-106.39,1100\n";
         let class = classify_with(&runtime, excerpt).expect("live classification");
         assert_eq!(class.frames.position, "LLA");
         assert!(has_position_columns(&class));
+        pool.shutdown();
     }
 
     #[test]
@@ -2130,10 +2599,19 @@ mod tests {
         assert_eq!(choose_backend(true, false), GpuBackend::Cuda);
         assert_eq!(choose_backend(false, true), GpuBackend::Vulkan);
         assert_eq!(choose_backend(false, false), GpuBackend::Cpu);
-        assert_eq!(device_message(GpuBackend::Cpu, false), "No GPU found; classifying on CPU");
-        assert_eq!(device_message(GpuBackend::Cuda, false), "Running on CUDA");
-        assert_eq!(device_message(GpuBackend::Vulkan, false), "Running on Vulkan");
-        assert_eq!(device_message(GpuBackend::Cuda, true), "GPU runtime failed; classifying on CPU");
+        assert_eq!(
+            device_message(GpuBackend::Cpu, 0, false),
+            "No GPU found; classifying on CPU, 0 layers"
+        );
+        assert_eq!(device_message(GpuBackend::Cuda, 32, false), "Running on CUDA, 32 layers");
+        assert_eq!(device_message(GpuBackend::Vulkan, 32, false), "Running on Vulkan, 32 layers");
+        assert_eq!(
+            device_message(GpuBackend::Cuda, 0, true),
+            "GPU runtime failed; classifying on CPU, 0 layers"
+        );
+        let label = device_label(GpuBackend::Cuda, 32);
+        assert!(device_message(GpuBackend::Cuda, 32, false).contains(&label));
+        assert_eq!(label, "CUDA, 32 layers");
 
         let (cuda_name, cuda_url) = cli_asset(GpuBackend::Cuda);
         let (vulkan_name, vulkan_url) = cli_asset(GpuBackend::Vulkan);
@@ -2153,25 +2631,75 @@ mod tests {
     }
 
     #[test]
-    fn gpu_offload_uses_a_finite_layer_count() {
+    fn gpu_offload_is_nonzero_unless_the_backend_is_cpu() {
         let help = "usage --fit [on|off] -ngl N --n-gpu-layers N --temp N";
         let cuda = offload_args(GpuBackend::Cuda, help);
-        assert_eq!(cuda, vec!["-ngl".to_string(), "0".to_string()]);
-        assert!(!cuda.iter().any(|arg| arg == "auto" || arg == "all" || arg == "on"));
+        assert_eq!(cuda, vec!["-ngl".to_string(), "32".to_string()]);
+        assert!(!cuda.iter().any(|arg| arg == "auto" || arg == "all" || arg == "on" || arg == "0"));
         assert_eq!(offload_args(GpuBackend::Cpu, help), vec!["-ngl".to_string(), "0".to_string()]);
         assert!(offload_args(GpuBackend::Cuda, "usage --temp N").is_empty());
-        let capped = offload_args_with(GpuBackend::Cuda, "usage -ngl N", Some(8_192), false);
+        let capped = offload_args_with(GpuBackend::Cuda, "usage -ngl N", Some(8_192));
         assert_eq!(capped, vec!["-ngl".to_string(), "32".to_string()]);
         assert_eq!(
-            offload_args_with(GpuBackend::Vulkan, "usage -ngl N", None, false),
-            vec!["-ngl".to_string(), "0".to_string()]
+            offload_args_with(GpuBackend::Vulkan, "usage -ngl N", None),
+            vec!["-ngl".to_string(), "32".to_string()]
         );
         assert_eq!(
-            offload_args_with(GpuBackend::Cuda, "usage -ngl N", Some(8_192), true),
-            vec!["-ngl".to_string(), "0".to_string()]
+            offload_args_with(GpuBackend::Cuda, "usage -ngl N", Some(2_000)),
+            vec!["-ngl".to_string(), "2".to_string()]
         );
-        assert_eq!(gpu_layer_limit(None), 0);
-        assert_eq!(gpu_layer_limit(Some(2_000)), 2);
+        assert_eq!(gpu_layers(GpuBackend::Cuda, None), 32);
+        assert_eq!(gpu_layers(GpuBackend::Vulkan, None), 32);
+        assert_eq!(gpu_layers(GpuBackend::Cpu, None), 0);
+        assert_eq!(gpu_layers(GpuBackend::Cpu, Some(16_000)), 0);
+        assert_eq!(gpu_layers(GpuBackend::Cuda, Some(2_000)), 2);
+        assert_eq!(gpu_layers(GpuBackend::Cuda, Some(1_000)), 1);
+    }
+
+    #[test]
+    fn cpu_fallback_happens_only_after_gpu_init_fails() {
+        assert_eq!(backend_after_init(GpuBackend::Cuda, true), (GpuBackend::Cuda, false));
+        assert_eq!(backend_after_init(GpuBackend::Vulkan, true), (GpuBackend::Vulkan, false));
+        assert_eq!(backend_after_init(GpuBackend::Cpu, true), (GpuBackend::Cpu, false));
+        assert_eq!(backend_after_init(GpuBackend::Cuda, false), (GpuBackend::Cpu, true));
+        assert_eq!(backend_after_init(GpuBackend::Vulkan, false), (GpuBackend::Cpu, true));
+        assert!(gpu_layers(GpuBackend::Cuda, None) > 0);
+        assert!(gpu_layers(GpuBackend::Vulkan, None) > 0);
+    }
+
+    #[test]
+    fn llama_server_launch_keeps_context_capped_and_offloads_layers() {
+        let help = "usage -c N --mmap --fit [on|off] -b N -ngl N --host --port -np N";
+        let cuda = server_args(GpuBackend::Cuda, help, Path::new("model.gguf"), 8081, None);
+        assert!(cuda.windows(2).any(|pair| pair == ["-m", "model.gguf"]), "{cuda:?}");
+        assert!(cuda.windows(2).any(|pair| pair == ["-c", "2048"]), "{cuda:?}");
+        assert!(cuda.windows(2).any(|pair| pair == ["--fit", "off"]), "{cuda:?}");
+        assert!(cuda.windows(2).any(|pair| pair == ["-ngl", "32"]), "{cuda:?}");
+        assert!(cuda.windows(2).any(|pair| pair == ["--host", "127.0.0.1"]), "{cuda:?}");
+        assert!(cuda.windows(2).any(|pair| pair == ["--port", "8081"]), "{cuda:?}");
+        assert!(!cuda.iter().any(|arg| arg == "auto" || arg == "131072"));
+        let vulkan = server_args(GpuBackend::Vulkan, help, Path::new("model.gguf"), 9, None);
+        assert!(vulkan.windows(2).any(|pair| pair == ["-ngl", "32"]), "{vulkan:?}");
+        let cpu = server_args(GpuBackend::Cpu, help, Path::new("model.gguf"), 9, Some(16_000));
+        assert!(cpu.windows(2).any(|pair| pair == ["-ngl", "0"]), "{cpu:?}");
+        assert!(cpu.windows(2).any(|pair| pair == ["-c", "2048"]), "{cpu:?}");
+    }
+
+    #[test]
+    fn completion_request_sends_the_header_sample_and_grammar() {
+        let excerpt = "time,lat,lon,alt\n0,32.4,-106.4,1000\n";
+        let body = completion_request(SYSTEM_PROMPT, &user_message(excerpt));
+        assert_eq!(body["n_predict"], 384);
+        assert_eq!(body["temperature"], 0);
+        assert_eq!(body["cache_prompt"], true);
+        let prompt = body["prompt"].as_str().unwrap();
+        assert!(prompt.contains("time,lat,lon,alt"));
+        assert!(prompt.contains(excerpt.trim()));
+        let grammar = body["grammar"].as_str().unwrap();
+        assert!(grammar.contains("header_lines"));
+        assert!(grammar.contains("frames"));
+        assert!(classification_schema().contains("header_lines"));
+        assert!(!prompt.contains("131072"));
     }
 
     #[test]
@@ -2497,5 +3025,170 @@ mod tests {
             cmd.arg("ok");
             cmd
         }
+    }
+
+    fn server_spec(program: PathBuf, model: PathBuf, backend: GpuBackend, log: &Path) -> ServerSpec {
+        ServerSpec {
+            program,
+            model,
+            backend,
+            help: String::new(),
+            free_mib: None,
+            fell_back: backend == GpuBackend::Cpu,
+            extra_env: vec![("FAUXRRT_LAUNCH_LOG".into(), log.display().to_string())],
+        }
+    }
+
+    fn write_exe(dir: &Path, name: &str, body: &str) -> PathBuf {
+        let path = dir.join(name);
+        fs::write(&path, body).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        path
+    }
+
+    const FAKE_LLAMA_SERVER: &str = r#"#!/usr/bin/env python3
+import json, os, sys
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+args = sys.argv[1:]
+port = int(args[args.index("--port") + 1])
+log = os.environ.get("FAUXRRT_LAUNCH_LOG")
+if log:
+    with open(log, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(args) + "\n")
+classification = {
+    "header_lines": 1,
+    "delimiter": ",",
+    "frames": {"position": "LLA"},
+    "units": {"position": "m"},
+    "columns": {"col_0": "time", "col_1": "pos_lat", "col_2": "pos_lon", "col_3": "pos_alt"},
+    "confidence_score": 0.9,
+    "unsupported_flag": False,
+    "reasoning": "lat lon alt",
+}
+
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def do_GET(self):
+        self._send(b'{"status":"ok"}')
+
+    def do_POST(self):
+        size = int(self.headers.get("Content-Length", "0"))
+        raw = self.rfile.read(size)
+        req_log = os.environ.get("FAUXRRT_REQUEST_LOG")
+        if req_log:
+            with open(req_log, "ab") as fh:
+                fh.write(raw + b"\n")
+        body = json.dumps({"content": json.dumps(classification)}).encode()
+        self._send(body)
+
+    def _send(self, body):
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, fmt, *args):
+        return
+
+ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()
+"#;
+
+    const CRASH_LLAMA_SERVER: &str = r#"#!/usr/bin/env python3
+import json, os, sys
+log = os.environ.get("FAUXRRT_LAUNCH_LOG")
+if log:
+    with open(log, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(sys.argv[1:]) + "\n")
+sys.stderr.write("ggml_cuda_init: failed to initialize CUDA\n")
+sys.exit(1)
+"#;
+
+    #[cfg(unix)]
+    #[test]
+    fn second_classification_does_not_relaunch_the_server() {
+        let dir = std::env::temp_dir().join(format!("fauxrrt-reuse-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let program = write_exe(&dir, "llama-server", FAKE_LLAMA_SERVER);
+        let log = dir.join("launches.jsonl");
+        let requests = dir.join("requests.jsonl");
+        let model = dir.join("model.gguf");
+        let mut spec = server_spec(program, model, GpuBackend::Cuda, &log);
+        spec.extra_env.push(("FAUXRRT_REQUEST_LOG".into(), requests.display().to_string()));
+        spec.fell_back = false;
+        let pool = Arc::new(LlamaServerPool::new());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let info = pool.start_or_fallback(&spec, || Ok(spec.clone()), &cancel).unwrap();
+        assert_eq!(info.backend, GpuBackend::Cuda);
+        assert_eq!(info.layers, 32);
+        assert!(!info.fell_back);
+        assert_eq!(pool.launch_count(), 1);
+        let runtime = LlamaRuntime::from_info(Arc::clone(&pool), info, Arc::clone(&cancel));
+        assert_eq!(runtime.backend, GpuBackend::Cuda);
+        assert_eq!(runtime.layers, 32);
+        assert_eq!(runtime.status_device(), "CUDA, 32 layers");
+        let excerpt = "time,lat,lon,alt\n0,32.4,-106.4,1000\n";
+        let first = classify_with(&runtime, excerpt).unwrap();
+        let second = classify_with(&runtime, excerpt).unwrap();
+        assert_eq!(first.frames.position, "LLA");
+        assert_eq!(second.frames.position, "LLA");
+        assert_eq!(pool.launch_count(), 1, "a second classification relaunched llama-server");
+        let argv = fs::read_to_string(&log).unwrap();
+        assert_eq!(argv.lines().count(), 1, "{argv}");
+        assert!(argv.contains("\"-ngl\""), "{argv}");
+        assert!(argv.contains("\"32\""), "{argv}");
+        assert!(argv.contains("\"-c\""), "{argv}");
+        assert!(argv.contains("\"2048\""), "{argv}");
+        assert!(argv.contains("\"--fit\""), "{argv}");
+        assert!(argv.contains("\"off\""), "{argv}");
+        let posted = fs::read_to_string(&requests).unwrap();
+        assert_eq!(posted.lines().count(), 2, "{posted}");
+        assert!(posted.contains("time,lat,lon,alt"));
+        assert!(posted.contains("root ::="), "grammar was not sent: {posted}");
+        assert!(posted.contains("\"n_predict\":384") || posted.contains("\"n_predict\": 384"), "{posted}");
+        pool.shutdown();
+        assert!(pool.current().is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cpu_server_starts_only_after_the_gpu_backend_exits() {
+        let dir = std::env::temp_dir().join(format!("fauxrrt-fallback-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let crash = write_exe(&dir, "cuda-server", CRASH_LLAMA_SERVER);
+        let cpu = write_exe(&dir, "cpu-server", FAKE_LLAMA_SERVER);
+        let log = dir.join("launches.jsonl");
+        let model = dir.join("model.gguf");
+        let preferred = server_spec(crash, model.clone(), GpuBackend::Cuda, &log);
+        let cpu_spec = server_spec(cpu, model, GpuBackend::Cpu, &log);
+        let pool = Arc::new(LlamaServerPool::new());
+        let cancel = AtomicBool::new(false);
+        let info = pool
+            .start_or_fallback(&preferred, || Ok(cpu_spec.clone()), &cancel)
+            .unwrap();
+        assert!(info.fell_back);
+        assert_eq!(info.backend, GpuBackend::Cpu);
+        assert_eq!(info.layers, 0);
+        assert_eq!(pool.launch_count(), 2);
+        let again = pool
+            .start_or_fallback(&preferred, || Ok(cpu_spec.clone()), &cancel)
+            .unwrap();
+        assert_eq!(again.backend, GpuBackend::Cpu);
+        assert_eq!(pool.launch_count(), 2, "a healthy server was relaunched");
+        let lines: Vec<_> = fs::read_to_string(&log).unwrap().lines().map(str::to_string).collect();
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[0].contains("\"32\""), "GPU attempt was not 32 layers: {}", lines[0]);
+        assert!(lines[1].contains("\"-ngl\"") && lines[1].contains("\"0\""), "{}", lines[1]);
+        pool.shutdown();
+        let _ = fs::remove_dir_all(&dir);
     }
 }

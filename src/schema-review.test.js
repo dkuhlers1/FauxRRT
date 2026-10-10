@@ -247,6 +247,14 @@ test("load progress shows bytes, files, and the device", () => {
     "Classifying track.csv (1/3) · Vulkan",
   );
   assert.equal(
+    formatLoadProgress({ file: "Classifying track.csv", done: 1, total: 2, device: "CUDA, 32 layers", bytes: 0, bytes_total: 0 }),
+    "Classifying track.csv (1/2) · CUDA, 32 layers",
+  );
+  assert.equal(
+    formatLoadProgress({ file: "Running on CUDA, 32 layers", device: "CUDA, 32 layers", done: 0, total: 1 }),
+    "Running on CUDA, 32 layers",
+  );
+  assert.equal(
     formatLoadProgress({
       file: "Download interrupted; resuming",
       bytes: 1_200_000_000,

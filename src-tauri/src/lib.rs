@@ -37,7 +37,8 @@ use mission::{
 };
 use classify::{
     classify_with, excerpt_of, file_origin, group_files, may_load, manual_reason, normalize_classification,
-    origin_from_text, partial_schema_guess, ClassifyNote, GroupedFile, LlamaRuntime, SchemaAssignment, SchemaGroup,
+    origin_from_text, partial_schema_guess, ClassifyNote, GroupedFile, LlamaRuntime, LlamaServerPool, SchemaAssignment,
+    SchemaGroup,
     TrajectoryClassification, CANCELLED,
 };
 use parse::{parse_path_with, parse_text, parse_with_classification, read_trajectory_text, ParsedTrack};
@@ -54,6 +55,8 @@ pub struct AppState {
     store: Mutex<Store>,
     mission: Mutex<MissionSession>,
     classify_cancel: Arc<AtomicBool>,
+    /// Resident llama-server. Choose files reuses it; Cancel and app exit stop it.
+    llama: Arc<LlamaServerPool>,
 }
 
 struct MissionSession {
@@ -167,13 +170,14 @@ fn picked_paths(files: Vec<PathBuf>) -> PickedPaths {
 }
 
 /// Classify after the file dialog has returned. The dialog stays on the UI thread;
-/// the download and llama-cli run on a blocking pool so the window can paint and cancel.
+/// the download and llama-server run on a blocking pool so the window can paint and cancel.
 #[tauri::command]
 async fn classify_picked(app: AppHandle, state: State<'_, AppState>, paths: Vec<String>) -> Result<ClassifyResult, String> {
     let cancel = Arc::clone(&state.classify_cancel);
     cancel.store(false, Ordering::SeqCst);
+    let llama = Arc::clone(&state.llama);
     let files: Vec<PathBuf> = paths.into_iter().map(PathBuf::from).collect();
-    tauri::async_runtime::spawn_blocking(move || classify_paths(&app, files, &cancel))
+    tauri::async_runtime::spawn_blocking(move || classify_paths(&app, files, &cancel, &llama))
         .await
         .map_err(|err| format!("classification task failed: {err}"))?
 }
@@ -181,6 +185,7 @@ async fn classify_picked(app: AppHandle, state: State<'_, AppState>, paths: Vec<
 #[tauri::command]
 fn cancel_classify(state: State<AppState>) {
     state.classify_cancel.store(true, Ordering::SeqCst);
+    state.llama.shutdown();
 }
 
 #[derive(Serialize)]
@@ -1366,7 +1371,12 @@ fn resolve_load_mode(
     Ok(Some(store.ensure_named_mode(object_id, name)?))
 }
 
-fn classify_paths(app: &AppHandle, files: Vec<PathBuf>, cancel: &Arc<AtomicBool>) -> Result<ClassifyResult, String> {
+fn classify_paths(
+    app: &AppHandle,
+    files: Vec<PathBuf>,
+    cancel: &Arc<AtomicBool>,
+    llama: &Arc<LlamaServerPool>,
+) -> Result<ClassifyResult, String> {
     let started = Instant::now();
     let total = files.len();
     if total == 0 {
@@ -1392,7 +1402,7 @@ fn classify_paths(app: &AppHandle, files: Vec<PathBuf>, cancel: &Arc<AtomicBool>
     let mut editor = Vec::new();
     if !pending.is_empty() {
         let data_dir = app.path().app_data_dir().map_err(|err| err.to_string())?;
-        match LlamaRuntime::ensure(&data_dir, cancel, &|note| emit_note(app, total, &note)) {
+        match LlamaRuntime::ensure(&data_dir, cancel, &|note| emit_note(app, total, &note), llama) {
             Err(err) if err == CANCELLED || err.contains(CANCELLED) => return Err(CANCELLED.into()),
             Err(err) => {
                 errors.push(err.clone());
@@ -1414,7 +1424,7 @@ fn classify_paths(app: &AppHandle, files: Vec<PathBuf>, cancel: &Arc<AtomicBool>
                             file: format!("Classifying {name}"),
                             bytes: 0,
                             bytes_total: 0,
-                            device: runtime.device.clone(),
+                            device: runtime.status_device(),
                         },
                     );
                     match classify_with(&runtime, &excerpt_of(text)) {
@@ -2292,6 +2302,7 @@ pub fn run() {
             store: Mutex::new(Store::new()),
             mission: Mutex::new(MissionSession::default()),
             classify_cancel: Arc::new(AtomicBool::new(false)),
+            llama: Arc::new(LlamaServerPool::new()),
         })
         .invoke_handler(tauri::generate_handler![
             load_files,
@@ -2352,6 +2363,26 @@ pub fn run() {
             set_mission_ui,
             set_mission_wind
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running FauxRRT");
+        .build(tauri::generate_context!())
+        .expect("error while building FauxRRT")
+        .run(|app, event| {
+            if let tauri::RunEvent::Exit = event {
+                if let Some(state) = app.try_state::<AppState>() {
+                    state.llama.shutdown();
+                }
+            }
+        });
+}
+
+#[cfg(test)]
+mod classify_command_tests {
+    #[test]
+    fn classify_picked_stays_off_the_ui_thread() {
+        let src = include_str!("lib.rs");
+        let start = src.find("async fn classify_picked").expect("classify_picked is async");
+        let body = &src[start..start + 700];
+        assert!(body.contains("spawn_blocking"), "{body}");
+        assert!(src.contains("state.llama.shutdown()"), "Cancel must stop llama-server");
+        assert!(src.contains("RunEvent::Exit"), "app exit must stop llama-server");
+    }
 }
