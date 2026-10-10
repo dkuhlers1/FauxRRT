@@ -55,6 +55,7 @@ import {
   loadFailureMessage,
   uniqueSchemaSummary,
 } from "./schema-review.js";
+import { propagateStage, propagationModeName } from "./propagate-stage.js";
 
 const tracks = new Map();
 let schemaSession = null;
@@ -2418,6 +2419,9 @@ function renderTrajectoryDrawer() {
   const modeName = obj
     ? (objectLoadName.get(obj.id) || loadModeFor(obj)?.name || suggestedModeName(obj))
     : "";
+  if (obj && modeName && !String(objectLoadName.get(obj.id) || "").trim()) {
+    objectLoadName.set(obj.id, modeName);
+  }
   const destLabel = escapeHtml(modeName || "the mode");
   const objectOptions = objects
     .map((o) => `<option value="${o.id}"${obj && o.id === obj.id ? " selected" : ""}>${escapeHtml(o.name)}</option>`)
@@ -3316,10 +3320,11 @@ function readSimForm() {
 }
 
 function destModeName(objectId) {
-  const card = els.objectList?.querySelector(`[data-object-id="${objectId}"]`);
-  return fieldText(card?.querySelector("[data-role='load-mode-name']"))
-    || objectLoadName.get(objectId)
-    || "";
+  const shown = fieldText(trajHost()?.querySelector("[data-role='load-mode-name']"));
+  const stored = objectId != null ? (objectLoadName.get(objectId) || "") : "";
+  const modeName = propagationModeName(shown, stored);
+  if (modeName && objectId != null) objectLoadName.set(objectId, modeName);
+  return modeName;
 }
 
 function simDestination() {
@@ -3442,27 +3447,27 @@ async function runSimStage() {
     els.progress.textContent = "Pick a separation time on the source trajectory.";
     return;
   }
+  const shownMode = fieldText(trajHost()?.querySelector("[data-role='load-mode-name']"));
   setBusy(true);
   els.progress.textContent = dist === "point" ? "Propagating spent stage…" : `Propagating spent stage (${simDraft.stage.count} times)…`;
   try {
-    const result = await invoke("simulate_spent_stage", ipcArgs({
-      spec: {
-        source_track_id: simDraft.trackId,
-        time_s: Number(timeS),
-        ballistic_coeff: Number(simDraft.stage.ballistic_coeff),
-        object_id: dest.objectId,
-        object_name: null,
-        mode_name: dest.modeName,
-        dist,
-        count: dist === "point" ? 1 : Math.max(1, Number(simDraft.stage.count) || 1),
-        t_min: dist === "uniform" ? Number(simDraft.stage.tMin) : null,
-        t_max: dist === "uniform" ? Number(simDraft.stage.tMax) : null,
-        sigma_s: dist === "normal" ? Number(simDraft.stage.sigma) : null,
-        n_sigma: dist === "normal" ? stageNSigma() : 3,
-        seed: Number(simDraft.stage.seed) || 1,
-      },
-    }));
-    await ingestSimResult(result, `Spent stage · ${result.tracks.length} traj`);
+    const outcome = await propagateStage({
+      shownMode,
+      storedMode: dest.modeName,
+      objectId: dest.objectId,
+      trackId: simDraft.trackId,
+      timeS,
+      sliderTime,
+      sample: simDraft.sample,
+      stage: simDraft.stage,
+      nSigma: stageNSigma(),
+      invoke: (cmd, args) => invoke(cmd, ipcArgs(args)),
+    });
+    if (!outcome.ok) {
+      els.progress.textContent = outcome.message;
+      return;
+    }
+    await ingestSimResult(outcome.result, `Spent stage · ${outcome.tracks.length} traj`);
   } catch (err) {
     els.progress.textContent = String(err);
   } finally {
