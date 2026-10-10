@@ -1,15 +1,16 @@
 /**
- * Animated surface-wind particles on a canvas above the Cesium globe.
+ * Animated wind particles on a canvas above the Cesium globe.
  *
- * The particle count is capped. Positions are updated on requestAnimationFrame
- * and drawn in screen space, so the Cesium scene stays on its on-demand
- * render loop. Turning the layer off aborts the fetch, cancels the frame
- * loop, and removes the canvas.
+ * One particle system follows the mission wind: GFS 10 m, a constant vector,
+ * the historical corridor that trajectories sample, or nothing. The count is
+ * capped. Positions update on requestAnimationFrame and draw in screen space,
+ * so the Cesium scene stays on its on-demand render loop.
  */
 
 import {
   advectInto,
-  loadGfsSurfaceField,
+  boundsContain,
+  resolveAnimationField,
   sampleWindInto,
   speedRampCss,
   speedRgb,
@@ -23,13 +24,14 @@ const SPEED_BINS = 24;
 const BIN_MAX_MPS = 42;
 const POLE_LIMIT = 79.5;
 
-let generation = 0;
+let fetchGen = 0;
 let abortCtrl = null;
 let raf = 0;
 let running = false;
 let canvas = null;
 let legend = null;
 let particles = null;
+let currentField = null;
 let layerAlpha = DEFAULT_WIND_ALPHA;
 
 export function setSurfaceWindAlpha(alpha) {
@@ -44,11 +46,19 @@ export function surfaceWindAlpha() {
   return layerAlpha;
 }
 
-export function setSurfaceWindEnabled(viewer, enabled, onStatus) {
-  generation += 1;
-  const gen = generation;
-  stopRuntime();
-  if (!enabled) {
+/**
+ * Show the selected mission wind on the one globe particle layer.
+ * A Surface grid already in `request` is used as-is, so selecting Surface
+ * does not start a second GFS particle system.
+ */
+export function setMissionWindAnimation(viewer, request, onStatus) {
+  fetchGen += 1;
+  const gen = fetchGen;
+  abortCtrl?.abort();
+  abortCtrl = null;
+  if (!request || request.type === "off") {
+    stopRuntime();
+    currentField = null;
     onStatus?.({ phase: "off" });
     return Promise.resolve({ ok: true });
   }
@@ -59,14 +69,29 @@ export function setSurfaceWindEnabled(viewer, enabled, onStatus) {
   abortCtrl = new AbortController();
   const signal = abortCtrl.signal;
   onStatus?.({ phase: "loading" });
-  return loadGfsSurfaceField(signal).then((field) => {
-    if (gen !== generation || signal.aborted) return { ok: false, aborted: true };
-    startLayer(viewer, field, gen);
-    onStatus?.({ phase: "ready", field });
+  return resolveAnimationField(request, signal).then((field) => {
+    if (gen !== fetchGen || signal.aborted) return { ok: false, aborted: true };
+    abortCtrl = null;
+    if (!field) {
+      stopRuntime();
+      currentField = null;
+      onStatus?.({ phase: "off" });
+      return { ok: true };
+    }
+    currentField = field;
+    if (running && canvas) {
+      canvas.dataset.windKind = field.kind || "";
+      if (legend) writeLegend(legend, field);
+      onStatus?.({ phase: field.loading ? "loading" : "ready", field });
+      return { ok: true, field, swapped: true };
+    }
+    startLayer(viewer);
+    onStatus?.({ phase: field.loading ? "loading" : "ready", field });
     return { ok: true, field };
   }).catch((err) => {
-    if (gen !== generation || err?.name === "AbortError") return { ok: false, aborted: true };
+    if (gen !== fetchGen || err?.name === "AbortError") return { ok: false, aborted: true };
     stopRuntime();
+    currentField = null;
     const message = err?.message || String(err);
     onStatus?.({ phase: "error", message });
     return { ok: false, message };
@@ -86,7 +111,7 @@ function stopRuntime() {
   particles = null;
 }
 
-function startLayer(viewer, field, gen) {
+function startLayer(viewer) {
   const Cesium = window.Cesium;
   const project = Cesium?.SceneTransforms?.worldToWindowCoordinates
     || Cesium?.SceneTransforms?.wgs84ToWindowCoordinates;
@@ -101,10 +126,11 @@ function startLayer(viewer, field, gen) {
   canvas = document.createElement("canvas");
   canvas.className = "surface-wind-canvas";
   canvas.dataset.windLayer = "on";
+  canvas.dataset.windKind = currentField?.kind || "";
   canvas.setAttribute("aria-hidden", "true");
   canvas.style.opacity = String(layerAlpha);
   parent.appendChild(canvas);
-  legend = buildLegend(field);
+  legend = buildLegend(currentField);
   parent.appendChild(legend);
   placeOverlay(canvas, legend, hostCanvas, parent);
 
@@ -131,18 +157,42 @@ function startLayer(viewer, field, gen) {
 
   particles = { lat, lon, age, life };
   running = true;
+  let seededToken = "";
+
+  const fieldToken = (field) => {
+    if (!field) return "off";
+    if (field.kind === "historical") {
+      return `h:${field.date}:${field.hour_utc}:${field.regions.length}:${field.loading ? 1 : 0}:${field.error || ""}`;
+    }
+    if (field.kind === "constant") return `c:${field.u}:${field.v}`;
+    return `g:${field.time || ""}:${field.nx || 0}:${field.ny || 0}`;
+  };
 
   const spawn = (index, center, halfLat, halfLon) => {
+    age[index] = Math.random() * 2;
+    life[index] = 4 + Math.random() * 6;
+    const field = currentField;
+    if (field?.kind === "historical") {
+      const region = regionUnder(field, center)
+        || field.regions[Math.floor(Math.random() * field.regions.length)];
+      if (!region) {
+        lat[index] = NaN;
+        return;
+      }
+      const point = randomInBounds(region.bounds);
+      lat[index] = point.lat;
+      lon[index] = point.lon;
+      return;
+    }
     const lat0 = center ? center.lat : 28;
     const lon0 = center ? center.lon : -90;
     lat[index] = clamp(lat0 + (Math.random() - 0.5) * 2 * halfLat, -80, 80);
     lon[index] = wrapLon(lon0 + (Math.random() - 0.5) * 2 * halfLon);
-    age[index] = Math.random() * 2;
-    life[index] = 4 + Math.random() * 6;
   };
 
   const frame = (now) => {
-    if (!running || gen !== generation) return;
+    if (!running) return;
+    const field = currentField;
     const host = viewer.scene.canvas;
     placeOverlay(canvas, legend, host, parent);
     const cssW = host.clientWidth || parent.clientWidth;
@@ -160,6 +210,10 @@ function startLayer(viewer, field, gen) {
     }
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, cssW, cssH);
+    if (!field || field.kind === "off" || (field.kind === "historical" && !field.regions.length)) {
+      raf = requestAnimationFrame(frame);
+      return;
+    }
 
     const dt = last ? Math.min(0.05, (now - last) / 1000) : 0.016;
     last = now;
@@ -169,13 +223,22 @@ function startLayer(viewer, field, gen) {
     const halfLat = Math.min(70, Math.max(1.2, (mpp * cssH * 0.48) / 111320));
     const cos = Math.max(0.25, Math.cos(((center?.lat ?? 0) * Math.PI) / 180));
     const halfLon = Math.min(160, halfLat / cos);
+    const token = fieldToken(field);
+    if (token !== seededToken) {
+      seededToken = token;
+      for (let i = 0; i < MAX_WIND_PARTICLES; i++) spawn(i, center, halfLat, halfLon);
+    }
 
     for (let b = 0; b < buckets.length; b++) buckets[b].length = 0;
 
     for (let i = 0; i < MAX_WIND_PARTICLES; i++) {
       sampleWindInto(field, lat[i], lon[i], wind);
       age[i] += dt;
-      const calm = !(wind.speed >= 0.35) || !Number.isFinite(wind.u);
+      if (wind.miss || !Number.isFinite(lat[i]) || !Number.isFinite(wind.u)) {
+        spawn(i, center, halfLat, halfLon);
+        continue;
+      }
+      const calm = !(wind.speed >= 0.35);
       const expired = age[i] > life[i] || (calm && age[i] > 0.7);
       const polar = lat[i] <= -POLE_LIMIT || lat[i] >= POLE_LIMIT;
       if (expired || polar || !Number.isFinite(lat[i])) {
@@ -222,17 +285,9 @@ function startLayer(viewer, field, gen) {
       }
     }
 
-    if (running && gen === generation) raf = requestAnimationFrame(frame);
+    if (running) raf = requestAnimationFrame(frame);
   };
 
-  const seedCenter = viewCenter(viewer, Cesium, scratch2, carto);
-  const seedH = viewer.scene.canvas.clientHeight || 800;
-  const seedMpp = metersPerPixel(viewer, seedH);
-  const seedHalfLat = Math.min(70, Math.max(1.2, (seedMpp * seedH * 0.48) / 111320));
-  const seedCos = Math.max(0.25, Math.cos(((seedCenter?.lat ?? 0) * Math.PI) / 180));
-  for (let i = 0; i < MAX_WIND_PARTICLES; i++) {
-    spawn(i, seedCenter, seedHalfLat, Math.min(160, seedHalfLat / seedCos));
-  }
   viewer.scene.requestRender();
   raf = requestAnimationFrame(frame);
 }
@@ -299,17 +354,28 @@ function projectFront(viewer, Cesium, project, lat, lon, scratch3, scratch2, out
   return true;
 }
 
+function regionUnder(field, center) {
+  if (!center) return null;
+  return (field.regions || []).find((region) => boundsContain(region.bounds, center.lat, center.lon)) || null;
+}
+
+function randomInBounds(bounds) {
+  const latSpan = Math.max(0.05, bounds.maxLat - bounds.minLat);
+  const lonSpan = Math.max(0.05, bounds.maxD - bounds.minD);
+  return {
+    lat: bounds.minLat + Math.random() * latSpan,
+    lon: wrapLon(bounds.ref + bounds.minD + Math.random() * lonSpan),
+  };
+}
+
 function buildLegend(field) {
   const el = document.createElement("aside");
   el.className = "wind-legend";
   el.dataset.windLegend = "on";
   const title = document.createElement("div");
   title.className = "wind-legend-title";
-  title.textContent = "Surface wind";
   const meta = document.createElement("div");
   meta.className = "wind-legend-meta";
-  const when = (field.time || "current").replace("T", " ");
-  meta.textContent = `GFS 10 m · ${when} UTC`;
   const bar = document.createElement("div");
   bar.className = "wind-legend-bar";
   bar.style.background = speedRampCss();
@@ -322,9 +388,19 @@ function buildLegend(field) {
   }
   const src = document.createElement("div");
   src.className = "wind-legend-meta";
-  src.textContent = "Open-Meteo GFS · directional speed";
   el.append(title, meta, bar, scale, src);
+  writeLegend(el, field);
   return el;
+}
+
+function writeLegend(el, field) {
+  const copy = field?.legend || { title: "Wind", meta: "", source: "" };
+  const title = el.querySelector(".wind-legend-title");
+  if (title) title.textContent = copy.title;
+  const metas = el.querySelectorAll(".wind-legend-meta");
+  if (metas[0]) metas[0].textContent = copy.meta || "";
+  if (metas[1]) metas[1].textContent = copy.source || "";
+  el.dataset.windKind = field?.kind || "";
 }
 
 function clamp(value, min, max) {

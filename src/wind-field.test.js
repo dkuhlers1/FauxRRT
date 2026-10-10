@@ -4,13 +4,18 @@ import { DEFAULT_WIND_ALPHA, MAX_WIND_PARTICLES, setSurfaceWindAlpha, surfaceWin
 import {
   GFS_SURFACE_ENDPOINT,
   advectInto,
+  boundsContain,
+  constantWindField,
   fieldFromSamples,
   gfsSurfaceBatchUrl,
   gridPointCount,
   gridSpec,
+  historicalWindField,
   meteoToUv,
+  resolveAnimationField,
   sampleWindInto,
   speedRgb,
+  surfaceAnimationNeedsFetch,
   wrapLon,
 } from "./wind-field.js";
 
@@ -101,6 +106,114 @@ test("speed colors stay in range and shift from blue toward red", () => {
   const fast = speedRgb(40);
   assert.ok(calm[2] > calm[0]);
   assert.ok(fast[0] > fast[2]);
+});
+
+test("constant wind is the same vector everywhere", () => {
+  const field = constantWindField(10, 270);
+  const out = { u: 0, v: 0, speed: 0 };
+  sampleWindInto(field, 0, 0, out);
+  assert.ok(Math.abs(out.u - 10) < 1e-9);
+  assert.ok(Math.abs(out.v) < 1e-9);
+  assert.equal(out.miss, false);
+  sampleWindInto(field, -40, 150, out);
+  assert.ok(Math.abs(out.u - 10) < 1e-9);
+  assert.equal(field.global, true);
+  assert.equal(field.legend.title, "Constant wind");
+  assert.match(field.legend.source, /everywhere/);
+});
+
+test("surface selection reuses the mission grid instead of fetching GFS", async () => {
+  const request = {
+    type: "surface",
+    time: "2026-10-07T00:00",
+    source: "Open-Meteo GFS 10 m",
+    lats: [0, 10],
+    lons: [-10, 0],
+    east_mps: [4, 0, 0, 0],
+    north_mps: [0, 0, 0, 1],
+  };
+  assert.equal(surfaceAnimationNeedsFetch(request), false);
+  assert.equal(surfaceAnimationNeedsFetch({ type: "surface" }), true);
+  assert.equal(surfaceAnimationNeedsFetch({ type: "constant" }), false);
+  const field = await resolveAnimationField(request);
+  assert.equal(field.kind, "grid");
+  assert.equal(field.global, false);
+  const out = { u: 0, v: 0, speed: 0 };
+  sampleWindInto(field, 0, -10, out);
+  assert.ok(Math.abs(out.u - 4) < 1e-6);
+  assert.ok(Math.abs(out.v) < 1e-6);
+  assert.equal(field.legend.title, "Surface wind");
+});
+
+test("historical wind is sampled inside its corridor and missing outside", () => {
+  const field = historicalWindField({
+    date: "2024-06-01",
+    hour_utc: 12,
+    source: "GFS 2024-06-01 12Z",
+    regions: [{
+      stations: [
+        { lat: 30, lon: -100, east_mps: 10, north_mps: 0 },
+        { lat: 32, lon: -98, east_mps: 0, north_mps: 10 },
+      ],
+    }],
+  });
+  assert.equal(field.global, false);
+  const out = { u: 0, v: 0, speed: 0, miss: false };
+  sampleWindInto(field, 30, -100, out);
+  assert.equal(out.miss, false);
+  assert.ok(out.u > 8, `near the west station u=${out.u}`);
+  sampleWindInto(field, 31, -99, out);
+  assert.equal(out.miss, false);
+  assert.ok(out.u > 2 && out.u < 8, `midpoint u=${out.u}`);
+  assert.ok(out.v > 2 && out.v < 8, `midpoint v=${out.v}`);
+  sampleWindInto(field, 30, -70, out);
+  assert.equal(out.miss, true);
+  assert.ok(!Number.isFinite(out.u));
+  assert.match(field.legend.source, /not a global map/);
+  assert.match(field.legend.meta, /corridor/i);
+});
+
+test("a historical profile stays local instead of covering the globe", () => {
+  const field = historicalWindField({
+    date: "2024-06-01",
+    hour_utc: 0,
+    regions: [{
+      stations: [{ lat: 28.5, lon: -80.6, east_mps: 6, north_mps: -2 }],
+    }],
+  });
+  const out = { u: 0, v: 0, speed: 0, miss: false };
+  sampleWindInto(field, 28.5, -80.6, out);
+  assert.equal(out.miss, false);
+  assert.ok(Math.abs(out.u - 6) < 1e-9);
+  sampleWindInto(field, 28.5, -70, out);
+  assert.equal(out.miss, true);
+  assert.equal(field.global, false);
+  assert.match(field.legend.meta, /sounding/i);
+  const bounds = field.regions[0].bounds;
+  assert.equal(boundsContain(bounds, 28.5, -80.6), true);
+  assert.equal(boundsContain(bounds, 50, 10), false);
+});
+
+test("historical coverage crosses the antimeridian the short way", () => {
+  const field = historicalWindField({
+    regions: [{
+      stations: [
+        { lat: 10, lon: 179.5, east_mps: 3, north_mps: 0 },
+        { lat: 10.2, lon: -179.5, east_mps: 3, north_mps: 0 },
+      ],
+    }],
+  });
+  const out = { u: 0, v: 0, speed: 0, miss: false };
+  sampleWindInto(field, 10.1, 180, out);
+  assert.equal(out.miss, false, "the short corridor across 180 should be inside");
+  sampleWindInto(field, 10.1, 0, out);
+  assert.equal(out.miss, true, "the opposite side of the earth is not this corridor");
+});
+
+test("off wind samples as a miss", () => {
+  const out = { u: 1, v: 1, speed: 1, miss: false };
+  sampleWindInto({ kind: "off" }, 10, 10, out);
+  assert.equal(out.miss, true);
 });
 
 test("batch URL asks Open-Meteo GFS for 10 m wind", () => {

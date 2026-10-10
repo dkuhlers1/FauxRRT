@@ -15,7 +15,7 @@ mod store;
 mod vessel;
 mod wind;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -28,7 +28,10 @@ use simulate::{
     build_fts_debris, build_nav_failure, build_spent_stage, regenerate_simulated, sample_stage_times,
     sample_with_internal_velocity, BuiltTrack, DebrisCatalog, FtsSpec, NavFailSpec, SpentStageSpec, StateSample,
 };
-use wind::{prepare_flight_wind, WindSpec};
+use wind::{
+    historical_resolve_key, prepare_flight_wind, profile_pair, resolve_wind_spec, surface_stations,
+    HistoricalAnimationRegion, WindAnimationField, WindSpec,
+};
 use impact::extract_impact;
 use kde::{kde_lonlat, KdeGrid, WeightedPoint};
 use mission::{
@@ -49,6 +52,11 @@ use serde::Serialize;
 use store::{display_budget, Store, TrackMeta};
 use tauri::{AppHandle, Emitter, Manager, State};
 
+struct WindAnimCache {
+    key: String,
+    field: WindAnimationField,
+}
+
 pub struct AppState {
     store: Mutex<Store>,
     mission: Mutex<MissionSession>,
@@ -56,6 +64,10 @@ pub struct AppState {
     /// Resident llama-server. It stays idle unless a later action asks for it.
     /// Choose files does not start it. Cancel and app exit still shut it down.
     llama: Arc<LlamaServerPool>,
+    /// Last globe animation field. Historical profiles stay out of the mission file.
+    wind_anim: Mutex<Option<WindAnimCache>>,
+    /// Historical soundings already fetched for trajectory regen, keyed like the globe.
+    resolved_wind: Mutex<HashMap<String, WindSpec>>,
 }
 
 struct MissionSession {
@@ -733,6 +745,8 @@ fn generate_trajectories(
         spec.wind = store.wind.without_site_profiles();
     }
     let spec = resolve_winds(spec)?;
+    remember_resolved(&state, &spec.wind, spec.launch_lat, spec.launch_lon, spec.aim_lat, spec.aim_lon);
+    invalidate_wind_anim(&state);
     if let WindSpec::Historical { source, date, hour_utc, .. } = &spec.wind {
         let mut store = state.store.lock().map_err(|e| e.to_string())?;
         store.set_wind(WindSpec::Historical {
@@ -807,6 +821,9 @@ async fn generate_rocketpy(
         let store = state.store.lock().map_err(|e| e.to_string())?;
         prepare_flight_wind(&store.wind, spec.env.latitude, spec.env.longitude)?
     };
+    let (launch_lat, launch_lon, aim_lat, aim_lon) = profile_pair(spec.env.latitude, spec.env.longitude);
+    remember_resolved(&state, &wind, launch_lat, launch_lon, aim_lat, aim_lon);
+    invalidate_wind_anim(&state);
     let spec_for_fly = spec.clone().with_mission_wind(&wind);
     let flown = tauri::async_runtime::spawn_blocking(move || fly_rocketpy(&spec_for_fly))
         .await
@@ -1882,6 +1899,195 @@ fn rename_mission(app: AppHandle, state: State<AppState>, name: String) -> Resul
     mission_info(&app, &state)
 }
 
+fn remember_spec(
+    map: &mut HashMap<String, WindSpec>,
+    wind: &WindSpec,
+    launch_lat: f64,
+    launch_lon: f64,
+    aim_lat: f64,
+    aim_lon: f64,
+) {
+    let WindSpec::Historical {
+        date,
+        hour_utc,
+        profiles,
+        ..
+    } = wind
+    else {
+        return;
+    };
+    if profiles.is_empty() {
+        return;
+    }
+    map.insert(
+        historical_resolve_key(date, *hour_utc, launch_lat, launch_lon, aim_lat, aim_lon),
+        wind.clone(),
+    );
+}
+
+fn remember_resolved(
+    state: &AppState,
+    wind: &WindSpec,
+    launch_lat: f64,
+    launch_lon: f64,
+    aim_lat: f64,
+    aim_lon: f64,
+) {
+    let Ok(mut map) = state.resolved_wind.lock() else {
+        return;
+    };
+    remember_spec(&mut map, wind, launch_lat, launch_lon, aim_lat, aim_lon);
+}
+
+fn invalidate_wind_anim(state: &AppState) {
+    if let Ok(mut cache) = state.wind_anim.lock() {
+        *cache = None;
+    }
+}
+
+fn sim_pair(origin: &simulate::SimulateOrigin) -> (f64, f64, f64, f64) {
+    let (lon, lat, _) = ecef_to_lla(origin.r_ecef[0], origin.r_ecef[1], origin.r_ecef[2]);
+    let aim_lon = (lon + 1.0).clamp(-180.0, 180.0);
+    (lat, lon, lat, aim_lon)
+}
+
+fn historical_animation_pairs(store: &Store) -> Vec<(f64, f64, f64, f64)> {
+    let mut pairs = Vec::new();
+    let mut seen = HashSet::new();
+    let mut push = |pair: (f64, f64, f64, f64)| {
+        let key = (
+            (pair.0 * 1_000.0).round() as i64,
+            (pair.1 * 1_000.0).round() as i64,
+            (pair.2 * 1_000.0).round() as i64,
+            (pair.3 * 1_000.0).round() as i64,
+        );
+        if seen.insert(key) {
+            pairs.push(pair);
+        }
+    };
+    let jobs = store.generated_regen_jobs();
+    let have_generated = !jobs.is_empty();
+    for (_, spec) in jobs {
+        push((spec.launch_lat, spec.launch_lon, spec.aim_lat, spec.aim_lon));
+    }
+    for track in store.tracks.values() {
+        if let Some(spec) = &track.rocketpy {
+            push(profile_pair(spec.env.latitude, spec.env.longitude));
+        }
+    }
+    for obj in store.objects.values() {
+        if let Some(spec) = &obj.rocketpy {
+            push(profile_pair(spec.env.latitude, spec.env.longitude));
+        }
+    }
+    if !have_generated {
+        if let Some((_, origin)) = store.simulate_regen_jobs().into_iter().next() {
+            push(sim_pair(&origin));
+        }
+    }
+    pairs
+}
+
+fn animation_stamp(date: &str, hour_utc: u8, pairs: &[(f64, f64, f64, f64)]) -> String {
+    let mut parts: Vec<String> = pairs
+        .iter()
+        .map(|pair| format!("{:.3}:{:.3}:{:.3}:{:.3}", pair.0, pair.1, pair.2, pair.3))
+        .collect();
+    parts.sort();
+    format!("h:{date}:{hour_utc}:{}", parts.join("|"))
+}
+
+#[tauri::command]
+fn wind_animation_field(state: State<AppState>) -> Result<WindAnimationField, String> {
+    let (wind, pairs) = {
+        let store = state.store.lock().map_err(|e| e.to_string())?;
+        let pairs = if matches!(store.wind, WindSpec::Historical { .. }) {
+            historical_animation_pairs(&store)
+        } else {
+            Vec::new()
+        };
+        (store.wind.clone(), pairs)
+    };
+    if let Some(ready) = WindAnimationField::from_stored(&wind) {
+        return Ok(ready);
+    }
+    let WindSpec::Historical {
+        date,
+        hour_utc,
+        source,
+        ..
+    } = &wind
+    else {
+        let fetched = resolve_wind_spec(wind, 0.0, 0.0, 0.0, 1.0)?;
+        return WindAnimationField::from_stored(&fetched)
+            .ok_or_else(|| "surface wind grid is incomplete".to_string());
+    };
+    let stamp = animation_stamp(date, *hour_utc, &pairs);
+    if let Ok(cache) = state.wind_anim.lock() {
+        if let Some(hit) = cache.as_ref() {
+            if hit.key == stamp {
+                return Ok(hit.field.clone());
+            }
+        }
+    }
+    let mut regions = Vec::new();
+    let mut source_label = source.clone();
+    for (launch_lat, launch_lon, aim_lat, aim_lon) in &pairs {
+        let resolve_key = historical_resolve_key(
+            date,
+            *hour_utc,
+            *launch_lat,
+            *launch_lon,
+            *aim_lat,
+            *aim_lon,
+        );
+        let resolved = {
+            let cached = state
+                .resolved_wind
+                .lock()
+                .ok()
+                .and_then(|map| map.get(&resolve_key).cloned());
+            if let Some(found) = cached {
+                found
+            } else {
+                let spec = WindSpec::Historical {
+                    date: date.clone(),
+                    hour_utc: *hour_utc,
+                    profiles: Vec::new(),
+                    source: String::new(),
+                };
+                let fetched =
+                    resolve_wind_spec(spec, *launch_lat, *launch_lon, *aim_lat, *aim_lon)?;
+                if let Ok(mut map) = state.resolved_wind.lock() {
+                    map.insert(resolve_key, fetched.clone());
+                }
+                fetched
+            }
+        };
+        if source_label.is_empty() {
+            if let WindSpec::Historical { source, .. } = &resolved {
+                source_label = source.clone();
+            }
+        }
+        let stations = surface_stations(&resolved);
+        if !stations.is_empty() {
+            regions.push(HistoricalAnimationRegion { stations });
+        }
+    }
+    let field = WindAnimationField::Historical {
+        date: date.clone(),
+        hour_utc: *hour_utc,
+        source: source_label,
+        regions,
+    };
+    if let Ok(mut cache) = state.wind_anim.lock() {
+        *cache = Some(WindAnimCache {
+            key: stamp,
+            field: field.clone(),
+        });
+    }
+    Ok(field)
+}
 #[tauri::command]
 fn set_mission_wind(app: AppHandle, state: State<AppState>, wind: WindSpec) -> Result<WindChangeResult, String> {
     let started = Instant::now();
@@ -1889,12 +2095,21 @@ fn set_mission_wind(app: AppHandle, state: State<AppState>, wind: WindSpec) -> R
         let store = state.store.lock().map_err(|e| e.to_string())?;
         (store.generated_regen_jobs(), store.simulate_regen_jobs())
     };
-    let (gen_parsed, settings_wind, compute_wind) = if jobs.is_empty() {
+    let (gen_parsed, settings_wind, compute_wind, resolved) = if jobs.is_empty() {
         let compute = resolve_wind_for_simulate(&wind, &sim_jobs)?;
-        (Vec::new(), compute.without_site_profiles(), compute)
+        let mut resolved = HashMap::new();
+        if let Some((_, origin)) = sim_jobs.first() {
+            let (lat, lon, aim_lat, aim_lon) = sim_pair(origin);
+            remember_spec(&mut resolved, &compute, lat, lon, aim_lat, aim_lon);
+        }
+        (Vec::new(), compute.without_site_profiles(), compute, resolved)
     } else {
         regenerate_generated_with_wind(&jobs, &wind)?
     };
+    if let Ok(mut map) = state.resolved_wind.lock() {
+        map.extend(resolved);
+    }
+    invalidate_wind_anim(&state);
     let (model, tracks, regenerated) = {
         let mut store = state.store.lock().map_err(|e| e.to_string())?;
         store.set_wind(settings_wind);
@@ -1926,7 +2141,7 @@ fn set_mission_wind(app: AppHandle, state: State<AppState>, wind: WindSpec) -> R
 fn regenerate_generated_with_wind(
     jobs: &[(u64, GenerateSpec)],
     wind: &WindSpec,
-) -> Result<(Vec<(u64, ParsedTrack)>, WindSpec, WindSpec), String> {
+) -> Result<(Vec<(u64, ParsedTrack)>, WindSpec, WindSpec, HashMap<String, WindSpec>), String> {
     let mut resolved_wind = wind.without_site_profiles();
     let mut cache: HashMap<String, WindSpec> = HashMap::new();
     let mut prepared = Vec::with_capacity(jobs.len());
@@ -1967,7 +2182,7 @@ fn regenerate_generated_with_wind(
         .first()
         .map(|(_, spec)| spec.wind.clone())
         .unwrap_or_else(|| wind.clone());
-    Ok((parsed, resolved_wind, compute_wind))
+    Ok((parsed, resolved_wind, compute_wind, cache))
 }
 
 fn regenerate_simulated_with_wind(
@@ -2041,9 +2256,13 @@ fn wind_resolve_key(spec: &GenerateSpec) -> String {
     match &spec.wind {
         WindSpec::Off => "off".into(),
         WindSpec::Constant { speed_mps, from_deg } => format!("c:{speed_mps}:{from_deg}"),
-        WindSpec::Historical { date, hour_utc, .. } => format!(
-            "h:{date}:{hour_utc}:{:.5}:{:.5}:{:.5}:{:.5}",
-            spec.launch_lat, spec.launch_lon, spec.aim_lat, spec.aim_lon
+        WindSpec::Historical { date, hour_utc, .. } => historical_resolve_key(
+            date,
+            *hour_utc,
+            spec.launch_lat,
+            spec.launch_lon,
+            spec.aim_lat,
+            spec.aim_lon,
         ),
         WindSpec::Surface { .. } => "gfs-surface".into(),
     }
@@ -2241,6 +2460,8 @@ pub fn run() {
             mission: Mutex::new(MissionSession::default()),
             classify_cancel: Arc::new(AtomicBool::new(false)),
             llama: Arc::new(LlamaServerPool::new()),
+            wind_anim: Mutex::new(None),
+            resolved_wind: Mutex::new(HashMap::new()),
         })
         .invoke_handler(tauri::generate_handler![
             load_files,
@@ -2299,7 +2520,8 @@ pub fn run() {
             save_mission_as,
             rename_mission,
             set_mission_ui,
-            set_mission_wind
+            set_mission_wind,
+            wind_animation_field
         ])
         .build(tauri::generate_context!())
         .expect("error while building FauxRRT")
@@ -2310,6 +2532,71 @@ pub fn run() {
                 }
             }
         });
+}
+
+#[cfg(test)]
+mod wind_animation_tests {
+    use super::historical_animation_pairs;
+    use crate::generate::GenerateSpec;
+    use crate::parse::ParsedTrack;
+    use crate::schema::DetectedSchema;
+    use crate::store::Store;
+    use crate::wind::WindSpec;
+
+    #[test]
+    fn historical_pairs_follow_the_generated_corridor() {
+        let mut store = Store::new();
+        let obj = store.create_object("Booster".into());
+        let mode = store.ensure_named_mode(obj.id, "Nominal").unwrap();
+        let spec = GenerateSpec {
+            launch_lat: 32.4,
+            launch_lon: -106.4,
+            launch_alt_m: 0.0,
+            aim_lat: 34.0,
+            aim_lon: -99.0,
+            aim_alt_m: 0.0,
+            ballistic_coeff: 2500.0,
+            burnout_alt_m: 80_000.0,
+            failure_count: 0,
+            wind: WindSpec::Off,
+        };
+        store.set_generate_spec(obj.id, spec.clone()).unwrap();
+        let track = ParsedTrack::from_lla(
+            DetectedSchema::generated(),
+            Some(vec![0.0, 1.0]),
+            vec![-106.4, 32.4, 100.0, -99.0, 34.0, 0.0],
+        );
+        let inserted = store
+            .insert_parsed_into(
+                vec![("Nominal-01".into(), None, track)],
+                Some(obj.id),
+                Some(mode),
+            )
+            .unwrap();
+        store.set_track_generate(inserted[0].id, spec);
+        let file = ParsedTrack::from_lla(
+            DetectedSchema::generated(),
+            Some(vec![0.0, 1.0]),
+            vec![-80.0, 25.0, 10.0, -79.0, 25.2, 0.0],
+        );
+        store
+            .insert_parsed_into(
+                vec![(
+                    "file.csv".into(),
+                    Some(std::path::PathBuf::from("file.csv")),
+                    file,
+                )],
+                Some(obj.id),
+                Some(mode),
+            )
+            .unwrap();
+        let pairs = historical_animation_pairs(&store);
+        assert_eq!(pairs.len(), 1, "{pairs:?}");
+        assert!((pairs[0].0 - 32.4).abs() < 1e-9);
+        assert!((pairs[0].1 + 106.4).abs() < 1e-9);
+        assert!((pairs[0].2 - 34.0).abs() < 1e-9);
+        assert!((pairs[0].3 + 99.0).abs() < 1e-9);
+    }
 }
 
 #[cfg(test)]

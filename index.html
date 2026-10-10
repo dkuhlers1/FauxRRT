@@ -146,21 +146,18 @@
                 <button type="button" data-wind="off" class="compact">Off</button>
                 <button type="button" data-wind="constant" class="ghost compact">Constant</button>
                 <button type="button" data-wind="historical" class="ghost compact">Historical</button>
-                <button type="button" data-wind="surface" class="ghost compact" title="Current GFS 10 m wind, the same field as the globe Surface wind layer">Surface</button>
+                <button type="button" data-wind="surface" class="ghost compact" title="Current GFS 10 m wind. The globe animates this same field.">Surface</button>
               </div>
               <div id="wind-fields"></div>
             </section>
             <section class="env-block" id="surface-wind-block">
-              <div class="muted method-label">Surface wind map</div>
-              <label class="inline" title="Animated GFS 10 m surface wind. Uncheck to remove it.">
-                <input type="checkbox" id="show-surface-wind" /> Show GFS 10 m layer
-              </label>
-              <label class="inline" title="Opacity of the surface wind streaks. Lower values keep the map, trajectories, and impacts visible.">
+              <div class="muted method-label">Wind on the globe</div>
+              <label class="inline" title="Opacity of the wind streaks. Lower values keep the map, trajectories, and impacts visible.">
                 Opacity
-                <input type="range" id="surface-wind-alpha" min="0.05" max="1" step="0.05" value="0.4" aria-label="Surface wind opacity" />
+                <input type="range" id="surface-wind-alpha" min="0.05" max="1" step="0.05" value="0.4" aria-label="Wind opacity" />
                 <span id="surface-wind-alpha-readout">40%</span>
               </label>
-              <p class="muted wind-hint">Same 10°×15° GFS 10 m field as mission wind Surface. The layer draws it on the map; Surface mission wind samples it along trajectories.</p>
+              <p class="muted wind-hint">Streaks follow the mission wind. Surface animates the GFS 10 m field. Constant uses that vector everywhere. Historical is drawn only over the sampled corridor or profile. Off removes the streaks.</p>
             </section>
             <section class="env-block" id="dof6-env">
               <div class="muted method-label">6DOF atmosphere</div>

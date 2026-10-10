@@ -60,6 +60,75 @@ pub struct WindStation {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SurfaceStation {
+    pub lat: f64,
+    pub lon: f64,
+    pub east_mps: f64,
+    pub north_mps: f64,
+}
+
+/// What the globe particle layer should draw for the selected mission wind.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum WindAnimationField {
+    Off,
+    Constant { speed_mps: f64, from_deg: f64 },
+    Surface {
+        time: String,
+        source: String,
+        lats: Vec<f64>,
+        lons: Vec<f64>,
+        east_mps: Vec<f64>,
+        north_mps: Vec<f64>,
+    },
+    Historical {
+        date: String,
+        hour_utc: u8,
+        source: String,
+        regions: Vec<HistoricalAnimationRegion>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct HistoricalAnimationRegion {
+    pub stations: Vec<SurfaceStation>,
+}
+
+impl WindAnimationField {
+    pub fn from_stored(wind: &WindSpec) -> Option<Self> {
+        match wind {
+            WindSpec::Off => Some(Self::Off),
+            WindSpec::Constant { speed_mps, from_deg } => Some(Self::Constant {
+                speed_mps: *speed_mps,
+                from_deg: *from_deg,
+            }),
+            WindSpec::Surface {
+                time,
+                source,
+                lats,
+                lons,
+                east_mps,
+                north_mps,
+            } if lats.len() >= 2
+                && lons.len() >= 2
+                && east_mps.len() == lats.len() * lons.len()
+                && north_mps.len() == east_mps.len() =>
+            {
+                Some(Self::Surface {
+                    time: time.clone(),
+                    source: source.clone(),
+                    lats: lats.clone(),
+                    lons: lons.clone(),
+                    east_mps: east_mps.clone(),
+                    north_mps: north_mps.clone(),
+                })
+            }
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WindLevel {
     pub alt_m: f64,
     pub east_mps: f64,
@@ -124,9 +193,20 @@ pub fn enu_to_meteo(east_mps: f64, north_mps: f64) -> (f64, f64) {
 /// Off and constant wind are used as stored. Historical soundings and the Surface
 /// GFS grid are fetched only when that selection has no profiles or grid yet.
 /// Generated 3DOF flights resolve the same selection along launch and aim.
-pub fn prepare_flight_wind(wind: &WindSpec, lat: f64, lon: f64) -> Result<WindSpec, String> {
+/// Launch plus a short aim offset. Historical globe streaks for a single
+/// profile use this same pair, so they cover the sounding and not the globe.
+pub fn profile_pair(lat: f64, lon: f64) -> (f64, f64, f64, f64) {
     let aim_lon = if lon <= 179.6 { lon + 0.4 } else { lon - 0.4 };
-    resolve_wind_spec(wind.clone(), lat, lon, lat, aim_lon)
+    (lat, lon, lat, aim_lon)
+}
+
+pub fn historical_resolve_key(date: &str, hour_utc: u8, launch_lat: f64, launch_lon: f64, aim_lat: f64, aim_lon: f64) -> String {
+    format!("h:{date}:{hour_utc}:{launch_lat:.5}:{launch_lon:.5}:{aim_lat:.5}:{aim_lon:.5}")
+}
+
+pub fn prepare_flight_wind(wind: &WindSpec, lat: f64, lon: f64) -> Result<WindSpec, String> {
+    let (launch_lat, launch_lon, aim_lat, aim_lon) = profile_pair(lat, lon);
+    resolve_wind_spec(wind.clone(), launch_lat, launch_lon, aim_lat, aim_lon)
 }
 
 pub fn wind_enu(wind: &WindSpec, lat: f64, lon: f64, alt_m: f64) -> (f64, f64) {
@@ -247,6 +327,26 @@ fn interpolate_stations(stations: &[WindStation], lat: f64, lon: f64, alt_m: f64
         wsum += w;
     }
     (east / wsum, north / wsum)
+}
+
+/// Surface east/north of each historical station, using the same level
+/// sample trajectories use at the ground.
+pub fn surface_stations(wind: &WindSpec) -> Vec<SurfaceStation> {
+    let WindSpec::Historical { profiles, .. } = wind else {
+        return Vec::new();
+    };
+    profiles
+        .iter()
+        .map(|station| {
+            let (east_mps, north_mps) = sample_station(station, 0.0);
+            SurfaceStation {
+                lat: station.lat,
+                lon: station.lon,
+                east_mps,
+                north_mps,
+            }
+        })
+        .collect()
 }
 
 fn sample_station(station: &WindStation, alt_m: f64) -> (f64, f64) {
@@ -835,5 +935,40 @@ mod tests {
         let prepared = prepare_flight_wind(&surface, 32.4, -106.4).unwrap();
         let (east, _) = wind_enu(&prepared, 32.4, -106.4, 40_000.0);
         assert!((east - 16.0).abs() < 1e-6, "{east}");
+    }
+
+    #[test]
+    fn profile_pair_is_a_short_local_offset() {
+        let (lat, lon, aim_lat, aim_lon) = profile_pair(32.0, -106.0);
+        assert!((lat - 32.0).abs() < 1e-12);
+        assert!((lon + 106.0).abs() < 1e-12);
+        assert!((aim_lat - 32.0).abs() < 1e-12);
+        assert!((aim_lon + 105.6).abs() < 1e-12);
+        let (_, _, _, wrapped) = profile_pair(10.0, 179.8);
+        assert!((wrapped - 179.4).abs() < 1e-12);
+    }
+
+    #[test]
+    fn surface_stations_use_the_ground_level_of_the_profile() {
+        let wind = WindSpec::Historical {
+            date: "2024-06-01".into(),
+            hour_utc: 12,
+            source: "test".into(),
+            profiles: vec![WindStation {
+                lat: 32.4,
+                lon: -106.4,
+                levels: vec![
+                    WindLevel { alt_m: 10.0, east_mps: 8.0, north_mps: 1.0 },
+                    WindLevel { alt_m: 10_000.0, east_mps: 40.0, north_mps: -5.0 },
+                ],
+            }],
+        };
+        let stations = surface_stations(&wind);
+        assert_eq!(stations.len(), 1);
+        assert!((stations[0].lat - 32.4).abs() < 1e-12);
+        assert!((stations[0].lon + 106.4).abs() < 1e-12);
+        assert!((stations[0].east_mps - 8.0).abs() < 1e-12);
+        assert!((stations[0].north_mps - 1.0).abs() < 1e-12);
+        assert!(surface_stations(&WindSpec::Off).is_empty());
     }
 }

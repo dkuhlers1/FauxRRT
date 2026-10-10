@@ -88,6 +88,7 @@ export function fieldFromSamples(spec, samples) {
     throw new Error("GFS response was missing most of the 10 m wind grid");
   }
   return {
+    kind: "grid",
     lats: Float64Array.from(spec.lats),
     lons: Float64Array.from(spec.lons),
     u,
@@ -96,14 +97,275 @@ export function fieldFromSamples(spec, samples) {
     ny,
     step: spec.step,
     global,
+    strict: false,
     time,
     source: "Open-Meteo GFS",
     level: "10 m",
     endpoint: GFS_SURFACE_ENDPOINT,
+    legend: {
+      title: "Surface wind",
+      meta: `GFS 10 m · ${(time || "current").replace("T", " ")} UTC`,
+      source: "Open-Meteo GFS · directional speed",
+    },
   };
 }
 
+/**
+ * Globe streaks for a mission-wind Surface grid already stored in east/north
+ * components. This does not fetch GFS again.
+ */
+export function surfaceFieldFromComponents({ lats, lons, east_mps: east, north_mps: north, time, source }) {
+  const latArr = Float64Array.from(lats || []);
+  const lonArr = Float64Array.from(lons || []);
+  const ny = latArr.length;
+  const nx = lonArr.length;
+  if (ny < 2 || nx < 2 || !east || !north || east.length !== nx * ny || north.length !== east.length) {
+    throw new Error("surface wind grid is incomplete");
+  }
+  const dlat = latArr[1] - latArr[0];
+  const dlon = lonArr[1] - lonArr[0];
+  if (!(dlat > 0) || !(dlon > 0)) throw new Error("wind grid axes must increase");
+  const global = Math.abs(nx * dlon - 360) < 1e-3;
+  const when = time || "";
+  return {
+    kind: "grid",
+    lats: latArr,
+    lons: lonArr,
+    u: Float32Array.from(east),
+    v: Float32Array.from(north),
+    nx,
+    ny,
+    step: dlat,
+    global,
+    strict: false,
+    time: when,
+    source: source || "Open-Meteo GFS",
+    level: "10 m",
+    endpoint: GFS_SURFACE_ENDPOINT,
+    legend: {
+      title: "Surface wind",
+      meta: `GFS 10 m · ${(when || "current").replace("T", " ")} UTC`,
+      source: "Open-Meteo GFS · directional speed",
+    },
+  };
+}
+
+/** True only when Surface was selected without the grid the mission already holds. */
+export function surfaceAnimationNeedsFetch(request) {
+  if (!request || request.type !== "surface") return false;
+  const nLat = request.lats?.length || 0;
+  const nLon = request.lons?.length || 0;
+  const n = request.east_mps?.length || 0;
+  return !(nLat >= 2 && nLon >= 2 && n === nLat * nLon && request.north_mps?.length === n);
+}
+
+export function constantWindField(speedMps, fromDeg) {
+  const speed = Number(speedMps);
+  const from = Number(fromDeg);
+  const [u, v] = meteoToUv(Number.isFinite(speed) ? speed : 0, Number.isFinite(from) ? from : 0);
+  const shownSpeed = Number.isFinite(speed) ? speed : 0;
+  const shownFrom = Number.isFinite(from) ? from : 0;
+  return {
+    kind: "constant",
+    global: true,
+    u,
+    v,
+    speed: Math.hypot(u, v),
+    legend: {
+      title: "Constant wind",
+      meta: `${trimNum(shownSpeed)} m/s from ${trimNum(shownFrom)}°`,
+      source: "Same vector everywhere",
+    },
+  };
+}
+
+/** Minimum pad around a profile or corridor, in degrees. A point sounding stays local. */
+export const HISTORICAL_PAD_DEG = 0.6;
+
+function trimNum(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return "0";
+  return String(Math.round(n * 10) / 10);
+}
+
+function miss(out) {
+  out.u = NaN;
+  out.v = NaN;
+  out.speed = NaN;
+  out.miss = true;
+  return out;
+}
+
+/** Short-way longitude offsets from `ref`, in degrees. */
+function lonOffset(lon, ref) {
+  let d = lon - ref;
+  if (d > 180) d -= 360;
+  if (d < -180) d += 360;
+  return d;
+}
+
+export function boundsFromStations(stations, padDeg = HISTORICAL_PAD_DEG) {
+  if (!stations?.length) return null;
+  const ref = stations[0].lon;
+  let minD = 0;
+  let maxD = 0;
+  let minLat = stations[0].lat;
+  let maxLat = stations[0].lat;
+  for (const station of stations) {
+    const d = lonOffset(station.lon, ref);
+    if (d < minD) minD = d;
+    if (d > maxD) maxD = d;
+    if (station.lat < minLat) minLat = station.lat;
+    if (station.lat > maxLat) maxLat = station.lat;
+  }
+  const padLat = Math.max(padDeg, (maxLat - minLat) * 0.25);
+  const padLon = Math.max(padDeg, (maxD - minD) * 0.25);
+  return {
+    ref,
+    minD: minD - padLon,
+    maxD: maxD + padLon,
+    minLat: Math.max(-80, minLat - padLat),
+    maxLat: Math.min(80, maxLat + padLat),
+    spanLat: maxLat - minLat,
+    spanLon: maxD - minD,
+  };
+}
+
+export function boundsContain(bounds, lat, lon) {
+  if (!bounds) return false;
+  if (lat < bounds.minLat || lat > bounds.maxLat) return false;
+  const d = lonOffset(lon, bounds.ref);
+  return d >= bounds.minD && d <= bounds.maxD;
+}
+
+function haversineM(lat1, lon1, lat2, lon2) {
+  const r = 6_371_000;
+  const p1 = (lat1 * Math.PI) / 180;
+  const p2 = (lat2 * Math.PI) / 180;
+  const dp = ((lat2 - lat1) * Math.PI) / 180;
+  const dl = ((lon2 - lon1) * Math.PI) / 180;
+  const a = Math.sin(dp / 2) ** 2 + Math.cos(p1) * Math.cos(p2) * Math.sin(dl / 2) ** 2;
+  return 2 * r * Math.asin(Math.min(1, Math.sqrt(a)));
+}
+
+/** Inverse-distance blend of surface station components. Same weights as trajectory sampling. */
+export function sampleStationsInto(stations, lat, lon, out) {
+  if (!stations?.length) return miss(out);
+  if (stations.length === 1) {
+    out.u = stations[0].east;
+    out.v = stations[0].north;
+    out.speed = Math.hypot(out.u, out.v);
+    out.miss = false;
+    return out;
+  }
+  let wsum = 0;
+  let east = 0;
+  let north = 0;
+  for (const station of stations) {
+    const dist = Math.max(1000, haversineM(lat, lon, station.lat, station.lon));
+    const w = 1 / (dist * dist);
+    east += w * station.east;
+    north += w * station.north;
+    wsum += w;
+  }
+  out.u = east / wsum;
+  out.v = north / wsum;
+  out.speed = Math.hypot(out.u, out.v);
+  out.miss = false;
+  return out;
+}
+
+function regionSpanDeg(region) {
+  return Math.max(region.bounds?.spanLat || 0, region.bounds?.spanLon || 0);
+}
+
+function historicalLegend(spec, regions) {
+  const hour = String(spec.hour_utc ?? 0).padStart(2, "0");
+  const when = `${spec.date || "historical"} ${hour}Z`;
+  if (spec.loading) {
+    return { title: "Historical wind", meta: `${when} UTC`, source: "Loading the sampled wind…" };
+  }
+  if (spec.error) {
+    return { title: "Historical wind", meta: `${when} UTC`, source: String(spec.error) };
+  }
+  if (!regions.length) {
+    return {
+      title: "Historical wind",
+      meta: `${when} UTC`,
+      source: "No sampled corridor yet. Streaks appear where trajectories use this wind.",
+    };
+  }
+  const local = regions.every((region) => regionSpanDeg(region) < 1);
+  const where = regions.length === 1
+    ? (local ? "Local sounding" : "Sampled corridor")
+    : `${regions.length} sampled areas`;
+  const src = spec.source ? `${spec.source} · not a global map` : "Not a global map";
+  return { title: "Historical wind", meta: `${where} · ${when} UTC`, source: src };
+}
+
+export function historicalWindField(spec = {}) {
+  const regions = (spec.regions || []).map((region) => {
+    const stations = (region.stations || []).map((station) => ({
+      lat: Number(station.lat),
+      lon: Number(station.lon),
+      east: Number(station.east_mps ?? station.east),
+      north: Number(station.north_mps ?? station.north),
+    })).filter((station) => Number.isFinite(station.lat) && Number.isFinite(station.lon) && Number.isFinite(station.east) && Number.isFinite(station.north));
+    return { stations, bounds: boundsFromStations(stations) };
+  }).filter((region) => region.stations.length && region.bounds);
+  return {
+    kind: "historical",
+    global: false,
+    date: spec.date || "",
+    hour_utc: spec.hour_utc ?? 0,
+    source: spec.source || "",
+    regions,
+    loading: Boolean(spec.loading),
+    error: spec.error || "",
+    legend: historicalLegend(spec, regions),
+  };
+}
+
+export function resolveAnimationField(request, signal) {
+  if (!request || request.type === "off") return Promise.resolve(null);
+  if (request.type === "constant") {
+    return Promise.resolve(constantWindField(request.speed_mps, request.from_deg));
+  }
+  if (request.type === "historical") return Promise.resolve(historicalWindField(request));
+  if (request.type === "surface") {
+    if (!surfaceAnimationNeedsFetch(request)) {
+      return Promise.resolve(surfaceFieldFromComponents(request));
+    }
+    return loadGfsSurfaceField(signal);
+  }
+  return Promise.resolve(null);
+}
+
 export function sampleWindInto(grid, lat, lon, out) {
+  if (!grid || grid.kind === "off") return miss(out);
+  if (grid.kind === "constant") {
+    out.u = grid.u;
+    out.v = grid.v;
+    out.speed = grid.speed;
+    out.miss = false;
+    return out;
+  }
+  if (grid.kind === "historical") {
+    let best = null;
+    let bestDist = Infinity;
+    for (const region of grid.regions || []) {
+      if (!boundsContain(region.bounds, lat, lon)) continue;
+      for (const station of region.stations) {
+        const dist = haversineM(lat, lon, station.lat, station.lon);
+        if (dist < bestDist) {
+          bestDist = dist;
+          best = region;
+        }
+      }
+    }
+    if (!best) return miss(out);
+    return sampleStationsInto(best.stations, lat, lon, out);
+  }
   const { lats, lons, u, v, nx, ny } = grid;
   const dlat = lats[1] - lats[0];
   const dlon = lons[1] - lons[0];
@@ -129,6 +391,7 @@ export function sampleWindInto(grid, lat, lon, out) {
   out.u = u[i00] * sx * sy + u[i10] * tx * sy + u[i01] * sx * ty + u[i11] * tx * ty;
   out.v = v[i00] * sx * sy + v[i10] * tx * sy + v[i01] * sx * ty + v[i11] * tx * ty;
   out.speed = Math.hypot(out.u, out.v);
+  out.miss = false;
   return out;
 }
 
