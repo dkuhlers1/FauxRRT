@@ -28,8 +28,8 @@ import {
   setSiteChangeHandler,
   setSiteMarkers,
   setStateMarker,
+  setMissionWindAnimation,
   setSurfaceWindAlpha,
-  setSurfaceWindVisible,
   setTerminateHull,
   setTerminateHullVisible,
   setRiskIsolines,
@@ -161,7 +161,6 @@ const els = {
   vesselTrials: document.getElementById("vessel-trials"),
   vesselStatus: document.getElementById("vessel-status"),
   showBoats: document.getElementById("show-boats"),
-  showSurfaceWind: document.getElementById("show-surface-wind"),
   surfaceWindAlpha: document.getElementById("surface-wind-alpha"),
   surfaceWindAlphaReadout: document.getElementById("surface-wind-alpha-readout"),
   showIipBoundary: document.getElementById("show-iip-boundary"),
@@ -210,9 +209,6 @@ for (const input of [els.vesselKe, els.vesselArea, els.vesselPerim, els.vesselTr
 els.showBoats?.addEventListener("change", () => {
   setBoatsVisible(els.showBoats.checked);
   persistMissionUi();
-});
-els.showSurfaceWind?.addEventListener("change", () => {
-  applySurfaceWind(Boolean(els.showSurfaceWind.checked));
 });
 els.surfaceWindAlpha?.addEventListener("input", () => {
   const alpha = setSurfaceWindAlpha(els.surfaceWindAlpha.value);
@@ -2033,20 +2029,92 @@ function requireModeNameFor(objectId) {
   return modeName;
 }
 
-function applySurfaceWind(on) {
-  return setSurfaceWindVisible(on, (status) => {
-    const loading = els.progress.textContent.startsWith("Loading GFS");
-    if (!status || status.phase === "off" || status.phase === "ready") {
-      if (loading) els.progress.textContent = "";
-      return;
-    }
-    if (status.phase === "loading") els.progress.textContent = "Loading GFS 10 m surface wind…";
-    else if (status.phase === "error") els.progress.textContent = `Surface wind unavailable: ${status.message}`;
-  }).then((result) => {
-    if (on && result && result.ok === false && !result.aborted && els.showSurfaceWind) {
-      els.showSurfaceWind.checked = false;
-    }
-    return result;
+let windShownStamp = "";
+let windRequestStamp = "";
+
+function globeWindStamp() {
+  const w = missionWind;
+  const sites = (riskModel.objects || []).map((obj) => {
+    const g = obj.generate || {};
+    const env = obj.rocketpy?.env || {};
+    const tracks = (obj.modes || []).reduce((n, mode) => n + (mode.tracks?.length || 0), 0);
+    return [
+      obj.id,
+      tracks,
+      g.launch_lat,
+      g.launch_lon,
+      g.aim_lat,
+      g.aim_lon,
+      env.latitude,
+      env.longitude,
+    ].join(",");
+  }).join(";");
+  const grid = Array.isArray(w.east_mps) ? w.east_mps.length : 0;
+  return [
+    w.type,
+    w.speed_mps,
+    w.from_deg,
+    w.date,
+    w.hour_utc,
+    w.time,
+    grid,
+    sites,
+    (riskModel.unassigned || []).length,
+  ].join("|");
+}
+
+function queueGlobeWind() {
+  const stamp = globeWindStamp();
+  if (stamp === windShownStamp || stamp === windRequestStamp) return;
+  windRequestStamp = stamp;
+  const type = missionWind.type || "off";
+  if (type === "off") {
+    windShownStamp = stamp;
+    setMissionWindAnimation({ type: "off" });
+    return;
+  }
+  if (type === "constant") {
+    windShownStamp = stamp;
+    setMissionWindAnimation({
+      type: "constant",
+      speed_mps: missionWind.speed_mps,
+      from_deg: missionWind.from_deg,
+    });
+    return;
+  }
+  if (type === "surface") {
+    windShownStamp = stamp;
+    setMissionWindAnimation({
+      type: "surface",
+      time: missionWind.time,
+      source: missionWind.source,
+      lats: missionWind.lats,
+      lons: missionWind.lons,
+      east_mps: missionWind.east_mps,
+      north_mps: missionWind.north_mps,
+    });
+    return;
+  }
+  setMissionWindAnimation({
+    type: "historical",
+    loading: true,
+    date: missionWind.date,
+    hour_utc: missionWind.hour_utc,
+    source: missionWind.source,
+  });
+  invoke("wind_animation_field").then((field) => {
+    if (windRequestStamp !== stamp || missionWind.type !== "historical") return;
+    windShownStamp = stamp;
+    setMissionWindAnimation(field || { type: "off" });
+  }).catch((err) => {
+    if (windRequestStamp !== stamp || missionWind.type !== "historical") return;
+    windRequestStamp = "";
+    setMissionWindAnimation({
+      type: "historical",
+      date: missionWind.date,
+      hour_utc: missionWind.hour_utc,
+      error: String(err),
+    });
   });
 }
 
@@ -2111,9 +2179,19 @@ function applyMissionWind(wind) {
   if (w.type === "surface") {
     missionWind.time = w.time || "";
     missionWind.source = w.source || "";
+    missionWind.lats = Array.isArray(w.lats) ? w.lats : [];
+    missionWind.lons = Array.isArray(w.lons) ? w.lons : [];
+    missionWind.east_mps = Array.isArray(w.east_mps) ? w.east_mps : [];
+    missionWind.north_mps = Array.isArray(w.north_mps) ? w.north_mps : [];
+  } else {
+    missionWind.lats = [];
+    missionWind.lons = [];
+    missionWind.east_mps = [];
+    missionWind.north_mps = [];
   }
   if (!missionWind.date) missionWind.date = defaultWindDate();
   renderWindPanel();
+  queueGlobeWind();
 }
 
 function renderWindPanel() {
@@ -2147,7 +2225,7 @@ function renderWindPanel() {
       ? `${escapeHtml(String(missionWind.time).replace("T", " "))} UTC`
       : "the current GFS hour";
     const src = missionWind.source ? `${escapeHtml(missionWind.source)} · ` : "";
-    els.windFields.innerHTML = `<div class="muted wind-hint">${src}${when}. This is the same 10°×15° GFS 10 m field as the globe Surface wind layer. Trajectories sample it by latitude and longitude, not only as a map overlay. Switching away regenerates generated trajectories.</div>`;
+    els.windFields.innerHTML = `<div class="muted wind-hint">${src}${when}. The globe animates this same 10°×15° GFS 10 m field. Trajectories sample it by latitude and longitude. Switching away regenerates generated trajectories.</div>`;
   } else {
     els.windFields.innerHTML = `<div class="muted wind-hint">No added wind. Atmosphere co-rotates with Earth. Switching away from this regenerates generated trajectories.</div>`;
   }
@@ -2169,10 +2247,6 @@ function bindWindPanel() {
         missionWind.date = defaultWindDate();
       }
       renderWindPanel();
-      if (missionWind.type === "surface" && els.showSurfaceWind && !els.showSurfaceWind.checked) {
-        els.showSurfaceWind.checked = true;
-        await applySurfaceWind(true);
-      }
       persistMissionWind();
     });
   });

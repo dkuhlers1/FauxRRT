@@ -1,4 +1,4 @@
-import { setSurfaceWindAlpha, setSurfaceWindEnabled } from "./wind-layer.js";
+import { setMissionWindAnimation as startMissionWind, setSurfaceWindAlpha } from "./wind-layer.js";
 
 export { setSurfaceWindAlpha };
 
@@ -449,12 +449,12 @@ export function setSiteMarkers(launch, aim) {
   requestRender();
 }
 
-export function setSurfaceWindVisible(enabled, onStatus) {
-  if (!viewer) {
+export function setMissionWindAnimation(request, onStatus) {
+  if (!viewer && request && request.type && request.type !== "off") {
     onStatus?.({ phase: "error", message: "Globe is not ready" });
     return Promise.resolve({ ok: false, message: "Globe is not ready" });
   }
-  return setSurfaceWindEnabled(viewer, enabled, onStatus);
+  return startMissionWind(viewer, request, onStatus);
 }
 
 export function setImagery(kind) {
