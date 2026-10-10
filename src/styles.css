@@ -876,12 +876,18 @@ input[type="number"], input[type="text"] {
   margin-right: 8px;
   font-family: "Segoe UI", "IBM Plex Sans", sans-serif;
 }
-.schema-data {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-  padding: 8px 4px;
-  background: rgba(61, 158, 255, 0.08);
+.schema-file-scroll {
+  overflow-x: auto;
+  max-width: 100%;
+}
+.schema-columns {
+  display: grid;
+  grid-auto-flow: column;
+  grid-auto-columns: max-content;
+  gap: 8px;
+  width: max-content;
+  align-items: start;
+  padding: 4px 0;
 }
 .schema-cell {
   display: flex;
@@ -892,7 +898,11 @@ input[type="number"], input[type="text"] {
   padding: 3px 6px;
   background: rgba(11, 16, 22, 0.72);
 }
-.schema-cell-text { color: var(--text); font-weight: 600; }
+.schema-cell-text {
+  color: var(--text);
+  font-weight: 600;
+  white-space: pre;
+}
 .schema-cell label {
   display: flex;
   flex-direction: column;
@@ -901,7 +911,7 @@ input[type="number"], input[type="text"] {
   font-family: "Segoe UI", "IBM Plex Sans", sans-serif;
   font-size: 10px;
 }
-.schema-cell select { max-width: 9.5rem; font-size: 11px; }
+.schema-cell select { width: 100%; max-width: none; font-size: 11px; }
 .schema-role { color: var(--accent); font-size: 10px; font-family: "Segoe UI", "IBM Plex Sans", sans-serif; }
 .schema-card {
   position: absolute;

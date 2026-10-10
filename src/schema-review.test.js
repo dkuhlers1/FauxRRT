@@ -138,7 +138,8 @@ test("review markup marks header lines and column roles on the file text", () =>
   }), 0, 1);
   assert.match(html, /data-role="file-text"/);
   assert.match(html, /<pre class="schema-rawline"># flight<\/pre>/);
-  assert.match(html, /<pre class="schema-rawline">0,1,2,3<\/pre>/);
+  assert.match(html, /schema-cell-text">0</);
+  assert.doesNotMatch(html, /<pre class="schema-rawline">0,1,2,3<\/pre>/);
   assert.match(html, /<pre class="schema-rawline">1,4,5,6<\/pre>/);
   assert.match(html, /data-line-kind="header"/);
   assert.match(html, /data-role="column-marks"/);
@@ -177,7 +178,8 @@ test("editor requires an origin for a local frame that has none", () => {
   const html = editorHtml(pending, 0, 1);
   assert.match(html, /data-field="header"/);
   assert.match(html, /data-field="frame"/);
-  assert.match(html, /<pre class="schema-rawline">time,x,y,z<\/pre>/);
+  assert.match(html, /schema-cell-text">time</);
+  assert.doesNotMatch(html, /<pre class="schema-rawline">time,x,y,z<\/pre>/);
   assert.match(html, /<pre class="schema-rawline">0,1,2,3<\/pre>/);
   assert.match(html, /Origin latitude/);
   assert.doesNotMatch(html, /Correct this schema/);
@@ -230,6 +232,51 @@ test("a rejected load command stays visible instead of becoming a blank object",
   );
   assert.equal(loadFailureMessage({ message: "commit_schema_assignments not allowed" }), "commit_schema_assignments not allowed");
   assert.equal(loadFailureMessage({}), "The trajectory load failed.");
+});
+
+test("a header cell and its role control share one column", () => {
+  const html = reviewCardHtml(group("aligned", {
+    files: [{
+      path: "/data/eglin_keywest_6dof.csv",
+      name: "eglin_keywest_6dof.csv",
+      excerpt: "time,lat,lon,alt\n0.0000,30.483200,-86.525400,26.00\n0.1000,30.483199,-86.525399,26.27\n",
+      origin_lat: null,
+      origin_lon: null,
+      origin_alt_m: null,
+    }],
+    classification: {
+      header_lines: 1,
+      delimiter: ",",
+      frames: { position: "LLA" },
+      units: { position: "m" },
+      columns: { col_0: "time", col_1: "pos_lat", col_2: "pos_lon", col_3: "pos_alt" },
+      column_units: { col_1: "deg", col_2: "deg", col_3: "m" },
+      confidence_score: 0.95,
+      unsupported_flag: false,
+      reasoning: "Read from the header.",
+    },
+  }), 0, 1);
+  const columns = [...html.matchAll(/<div class="schema-cell" data-column="(\d+)">([\s\S]*?)<\/div>/g)];
+  assert.equal(columns.length, 4);
+  const lat = columns.find((match) => match[1] === "1")[2];
+  assert.match(lat, /schema-cell-text">lat</);
+  assert.match(lat, /data-col="1" data-field="role"/);
+  assert.match(lat, /data-field="unit"/);
+  assert.match(lat, /data-field="frame"/);
+  assert.doesNotMatch(html, /<pre class="schema-rawline">time,lat,lon,alt<\/pre>/);
+  assert.match(html, /<pre class="schema-rawline">0\.0000,30\.483200,-86\.525400,26\.00<\/pre>/);
+  const scrollStart = html.indexOf('class="schema-file-scroll"');
+  const originAt = html.indexOf('data-role="origin-fields"');
+  const scrolled = html.slice(scrollStart, originAt);
+  assert.match(scrolled, /data-role="column-marks"/);
+  assert.match(scrolled, /schema-cell-text">lat</);
+  assert.match(scrolled, /schema-rawline/);
+  const css = fs.readFileSync(new URL("./styles.css", import.meta.url), "utf8");
+  assert.match(css, /\.schema-columns\s*\{[^}]*grid-auto-flow:\s*column/);
+  assert.match(css, /\.schema-columns\s*\{[^}]*grid-auto-columns:\s*max-content/);
+  assert.match(css, /\.schema-columns\s*\{[^}]*width:\s*max-content/);
+  assert.match(css, /\.schema-file-scroll\s*\{[^}]*overflow-x:\s*auto/);
+  assert.doesNotMatch(css, /\.schema-columns\s*\{[^}]*flex-wrap:\s*wrap/);
 });
 
 test("review markup is the first screen and LLA units are per column", () => {
