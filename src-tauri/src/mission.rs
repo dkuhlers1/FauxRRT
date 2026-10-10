@@ -113,6 +113,9 @@ pub struct MissionUi {
     pub show_terminate_boundary: bool,
     #[serde(default = "default_true")]
     pub show_vessel_risk: bool,
+    /// Order-of-magnitude contours of the vessel Risk(g) field.
+    #[serde(default = "default_true")]
+    pub show_risk_isolines: bool,
 }
 
 impl Default for MissionUi {
@@ -127,6 +130,7 @@ impl Default for MissionUi {
             show_iip_boundary: false,
             show_terminate_boundary: false,
             show_vessel_risk: true,
+            show_risk_isolines: true,
         }
     }
 }
