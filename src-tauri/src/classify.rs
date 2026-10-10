@@ -56,26 +56,37 @@ lat, latitude, lon, longitude, alt, and altitude are LLA position: pos_lat, pos_
 x-ecr, y-ecr, and z-ecr are Earth-centered rotating position, which is ECEF: pos_x, pos_y, and pos_z. Match each column by the axis in its name. z-ecr may appear before y-ecr.
 north, east, and down are NED: pos_n, pos_e, and pos_d.
 Return that identification only. Do not convert coordinates into another frame.
-Always include position, velocity, acceleration, and orientation under units. Include mass under units only when a column role is mass.
+
+frames.position, frames.velocity, and frames.acceleration are separate coordinate systems. They may differ. Position in ECEF with velocity in NED is valid. Omit frames.velocity when the file has no velocity columns. Omit frames.acceleration when the file has no acceleration columns. Do not use one coordinate system for the whole file.
+Always include position under units. Include velocity, acceleration, orientation, and mass under units only when those columns exist.
 
 delimiter is one of "," , "\t" , ";" , "|" , or "whitespace".
 header_lines is how many leading lines to skip before the first data row.
-Set unsupported_flag to true when the coordinate system or any unit is outside the supported list. Do not rename an unsupported frame or unit into a supported one.
+Set unsupported_flag to true when a coordinate system or any unit is outside the supported list. Do not rename an unsupported frame or unit into a supported one.
 Set confidence_score below 0.6 when the layout is ambiguous. Do not guess past a low-confidence result.
 reasoning is one short classification note, not a conversation.
 
 Return exactly this JSON shape and no other field names:
-{"header_lines":0,"delimiter":",","coordinate_system":"ECEF","units":{"position":"m","velocity":"m/s","acceleration":"m/s^2","orientation":"rad"},"columns":{"col_0":"time","col_1":"pos_x","col_2":"pos_y","col_3":"pos_z"},"confidence_score":0.85,"unsupported_flag":false,"reasoning":"one short note"}
+{"header_lines":1,"delimiter":",","frames":{"position":"ECEF","velocity":"NED"},"units":{"position":"m","velocity":"m/s"},"columns":{"col_0":"time","col_1":"pos_x","col_2":"pos_y","col_3":"pos_z","col_4":"vel_n","col_5":"vel_e","col_6":"vel_d"},"confidence_score":0.85,"unsupported_flag":false,"reasoning":"position ECEF, velocity NED"}
 "#;
 
 const JSON_SCHEMA: &str = r#"{
   "type": "object",
   "additionalProperties": false,
-  "required": ["header_lines", "delimiter", "coordinate_system", "units", "columns", "confidence_score", "unsupported_flag", "reasoning"],
+  "required": ["header_lines", "delimiter", "frames", "units", "columns", "confidence_score", "unsupported_flag", "reasoning"],
   "properties": {
     "header_lines": { "type": "integer", "minimum": 0 },
     "delimiter": { "type": "string" },
-    "coordinate_system": { "type": "string" },
+    "frames": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["position"],
+      "properties": {
+        "position": { "type": "string" },
+        "velocity": { "type": "string" },
+        "acceleration": { "type": "string" }
+      }
+    },
     "units": {
       "type": "object",
       "additionalProperties": false,
@@ -95,17 +106,74 @@ const JSON_SCHEMA: &str = r#"{
   }
 }"#;
 
+/// Coordinate system of one state group. Position, velocity, and acceleration are independent.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ChannelFrames {
+    pub position: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub velocity: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acceleration: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct TrajectoryClassification {
     pub header_lines: u32,
     pub delimiter: String,
-    pub coordinate_system: String,
+    pub frames: ChannelFrames,
     pub units: ClassificationUnits,
     pub columns: BTreeMap<String, String>,
     pub confidence_score: f64,
     pub unsupported_flag: bool,
     pub reasoning: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ClassificationWire {
+    header_lines: u32,
+    delimiter: String,
+    /// Older files stored one frame for the whole file. The loader expands it per channel.
+    #[serde(default)]
+    coordinate_system: Option<String>,
+    #[serde(default)]
+    frames: Option<ChannelFrames>,
+    units: ClassificationUnits,
+    columns: BTreeMap<String, String>,
+    confidence_score: f64,
+    unsupported_flag: bool,
+    reasoning: String,
+}
+
+impl<'de> Deserialize<'de> for TrajectoryClassification {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let wire = ClassificationWire::deserialize(deserializer)?;
+        let frames = match wire.frames {
+            Some(frames) => frames,
+            None => {
+                let frame = wire.coordinate_system.unwrap_or_default();
+                let velocity = wire.columns.values().any(|role| role.starts_with("vel_")).then(|| frame.clone());
+                let acceleration = wire
+                    .columns
+                    .values()
+                    .any(|role| role.starts_with("acc_"))
+                    .then(|| frame.clone());
+                ChannelFrames { position: frame, velocity, acceleration }
+            }
+        };
+        Ok(TrajectoryClassification {
+            header_lines: wire.header_lines,
+            delimiter: wire.delimiter,
+            frames,
+            units: wire.units,
+            columns: wire.columns,
+            confidence_score: wire.confidence_score,
+            unsupported_flag: wire.unsupported_flag,
+            reasoning: wire.reasoning,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -272,9 +340,23 @@ fn free_vram_mib() -> Option<u64> {
         .min()
 }
 
+fn canon_owned(raw: &str) -> String {
+    canonical_frame(raw).unwrap_or(raw).to_string()
+}
+
 pub fn normalize_classification(class: &mut TrajectoryClassification) {
-    if let Some(frame) = canonical_frame(&class.coordinate_system) {
-        class.coordinate_system = frame.to_string();
+    class.frames.position = canon_owned(&class.frames.position);
+    if !class_has_prefix(class, "vel_") {
+        class.frames.velocity = None;
+        class.units.velocity = None;
+    } else if let Some(frame) = class.frames.velocity.as_ref() {
+        class.frames.velocity = Some(canon_owned(frame));
+    }
+    if !class_has_prefix(class, "acc_") {
+        class.frames.acceleration = None;
+        class.units.acceleration = None;
+    } else if let Some(frame) = class.frames.acceleration.as_ref() {
+        class.frames.acceleration = Some(canon_owned(frame));
     }
     class.delimiter = canonical_delimiter(&class.delimiter);
     class.units.position = canonical_or_original(UnitKind::Position, &class.units.position);
@@ -454,12 +536,24 @@ fn class_has_role(class: &TrajectoryClassification, role: &str) -> bool {
     column_roles(class).values().any(|r| r == role)
 }
 
+fn class_has_prefix(class: &TrajectoryClassification, prefix: &str) -> bool {
+    column_roles(class).values().any(|role| role.starts_with(prefix))
+}
+
+fn frame_problem(label: &str, raw: &str) -> Option<String> {
+    if canonical_frame(raw).is_none() {
+        Some(format!("{label} coordinate system {raw} is not supported"))
+    } else {
+        None
+    }
+}
+
 fn role_index(roles: &BTreeMap<usize, String>, names: &[&str]) -> Option<usize> {
     roles.iter().find(|(_, role)| names.contains(&role.as_str())).map(|(i, _)| *i)
 }
 
 pub fn has_position_columns(class: &TrajectoryClassification) -> bool {
-    let Some(frame) = canonical_frame(&class.coordinate_system) else {
+    let Some(frame) = canonical_frame(&class.frames.position) else {
         return false;
     };
     let roles = column_roles(class);
@@ -498,8 +592,28 @@ fn channel_problem(class: &TrajectoryClassification, prefix: &str, unit: &Option
 }
 
 pub fn support_problem(class: &TrajectoryClassification) -> Option<String> {
-    if canonical_frame(&class.coordinate_system).is_none() {
-        return Some(format!("coordinate system {} is not supported", class.coordinate_system));
+    if let Some(problem) = frame_problem("position", &class.frames.position) {
+        return Some(problem);
+    }
+    if class_has_prefix(class, "vel_") {
+        match class.frames.velocity.as_deref() {
+            None => return Some("velocity columns have no coordinate system".into()),
+            Some(frame) => {
+                if let Some(problem) = frame_problem("velocity", frame) {
+                    return Some(problem);
+                }
+            }
+        }
+    }
+    if class_has_prefix(class, "acc_") {
+        match class.frames.acceleration.as_deref() {
+            None => return Some("acceleration columns have no coordinate system".into()),
+            Some(frame) => {
+                if let Some(problem) = frame_problem("acceleration", frame) {
+                    return Some(problem);
+                }
+            }
+        }
     }
     if canonical_unit(UnitKind::Position, &class.units.position).is_err() {
         return Some(format!("position unit {} is not supported", class.units.position));
@@ -550,7 +664,7 @@ pub fn manual_reason(class: &TrajectoryClassification) -> String {
     if !class.confidence_score.is_finite() || class.confidence_score < LOW_CONFIDENCE {
         parts.push(format!("confidence {:.2} is low", class.confidence_score));
     }
-    if canonical_frame(&class.coordinate_system).is_some() && !has_position_columns(class) {
+    if canonical_frame(&class.frames.position).is_some() && !has_position_columns(class) {
         parts.push("position columns are missing".into());
     }
     parts.join("; ")
@@ -578,7 +692,7 @@ pub fn layout_id(class: &TrajectoryClassification) -> String {
     let layout = serde_json::json!({
         "header_lines": class.header_lines,
         "delimiter": class.delimiter,
-        "coordinate_system": class.coordinate_system,
+        "frames": class.frames,
         "units": class.units,
         "columns": class.columns,
     });
@@ -606,7 +720,7 @@ pub fn group_files(files: Vec<(GroupedFile, TrajectoryClassification)>) -> Vec<S
             );
         }
         let group = buckets.get_mut(&id).unwrap();
-        let local = matches!(class.coordinate_system.as_str(), "NED" | "NEU");
+        let local = matches!(canonical_frame(&class.frames.position), Some("NED" | "NEU"));
         if local && file.origin_lat.is_none() {
             group.needs_manual = true;
         }
@@ -623,7 +737,7 @@ pub fn group_files(files: Vec<(GroupedFile, TrajectoryClassification)>) -> Vec<S
         if !layout_reason.is_empty() {
             reasons.push(layout_reason);
         }
-        if matches!(group.classification.coordinate_system.as_str(), "NED" | "NEU")
+        if matches!(canonical_frame(&group.classification.frames.position), Some("NED" | "NEU"))
             && group.files.iter().any(|file| file.origin_lat.is_none())
         {
             reasons.push("a local frame needs an origin latitude and longitude".into());
@@ -664,11 +778,15 @@ fn classification_from_detected(schema: &DetectedSchema) -> TrajectoryClassifica
     let mut class = TrajectoryClassification {
         header_lines: if schema.has_header { 1 } else { 0 },
         delimiter: schema.delimiter.clone(),
-        coordinate_system: match schema.frame {
-            Frame::Lla => "LLA",
-            Frame::Ecef => "ECEF",
-        }
-        .to_string(),
+        frames: ChannelFrames {
+            position: match schema.frame {
+                Frame::Lla => "LLA",
+                Frame::Ecef => "ECEF",
+            }
+            .to_string(),
+            velocity: None,
+            acceleration: None,
+        },
         units: ClassificationUnits {
             position: if km { "km" } else { "m" }.to_string(),
             velocity: None,
@@ -690,7 +808,11 @@ pub fn partial_schema_guess(text: &str) -> TrajectoryClassification {
     let mut class = heuristic_classification(text).unwrap_or_else(|_| TrajectoryClassification {
         header_lines: 0,
         delimiter: ",".into(),
-        coordinate_system: "LLA".into(),
+        frames: ChannelFrames {
+            position: "LLA".into(),
+            velocity: None,
+            acceleration: None,
+        },
         units: ClassificationUnits {
             position: "m".into(),
             velocity: None,
@@ -765,7 +887,7 @@ fn number_at(text: &str) -> Option<f64> {
 }
 
 pub fn position_indexes(class: &TrajectoryClassification) -> Result<(Option<usize>, usize, usize, usize), String> {
-    let frame = canonical_frame(&class.coordinate_system).ok_or_else(|| "unsupported coordinate system".to_string())?;
+    let frame = canonical_frame(&class.frames.position).ok_or_else(|| "unsupported coordinate system".to_string())?;
     let roles = column_roles(class);
     let time = role_index(&roles, &["time"]);
     let (a, b, c) = match frame {
@@ -1108,11 +1230,12 @@ pub fn run_bounded(mut cmd: Command, timeout: Duration, cancel: &AtomicBool) -> 
 }
 
 fn classification_grammar() -> &'static str {
-    r#"root ::= "{" ws "\"header_lines\":" ws number ws "," ws "\"delimiter\":" ws string ws "," ws "\"coordinate_system\":" ws string ws "," ws "\"units\":" ws units ws "," ws "\"columns\":" ws columns ws "," ws "\"confidence_score\":" ws number ws "," ws "\"unsupported_flag\":" ws boolean ws "," ws "\"reasoning\":" ws string ws "}"
+    r#"root ::= "{" ws "\"header_lines\":" ws number ws "," ws "\"delimiter\":" ws string ws "," ws "\"frames\":" ws frames ws "," ws "\"units\":" ws units ws "," ws "\"columns\":" ws columns ws "," ws "\"confidence_score\":" ws number ws "," ws "\"unsupported_flag\":" ws boolean ws "," ws "\"reasoning\":" ws string ws "}"
 ws ::= [ \t\n]*
 number ::= "-"? [0-9]+ ("." [0-9]+)?
 boolean ::= "true" | "false"
 string ::= "\"" ([^"\\] | "\\" .)* "\""
+frames ::= "{" ws "\"position\":" ws string (ws "," ws "\"velocity\":" ws string)? (ws "," ws "\"acceleration\":" ws string)? ws "}"
 units ::= "{" ws "\"position\":" ws string (ws "," ws "\"velocity\":" ws string)? (ws "," ws "\"acceleration\":" ws string)? (ws "," ws "\"orientation\":" ws string)? (ws "," ws "\"mass\":" ws string)? ws "}"
 columns ::= "{" ws pair (ws "," ws pair)* ws "}"
 pair ::= string ws ":" ws string
@@ -1603,7 +1726,11 @@ mod tests {
         TrajectoryClassification {
             header_lines: 1,
             delimiter: ",".into(),
-            coordinate_system: "ECEF".into(),
+            frames: ChannelFrames {
+                position: "ECEF".into(),
+                velocity: None,
+                acceleration: None,
+            },
             units: ClassificationUnits {
                 position: "m".into(),
                 velocity: Some("m/s".into()),
@@ -1645,7 +1772,7 @@ mod tests {
         for key in [
             "header_lines",
             "delimiter",
-            "coordinate_system",
+            "frames",
             "confidence_score",
             "unsupported_flag",
             "reasoning",
@@ -1662,6 +1789,10 @@ mod tests {
         assert!(SYSTEM_PROMPT.contains("x-ecr") && SYSTEM_PROMPT.contains("y-ecr") && SYSTEM_PROMPT.contains("z-ecr"));
         assert!(SYSTEM_PROMPT.contains("north, east, and down"));
         assert!(SYSTEM_PROMPT.contains("Do not convert coordinates"));
+        assert!(SYSTEM_PROMPT.contains("frames.position"));
+        assert!(SYSTEM_PROMPT.contains("frames.velocity"));
+        assert!(SYSTEM_PROMPT.contains("frames.acceleration"));
+        assert!(!SYSTEM_PROMPT.contains("\"coordinate_system\""));
         assert!(GGUF_URL.contains("Llama-3.1-8B-Instruct"));
         assert!(GGUF_FILENAME.contains("Q4_K_M"));
         assert!(!GGUF_URL.to_ascii_lowercase().contains("mistral"));
@@ -1676,7 +1807,9 @@ mod tests {
             calls: Mutex::new(0),
         };
         let class = classify_with(&scripted, "t,x,y,z\n").unwrap();
-        assert_eq!(class.coordinate_system, "ECEF");
+        assert_eq!(class.frames.position, "ECEF");
+        assert!(class.frames.velocity.is_none());
+        assert!(class.frames.acceleration.is_none());
         assert_eq!(*scripted.calls.lock().unwrap(), 2);
     }
 
@@ -1688,12 +1821,17 @@ mod tests {
         let extra = r#"{"header_lines":1,"delimiter":",","coordinate_system":"ECEF","units":{"position":"m"},"columns":{"col_0":"pos_x","col_1":"pos_y","col_2":"pos_z"},"confidence_score":0.9,"unsupported_flag":false,"reasoning":"ok","warnings":[]}"#;
         assert!(accept_output(extra).is_err());
         assert!(accept_output("```json\n{\"header_lines\":0}\n```").is_err());
+        let old = r#"{"header_lines":1,"delimiter":",","coordinate_system":"ECEF","units":{"position":"m","velocity":"m/s"},"columns":{"col_0":"time","col_1":"pos_x","col_2":"pos_y","col_3":"pos_z","col_4":"vel_x","col_5":"vel_y","col_6":"vel_z"},"confidence_score":0.9,"unsupported_flag":false,"reasoning":"old file"}"#;
+        let legacy = accept_output(old).unwrap();
+        assert_eq!(legacy.frames.position, "ECEF");
+        assert_eq!(legacy.frames.velocity.as_deref(), Some("ECEF"));
+        assert!(legacy.frames.acceleration.is_none());
     }
 
     #[test]
     fn unsupported_frame_and_low_confidence_need_manual_assignment() {
         let mut class = sample_ecef();
-        class.coordinate_system = "BODY".into();
+        class.frames.position = "BODY".into();
         normalize_classification(&mut class);
         assert!(class.unsupported_flag);
         assert!(needs_manual_override(&class));
@@ -1778,7 +1916,7 @@ mod tests {
     #[test]
     fn local_frame_without_an_origin_needs_manual() {
         let mut class = sample_ecef();
-        class.coordinate_system = "NED".into();
+        class.frames.position = "NED".into();
         class.columns.insert("col_1".into(), "pos_n".into());
         class.columns.insert("col_2".into(), "pos_e".into());
         class.columns.insert("col_3".into(), "pos_d".into());
@@ -1820,7 +1958,7 @@ mod tests {
         let runtime = LlamaRuntime::from_paths(PathBuf::from(cli), PathBuf::from(model));
         let excerpt = "time,lat,lon,alt\n0,32.4,-106.4,1000\n1,32.41,-106.39,1100\n";
         let class = classify_with(&runtime, excerpt).expect("live classification");
-        assert_eq!(class.coordinate_system, "LLA");
+        assert_eq!(class.frames.position, "LLA");
         assert!(has_position_columns(&class));
     }
 
@@ -1891,7 +2029,7 @@ mod tests {
         let excerpt = excerpt_of(&text);
         assert!(excerpt.lines().count() <= 50 && excerpt.lines().count() >= 20);
         assert!(excerpt.starts_with("time,lat,lon,alt"));
-        let json = r#"{"header_lines":1,"delimiter":",","coordinate_system":"LLA","units":{"position":"m"},"columns":{"col_0":"time","col_1":"pos_lat","col_2":"pos_lon","col_3":"pos_alt"},"confidence_score":0.93,"unsupported_flag":false,"reasoning":"lat lon alt"}"#;
+        let json = r#"{"header_lines":1,"delimiter":",","frames":{"position":"LLA"},"units":{"position":"m"},"columns":{"col_0":"time","col_1":"pos_lat","col_2":"pos_lon","col_3":"pos_alt"},"confidence_score":0.93,"unsupported_flag":false,"reasoning":"lat lon alt"}"#;
         let saw = Mutex::new(String::new());
         struct Watch<'a> {
             json: &'a str,
@@ -1913,7 +2051,7 @@ mod tests {
         assert!(saw.lock().unwrap().contains("time,lat,lon,alt"));
         assert_eq!(class.header_lines, 1);
         assert_eq!(class.delimiter, ",");
-        assert_eq!(class.coordinate_system, "LLA");
+        assert_eq!(class.frames.position, "LLA");
         assert_eq!(class.columns.get("col_1").map(String::as_str), Some("pos_lat"));
         assert!(class.units.velocity.is_none());
         assert!(may_load(&class, false), "{class:?}");

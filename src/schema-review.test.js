@@ -39,7 +39,7 @@ function group(name, overrides = {}) {
     classification: {
       header_lines: 1,
       delimiter: ",",
-      coordinate_system: "ECEF",
+      frames: { position: "ECEF" },
       units: { position: "m", velocity: "m/s", acceleration: "m/s^2", orientation: "rad" },
       columns: { col_0: "time", col_1: "pos_x", col_2: "pos_y", col_3: "pos_z" },
       confidence_score: 0.9,
@@ -78,7 +78,9 @@ test("a rejected schema is not loaded until the editor saves it", () => {
   const draft = {
     headerLines: 1,
     delimiter: ",",
-    frame: "LLA",
+    positionFrame: "LLA",
+    velocityFrame: "",
+    accelerationFrame: "",
     positionUnit: "m",
     velocityUnit: "m/s",
     accelerationUnit: "m/s^2",
@@ -95,14 +97,17 @@ test("a rejected schema is not loaded until the editor saves it", () => {
   const again = declinePlan([edited]);
   assert.equal(again.edit.length, 0);
   assert.equal(assignmentOf(again.loadNow[0]).user_assigned, true);
-  assert.equal(assignmentOf(again.loadNow[0]).classification.coordinate_system, "LLA");
+  assert.equal(assignmentOf(again.loadNow[0]).classification.frames.position, "LLA");
+  assert.equal(assignmentOf(again.loadNow[0]).classification.frames.velocity, undefined);
 });
 
 test("accepted schemas are not asked again", () => {
   const groups = [acceptGroup(group("a")), group("b"), applyEditorDraft(group("c"), {
     headerLines: 0,
     delimiter: ",",
-    frame: "ECEF",
+    positionFrame: "ECEF",
+    velocityFrame: "",
+    accelerationFrame: "",
     positionUnit: "m",
     velocityUnit: "m/s",
     accelerationUnit: "m/s^2",
@@ -129,10 +134,9 @@ test("review markup marks header lines and column roles", () => {
       origin_alt_m: null,
     }],
   }), 0, 1);
-  assert.match(html, /schema-header/);
-  assert.match(html, /schema-tag">header/);
-  assert.match(html, /schema-role">time/);
-  assert.match(html, /schema-role">pos_x/);
+  assert.match(html, /data-role="file-text"/);
+  assert.match(html, /# flight\n0,1,2,3\n1,4,5,6/);
+  assert.doesNotMatch(html, /schema-role/);
   assert.match(html, /data-act="schema-yes"/);
   const tabbed = editorHtml(group("tab", {
     classification: { ...group("tab").classification, delimiter: "\t" },
@@ -149,7 +153,7 @@ test("editor requires an origin for a local frame that has none", () => {
     classification: {
       header_lines: 0,
       delimiter: ",",
-      coordinate_system: "NED",
+      frames: { position: "NED" },
       units: { position: "m" },
       columns: { col_0: "pos_n", col_1: "pos_e", col_2: "pos_d" },
       confidence_score: 0.4,
@@ -159,12 +163,15 @@ test("editor requires an origin for a local frame that has none", () => {
   });
   const html = editorHtml(pending, 0, 1);
   assert.match(html, /data-field="header"/);
-  assert.match(html, /data-field="frame"/);
+  assert.match(html, /data-field="position-frame"/);
+  assert.match(html, /time,x,y,z\n0,1,2,3\n1,1,2,4/);
   assert.match(html, /Origin latitude/);
   const draft = {
     headerLines: 0,
     delimiter: ",",
-    frame: "NED",
+    positionFrame: "NED",
+    velocityFrame: "",
+    accelerationFrame: "",
     positionUnit: "m",
     velocityUnit: "m/s",
     accelerationUnit: "m/s^2",

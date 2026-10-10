@@ -345,6 +345,17 @@ pub fn sample_track_state(
     times: Option<&[f64]>,
     time_s: f64,
 ) -> Result<StateSample, String> {
+    sample_with_internal_velocity(track_id, lla, times, None, time_s)
+}
+
+/// Sample the internal track. Stored velocity is ECEF metres per second.
+pub fn sample_with_internal_velocity(
+    track_id: u64,
+    lla: &[f32],
+    times: Option<&[f64]>,
+    velocity_ecef: Option<&[f32]>,
+    time_s: f64,
+) -> Result<StateSample, String> {
     let n = lla.len() / 3;
     if n < 2 {
         return Err("track needs at least two states".into());
@@ -379,7 +390,17 @@ pub fn sample_track_state(
     let r1 = ecef_of(&lla[(i + 1) * 3..(i + 1) * 3 + 3]);
     let r = r0.add(r1.sub(r0).scale(frac));
     let (lon, lat, alt) = ecef_to_lla(r.x, r.y, r.z);
-    let v = velocity_on_segment(lla, &clock, i, frac);
+    let v = if let Some(vel) = velocity_ecef.filter(|vel| vel.len() == n * 3) {
+        let a = i * 3;
+        let b = (i + 1) * 3;
+        Vec3::from_ecef(
+            vel[a] as f64 * (1.0 - frac) + vel[b] as f64 * frac,
+            vel[a + 1] as f64 * (1.0 - frac) + vel[b + 1] as f64 * frac,
+            vel[a + 2] as f64 * (1.0 - frac) + vel[b + 2] as f64 * frac,
+        )
+    } else {
+        velocity_on_segment(lla, &clock, i, frac)
+    };
     Ok(finish_sample(
         track_id, t, time_start, time_end, has_clock, lon, lat, alt, v,
     ))
