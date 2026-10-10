@@ -270,31 +270,127 @@ fn retry_message(excerpt: &str) -> String {
 }
 
 pub fn accept_output(raw: &str) -> Result<TrajectoryClassification, String> {
-    let json = sole_json_object(raw)?;
-    let mut class: TrajectoryClassification =
-        serde_json::from_str(json).map_err(|err| format!("JSON did not match the classification object: {err}"))?;
-    normalize_classification(&mut class);
-    if !class.confidence_score.is_finite() || !(0.0..=1.0).contains(&class.confidence_score) {
-        return Err("confidence_score must be between 0 and 1".into());
+    let objects = json_objects(raw);
+    if objects.is_empty() {
+        return Err("model output was not a JSON object".into());
     }
-    Ok(class)
+    // The last object is the completion. An echoed prompt can contain an earlier example.
+    let mut last_err = "model output was not a JSON object".to_string();
+    for object in objects.iter().rev() {
+        match serde_json::from_str::<TrajectoryClassification>(object) {
+            Ok(mut class) => {
+                normalize_classification(&mut class);
+                if !class.confidence_score.is_finite() || !(0.0..=1.0).contains(&class.confidence_score) {
+                    last_err = "confidence_score must be between 0 and 1".into();
+                    continue;
+                }
+                return Ok(class);
+            }
+            Err(err) => last_err = format!("JSON did not match the classification object: {err}"),
+        }
+    }
+    Err(last_err)
 }
 
-fn sole_json_object(raw: &str) -> Result<&str, String> {
-    let trimmed = raw.trim();
-    if let Some(object) = json_object_in(trimmed) {
-        return Ok(object);
+/// Every balanced `{...}` value in `raw`, including ones that follow a log line.
+fn json_objects(raw: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut index = 0;
+    while index < raw.len() {
+        let Some(rel) = raw[index..].find('{') else {
+            break;
+        };
+        let start = index + rel;
+        let slice = &raw[start..];
+        match balanced_object_end(slice) {
+            Some(end) => {
+                let object = &slice[..=end];
+                if serde_json::from_str::<Value>(object)
+                    .ok()
+                    .is_some_and(|value| value.is_object())
+                {
+                    out.push(object);
+                }
+                index = start + end + 1;
+            }
+            None => index = start + '{'.len_utf8(),
+        }
     }
-    Err("model output was not a JSON object".into())
+    out
 }
 
-fn json_object_in(raw: &str) -> Option<&str> {
-    let start = raw.find('{')?;
-    let slice = &raw[start..];
-    let end = balanced_object_end(slice)?;
-    let object = &slice[..=end];
-    let value: Value = serde_json::from_str(object).ok()?;
-    value.is_object().then_some(object)
+/// llama.cpp on Windows can write the completion as UTF-16 when stdout is a pipe.
+pub fn decode_process_text(bytes: &[u8]) -> String {
+    if bytes.starts_with(&[0xFF, 0xFE]) {
+        return String::from_utf16_lossy(&utf16_units(&bytes[2..], true));
+    }
+    if bytes.starts_with(&[0xFE, 0xFF]) {
+        return String::from_utf16_lossy(&utf16_units(&bytes[2..], false));
+    }
+    if looks_utf16_le(bytes) {
+        return String::from_utf16_lossy(&utf16_units(bytes, true));
+    }
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
+fn looks_utf16_le(bytes: &[u8]) -> bool {
+    if bytes.len() < 16 || bytes.len() % 2 != 0 {
+        return false;
+    }
+    let highs = bytes.len() / 2;
+    let zeros = bytes.iter().skip(1).step_by(2).filter(|byte| **byte == 0).count();
+    zeros * 4 >= highs * 3
+}
+
+fn utf16_units(bytes: &[u8], little: bool) -> Vec<u16> {
+    bytes
+        .chunks(2)
+        .map(|chunk| {
+            let lo = chunk[0];
+            let hi = chunk.get(1).copied().unwrap_or(0);
+            if little {
+                u16::from_le_bytes([lo, hi])
+            } else {
+                u16::from_be_bytes([lo, hi])
+            }
+        })
+        .collect()
+}
+
+pub fn strip_ansi(text: &str) -> String {
+    let mut out = String::new();
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' {
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                for next in chars.by_ref() {
+                    if next.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// Load failures llama.cpp prints instead of a completion. They are not model text.
+pub fn runtime_failure(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    [
+        "failed to allocate",
+        "out of memory",
+        "unable to load model",
+        "not enough memory",
+        "insufficient memory",
+        "bad_alloc",
+        "cudamalloc failed",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
 }
 
 fn balanced_object_end(text: &str) -> Option<usize> {
@@ -752,7 +848,7 @@ pub fn group_files(files: Vec<(GroupedFile, TrajectoryClassification)>) -> Vec<S
 /// Low-confidence column guess for the manual editor when Llama does not return JSON.
 /// Loading a file does not use this in place of the model.
 pub fn heuristic_classification(text: &str) -> Result<TrajectoryClassification, String> {
-    let preview = detect_preview(text).ok_or_else(|| "could not detect a columnar schema".to_string())?;
+    let preview = detect_preview(text).ok_or_else(|| "could not detect a columnar trajectory file format".to_string())?;
     Ok(classification_from_detected(&detect_schema(&preview)))
 }
 
@@ -966,7 +1062,9 @@ pub fn device_message(backend: GpuBackend, fell_back: bool) -> &'static str {
     }
 }
 
-/// Prompt plus 20–50 excerpt lines. Llama 3.1's native 131072 context is about 16 GB of KV cache.
+/// Prompt plus 20–50 excerpt lines. Llama 3.1's native 131072 context is about 16 GB of KV cache,
+/// which is the whole machine on a 16 GB Windows laptop. The process then prints an allocation
+/// error and no classification JSON.
 pub const CLASSIFY_CONTEXT: &str = "2048";
 /// The classification object is a few hundred tokens. A long generation is prose, not a schema.
 pub const CLASSIFY_PREDICT: &str = "384";
@@ -984,8 +1082,17 @@ pub fn gpu_layer_limit(free_mib: Option<u64>) -> u32 {
     ((budget / MIB_PER_LAYER) as u32).min(LAYERS)
 }
 
-/// mmap the GGUF and keep the context small. Never mlock and never disable mmap.
+/// mmap the GGUF and keep the context at 2048. Never mlock and never disable mmap.
+///
+/// `--fit` defaults to on and sizes unset context up to the trained length. `--fit-ctx` is the
+/// smallest context that fit may use, not a maximum. Leaving fit on lets a 16 GB machine try to
+/// allocate the 131072-token KV cache, fail, and print that error where the classification JSON
+/// should be. Fit is turned off and `-c` is set instead.
 pub fn memory_args(help: &str) -> Vec<String> {
+    memory_args_with(help, false)
+}
+
+pub fn memory_args_with(help: &str, tight: bool) -> Vec<String> {
     let mut args = Vec::new();
     if help_has(help, "-c") || help_has(help, "--ctx-size") {
         args.push("-c".into());
@@ -997,32 +1104,35 @@ pub fn memory_args(help: &str) -> Vec<String> {
     } else if help_has(help, "--mmap") {
         args.push("--mmap".into());
     }
-    if help_has(help, "--fit-ctx") {
-        args.push("--fit-ctx".into());
-        args.push(CLASSIFY_CONTEXT.into());
-    }
-    args
-}
-
-/// GPU offload stays inside VRAM. `--fit` chooses the layer count. `-ngl auto` is not combined
-/// with it, because that pins every layer and copies the weights beside the mmap.
-pub fn offload_args(backend: GpuBackend, help: &str) -> Vec<String> {
-    offload_args_with(backend, help, None)
-}
-
-pub fn offload_args_with(backend: GpuBackend, help: &str, free_mib: Option<u64>) -> Vec<String> {
-    if backend == GpuBackend::Cpu {
-        return Vec::new();
-    }
-    let mut args = Vec::new();
     if help_has(help, "--fit") {
         args.push("--fit".into());
-        args.push("on".into());
-    } else if help_has(help, "-ngl") || help_has(help, "--n-gpu-layers") {
-        args.push("-ngl".into());
-        args.push(gpu_layer_limit(free_mib).to_string());
+        args.push("off".into());
+    }
+    if help_has(help, "-b") || help_has(help, "--batch-size") {
+        args.push("-b".into());
+        args.push(if tight { "128" } else { "512" }.into());
     }
     args
+}
+
+/// A finite layer count. `-ngl auto` is the llama.cpp default and copies every layer beside the
+/// mmap. Unknown free memory, the CPU build, and the tight retry all stay at zero layers.
+/// `--fit` is not turned on here; [`memory_args`] turns it off so context cannot grow.
+pub fn offload_args(backend: GpuBackend, help: &str) -> Vec<String> {
+    offload_args_with(backend, help, None, false)
+}
+
+pub fn offload_args_with(backend: GpuBackend, help: &str, free_mib: Option<u64>, tight: bool) -> Vec<String> {
+    let has_ngl = help_has(help, "-ngl") || help_has(help, "--n-gpu-layers");
+    if !has_ngl {
+        return Vec::new();
+    }
+    let layers = if backend == GpuBackend::Cpu || tight {
+        0
+    } else {
+        gpu_layer_limit(free_mib)
+    };
+    vec!["-ngl".into(), layers.to_string()]
 }
 
 pub struct LlamaRuntime {
@@ -1090,52 +1200,42 @@ fn note(progress: &dyn Fn(ClassifyNote), label: &str, bytes: u64, bytes_total: u
 
 impl TextCompleter for LlamaRuntime {
     fn complete(&self, system: &str, user: &str) -> Result<String, String> {
+        self.complete_once(system, user, false)
+    }
+}
+
+impl LlamaRuntime {
+    /// One llama-cli completion. A memory error is not model text: retry once with no GPU layers
+    /// and a smaller batch. The grammar is what forces the classification JSON. The JSON schema
+    /// converter can reject the schema and exit with an error string, which then fails the
+    /// "JSON object" check on both attempts.
+    fn complete_once(&self, system: &str, user: &str, tight: bool) -> Result<String, String> {
         if self.cancel.load(Ordering::SeqCst) {
             return Err(CANCELLED.into());
         }
         let dir = std::env::temp_dir().join(format!("fauxrrt-llama-{}", std::process::id()));
         fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
         let prompt_path = dir.join("prompt.txt");
-        let schema_path = dir.join("schema.json");
         fs::write(&prompt_path, llama_prompt(system, user)).map_err(|e| e.to_string())?;
-        fs::write(&schema_path, JSON_SCHEMA).map_err(|e| e.to_string())?;
         let help = self.cached_help()?;
         let mut cmd = Command::new(&self.cli);
         cmd.arg("-m").arg(&self.model);
         cmd.arg("-n").arg(CLASSIFY_PREDICT);
-        for arg in memory_args(&help) {
+        for arg in memory_args_with(&help, tight) {
             cmd.arg(arg);
         }
-        let free_mib = if self.backend != GpuBackend::Cpu && !help_has(&help, "--fit") {
+        let free_mib = if self.backend != GpuBackend::Cpu && !tight {
             free_vram_mib()
         } else {
             None
         };
-        for arg in offload_args_with(self.backend, &help, free_mib) {
+        for arg in offload_args_with(self.backend, &help, free_mib, tight) {
             cmd.arg(arg);
         }
-        if help_has(&help, "--temp") {
-            cmd.arg("--temp").arg("0");
-        } else if help_has(&help, "--temperature") {
-            cmd.arg("--temperature").arg("0");
+        for arg in session_args(&help) {
+            cmd.arg(arg);
         }
-        if help_has(&help, "--no-conversation") {
-            cmd.arg("--no-conversation");
-        } else if help_has(&help, "-no-cnv") {
-            cmd.arg("-no-cnv");
-        }
-        if help_has(&help, "--no-display-prompt") {
-            cmd.arg("--no-display-prompt");
-        }
-        if help_has(&help, "--json-schema-file") {
-            cmd.arg("--json-schema-file").arg(&schema_path);
-        } else if help_has(&help, "--grammar-file") {
-            let grammar_path = dir.join("schema.gbnf");
-            fs::write(&grammar_path, classification_grammar()).map_err(|e| e.to_string())?;
-            cmd.arg("--grammar-file").arg(&grammar_path);
-        } else {
-            return Err("llama.cpp cannot force the JSON schema, so the model was not run".into());
-        }
+        push_json_constraint(&mut cmd, &help, &dir)?;
         if help_has(&help, "-f") || help_has(&help, "--file") {
             cmd.arg("-f").arg(&prompt_path);
         } else {
@@ -1143,11 +1243,19 @@ impl TextCompleter for LlamaRuntime {
             cmd.arg("-p").arg(prompt);
         }
         let output = run_bounded(cmd, INFERENCE_TIMEOUT, &self.cancel)?;
-        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-        if stdout.trim().is_empty() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = strip_ansi(&decode_process_text(&output.stdout));
+        let stderr = strip_ansi(&decode_process_text(&output.stderr));
+        if accept_output(&stdout).is_ok() {
+            return Ok(stdout);
+        }
+        let combined = format!("{stdout}\n{stderr}");
+        if !tight && runtime_failure(&combined) {
+            return self.complete_once(system, user, true);
+        }
+        if stdout.trim().is_empty() || runtime_failure(&stdout) || runtime_failure(&stderr) {
             let tail = stderr
                 .lines()
+                .chain(stdout.lines())
                 .rev()
                 .find(|line| !line.trim().is_empty())
                 .unwrap_or("no llama.cpp output");
@@ -1155,6 +1263,60 @@ impl TextCompleter for LlamaRuntime {
         }
         Ok(stdout)
     }
+}
+
+fn session_args(help: &str) -> Vec<String> {
+    let mut args = Vec::new();
+    if help_has(help, "--simple-io") {
+        args.push("--simple-io".into());
+    }
+    if help_has(help, "--single-turn") {
+        args.push("--single-turn".into());
+    }
+    if help_has(help, "--no-conversation") {
+        args.push("--no-conversation".into());
+    } else if help_has(help, "-no-cnv") {
+        args.push("-no-cnv".into());
+    }
+    if help_has(help, "--no-display-prompt") {
+        args.push("--no-display-prompt".into());
+    }
+    if help_has(help, "--no-show-timings") {
+        args.push("--no-show-timings".into());
+    }
+    if help_has(help, "--skip-chat-parsing") {
+        args.push("--skip-chat-parsing".into());
+    }
+    if help_has(help, "--reasoning") {
+        args.push("--reasoning".into());
+        args.push("off".into());
+    }
+    if help_has(help, "--temp") {
+        args.push("--temp".into());
+        args.push("0".into());
+    } else if help_has(help, "--temperature") {
+        args.push("--temperature".into());
+        args.push("0".into());
+    }
+    args
+}
+
+/// Grammar forces every token of the completion. `--json-schema-file` is only the fallback
+/// when this llama.cpp build has no grammar file flag.
+fn push_json_constraint(cmd: &mut Command, help: &str, dir: &Path) -> Result<(), String> {
+    if help_has(help, "--grammar-file") {
+        let grammar_path = dir.join("schema.gbnf");
+        fs::write(&grammar_path, classification_grammar()).map_err(|e| e.to_string())?;
+        cmd.arg("--grammar-file").arg(&grammar_path);
+        return Ok(());
+    }
+    if help_has(help, "--json-schema-file") {
+        let schema_path = dir.join("schema.json");
+        fs::write(&schema_path, JSON_SCHEMA).map_err(|e| e.to_string())?;
+        cmd.arg("--json-schema-file").arg(&schema_path);
+        return Ok(());
+    }
+    Err("llama.cpp cannot force the classification JSON, so the model was not run".into())
 }
 
 fn llama_prompt(system: &str, user: &str) -> String {
@@ -1991,32 +2153,74 @@ mod tests {
     }
 
     #[test]
-    fn gpu_offload_fits_layers_and_cpu_passes_none() {
+    fn gpu_offload_uses_a_finite_layer_count() {
         let help = "usage --fit [on|off] -ngl N --n-gpu-layers N --temp N";
         let cuda = offload_args(GpuBackend::Cuda, help);
-        assert_eq!(cuda, vec!["--fit".to_string(), "on".to_string()]);
-        assert!(!cuda.iter().any(|arg| arg == "-ngl" || arg == "auto" || arg == "all"));
-        assert!(offload_args(GpuBackend::Vulkan, help).windows(2).any(|pair| pair == ["--fit", "on"]));
-        assert!(offload_args(GpuBackend::Cpu, help).is_empty());
+        assert_eq!(cuda, vec!["-ngl".to_string(), "0".to_string()]);
+        assert!(!cuda.iter().any(|arg| arg == "auto" || arg == "all" || arg == "on"));
+        assert_eq!(offload_args(GpuBackend::Cpu, help), vec!["-ngl".to_string(), "0".to_string()]);
         assert!(offload_args(GpuBackend::Cuda, "usage --temp N").is_empty());
-        let capped = offload_args_with(GpuBackend::Cuda, "usage -ngl N", Some(8_192));
+        let capped = offload_args_with(GpuBackend::Cuda, "usage -ngl N", Some(8_192), false);
         assert_eq!(capped, vec!["-ngl".to_string(), "32".to_string()]);
-        assert_eq!(offload_args_with(GpuBackend::Vulkan, "usage -ngl N", None), vec!["-ngl".to_string(), "0".to_string()]);
+        assert_eq!(
+            offload_args_with(GpuBackend::Vulkan, "usage -ngl N", None, false),
+            vec!["-ngl".to_string(), "0".to_string()]
+        );
+        assert_eq!(
+            offload_args_with(GpuBackend::Cuda, "usage -ngl N", Some(8_192), true),
+            vec!["-ngl".to_string(), "0".to_string()]
+        );
         assert_eq!(gpu_layer_limit(None), 0);
         assert_eq!(gpu_layer_limit(Some(2_000)), 2);
     }
 
     #[test]
     fn llama_context_is_small_and_weights_stay_mmapd() {
-        let help = "usage -c --ctx-size N --mmap --no-mmap --load-mode --fit --fit-ctx N --json-schema-file F --grammar-file F";
+        let help = "usage -c --ctx-size N --mmap --no-mmap --load-mode --fit --fit-ctx N -b --batch-size N --json-schema-file F --grammar-file F";
         let args = memory_args(help);
         assert!(args.windows(2).any(|pair| pair == ["-c", "2048"]), "{args:?}");
         assert!(args.windows(2).any(|pair| pair == ["--load-mode", "mmap"]), "{args:?}");
-        assert!(args.windows(2).any(|pair| pair == ["--fit-ctx", "2048"]), "{args:?}");
+        assert!(args.windows(2).any(|pair| pair == ["--fit", "off"]), "{args:?}");
+        assert!(args.windows(2).any(|pair| pair == ["-b", "512"]), "{args:?}");
+        assert!(!args.iter().any(|arg| arg == "--fit-ctx" || arg == "on"));
         assert!(!args.iter().any(|arg| arg == "--no-mmap" || arg == "--mlock" || arg == "mlock"));
         let mmap_only = memory_args("usage -c N --mmap --no-mmap");
         assert!(mmap_only.iter().any(|arg| arg == "--mmap"), "{mmap_only:?}");
         assert!(!mmap_only.iter().any(|arg| arg.contains("no-mmap") || arg.contains("mlock")));
+        let tight = memory_args_with(help, true);
+        assert!(tight.windows(2).any(|pair| pair == ["-b", "128"]), "{tight:?}");
+    }
+
+    #[test]
+    fn subprocess_io_stays_on_the_pipe_and_reasoning_stays_off() {
+        let help = "usage --simple-io --single-turn --no-conversation --no-display-prompt --no-show-timings --skip-chat-parsing --reasoning [on|off|auto] --temp N";
+        let args = session_args(help);
+        for flag in ["--simple-io", "--single-turn", "--no-conversation", "--no-display-prompt", "--no-show-timings", "--skip-chat-parsing"] {
+            assert!(args.iter().any(|arg| arg == flag), "{flag} missing from {args:?}");
+        }
+        assert!(args.windows(2).any(|pair| pair == ["--reasoning", "off"]), "{args:?}");
+        assert!(args.windows(2).any(|pair| pair == ["--temp", "0"]), "{args:?}");
+    }
+
+    #[test]
+    fn allocation_error_is_not_a_classification_and_utf16_json_is() {
+        let err = "llama_kv_cache_init: failed to allocate buffer for kv cache\nmain: error: unable to load model\n";
+        assert!(runtime_failure(err));
+        assert!(accept_output(err).unwrap_err().contains("not a JSON object"));
+        let json = r#"{"header_lines":1,"delimiter":",","frames":{"position":"LLA"},"units":{"position":"m"},"columns":{"col_0":"time","col_1":"pos_lat","col_2":"pos_lon","col_3":"pos_alt"},"confidence_score":0.9,"unsupported_flag":false,"reasoning":"lat lon alt"}"#;
+        let mut utf16 = Vec::new();
+        for unit in json.encode_utf16() {
+            utf16.extend(unit.to_le_bytes());
+        }
+        let decoded = decode_process_text(&utf16);
+        let class = accept_output(&decoded).unwrap();
+        assert_eq!(class.frames.position, "LLA");
+        let noisy = format!("log line without an object\n{json}");
+        assert_eq!(accept_output(&noisy).unwrap().columns.get("col_1").map(String::as_str), Some("pos_lat"));
+        let example = r#"{"header_lines":1,"delimiter":",","frames":{"position":"ECEF","velocity":"NED"},"units":{"position":"m","velocity":"m/s"},"columns":{"col_0":"time","col_1":"pos_x"},"confidence_score":0.85,"unsupported_flag":false,"reasoning":"example"}"#;
+        let both = format!("{example}\n{json}");
+        assert_eq!(accept_output(&both).unwrap().frames.position, "LLA");
+        assert!(!runtime_failure("classification was not the JSON object"));
     }
 
     #[test]

@@ -838,7 +838,7 @@ input[type="number"], input[type="text"] {
   flex: 1;
   min-height: 0;
   overflow: auto;
-  padding: 16px 18px 180px;
+  padding: 16px 18px 140px;
   font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
   font-size: 12px;
   line-height: 1.45;
@@ -852,19 +852,17 @@ input[type="number"], input[type="text"] {
 }
 .schema-kicker { color: var(--muted); font-size: 11px; letter-spacing: 0.04em; text-transform: uppercase; }
 .schema-share, .schema-note { color: var(--muted); font-size: 12px; }
-.schema-raw {
-  margin: 8px 0;
-  padding: 8px;
-  max-height: 9.5em;
-  overflow: auto;
+.schema-raw, .schema-rawline {
+  margin: 0;
+  padding: 0;
   white-space: pre;
   font-family: "IBM Plex Mono", ui-monospace, monospace;
   font-size: 12px;
   line-height: 1.45;
-  background: rgba(11, 16, 22, 0.72);
-  border: 1px solid rgba(232, 237, 243, 0.16);
+  background: transparent;
+  border: 0;
 }
-.schema-line { padding: 2px 0; white-space: pre-wrap; }
+.schema-line { padding: 2px 0 8px; }
 .schema-header {
   background: rgba(227, 93, 106, 0.16);
   border-left: 3px solid var(--danger);
@@ -894,13 +892,23 @@ input[type="number"], input[type="text"] {
   padding: 3px 6px;
   background: rgba(11, 16, 22, 0.72);
 }
+.schema-cell-text { color: var(--text); font-weight: 600; }
+.schema-cell label {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  color: var(--muted);
+  font-family: "Segoe UI", "IBM Plex Sans", sans-serif;
+  font-size: 10px;
+}
+.schema-cell select { max-width: 9.5rem; font-size: 11px; }
 .schema-role { color: var(--accent); font-size: 10px; font-family: "Segoe UI", "IBM Plex Sans", sans-serif; }
 .schema-card {
   position: absolute;
   left: 12px;
   right: 12px;
   bottom: 12px;
-  max-height: 46%;
+  max-height: 28%;
   overflow: auto;
   background: var(--panel);
   border: 1px solid var(--line);

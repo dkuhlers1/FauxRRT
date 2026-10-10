@@ -1,4 +1,4 @@
-/** Confirmation flow for detected trajectory schemas. Pure helpers plus markup. */
+/** Confirmation flow for detected trajectory file formats. Pure helpers plus markup. */
 
 export const FRAMES = ["NED", "NEU", "LLA", "ECEF", "ECI"];
 
@@ -73,9 +73,10 @@ export function loadFailureMessage(err) {
 }
 
 export function uniqueSchemaSummary(groups) {
-  const schemas = groups.length;
+  const formats = groups.length;
   const files = groups.reduce((count, group) => count + (group.files?.length || 0), 0);
-  const lead = `${schemas} unique ${schemas === 1 ? "schema" : "schemas"} detected across ${files} ${files === 1 ? "file" : "files"}.`;
+  const noun = formats === 1 ? "trajectory file format" : "trajectory file formats";
+  const lead = `${formats} unique ${noun} detected across ${files} ${files === 1 ? "file" : "files"}.`;
   const confirmed = groups.filter((group) => group.status === "accepted" || group.status === "edited").length;
   if (!confirmed) return lead;
   return `${lead} ${confirmed} already confirmed.`;
@@ -85,7 +86,7 @@ export function canAccept(group) {
   return group.status === "pending" && !group.needs_manual && !group.correction_required;
 }
 
-/** Decline review: load usable schemas now. Hold rejected and low-confidence groups for the editor. */
+/** Decline review: load usable formats now. Hold rejected and low-confidence groups for the column marks. */
 export function declinePlan(groups) {
   const loadNow = [];
   const edit = [];
@@ -185,8 +186,104 @@ function columnCount(group) {
   return Math.max(max, previewModel(group).cells.length, 1);
 }
 
-function rawLinesHtml(group) {
-  return `<pre class="schema-raw" data-role="file-text">${escapeHtml(rawFilePreview(group))}</pre>`;
+function channelOf(role) {
+  if (role.startsWith("pos_")) return "position";
+  if (role.startsWith("vel_")) return "velocity";
+  if (role.startsWith("acc_")) return "acceleration";
+  if (role.startsWith("orientation_")) return "orientation";
+  if (role === "mass") return "mass";
+  return "";
+}
+
+function selectOptions(values, selected) {
+  return values
+    .map((value) => `<option value="${escapeHtml(value)}"${value === selected ? " selected" : ""}>${escapeHtml(value === "" ? "—" : value)}</option>`)
+    .join("");
+}
+
+function roleOptions(selected) {
+  return ROLES.map((role) => `<option value="${role}"${role === selected ? " selected" : ""}>${role}</option>`).join("");
+}
+
+function unitFrameHtml(index, role, unit, frame) {
+  const channel = channelOf(role);
+  if (!channel) return "";
+  const units = UNIT_CHOICES[channel];
+  const unitValue = units.includes(unit) ? unit : units[0];
+  const unitSelect = `<label>unit <select data-col="${index}" data-field="unit">${selectOptions(units, unitValue)}</select></label>`;
+  if (channel !== "position" && channel !== "velocity" && channel !== "acceleration") return unitSelect;
+  const frames = channel === "position" ? FRAMES : ["", ...FRAMES];
+  const frameValue = frames.includes(frame) ? frame : frames[0];
+  return `${unitSelect}<label>frame <select data-col="${index}" data-field="frame">${selectOptions(frames, frameValue)}</select></label>`;
+}
+
+function columnMarkHtml(index, cellText, role, classif) {
+  const channel = channelOf(role);
+  const frames = classif.frames || {};
+  const units = classif.units || {};
+  const frame = channel === "position" || channel === "velocity" || channel === "acceleration" ? frames[channel] || "" : "";
+  const unit = channel ? units[channel] || "" : "";
+  return `<div class="schema-cell" data-column="${index}">
+    <span class="schema-cell-text">${escapeHtml(cellText)}</span>
+    <label>role <select data-col="${index}" data-field="role">${roleOptions(ROLES.includes(role) ? role : "ignore")}</select></label>
+    ${unitFrameHtml(index, role, unit, frame)}
+  </div>`;
+}
+
+function markLineIndex(lines, headerCount, delimiter) {
+  const lastHeader = headerCount > 0 ? Math.min(headerCount, lines.length) - 1 : -1;
+  if (lastHeader >= 0 && splitFields(lines[lastHeader] || "", delimiter).length > 1) return lastHeader;
+  for (let i = Math.max(headerCount, 0); i < lines.length; i += 1) {
+    if (String(lines[i] || "").trim()) return i;
+  }
+  return Math.max(0, lastHeader);
+}
+
+function originFieldsHtml(group) {
+  const frame = group.classification?.frames?.position || "";
+  const local = frame === "NED" || frame === "NEU";
+  const originFile = (group.files || []).find((file) => file.origin_lat != null);
+  const origin = group.assigned_origin || {};
+  const lat = origin.lat ?? originFile?.origin_lat ?? "";
+  const lon = origin.lon ?? originFile?.origin_lon ?? "";
+  const alt = origin.alt ?? originFile?.origin_alt_m ?? "";
+  return `<div data-role="origin-fields"${local ? "" : " hidden"}>
+    <p class="schema-note">Origin for a NED or NEU position column. A header origin on a file is kept.</p>
+    <label>Origin latitude <input data-field="origin-lat" type="number" step="any" value="${escapeHtml(lat)}" /></label>
+    <label>Origin longitude <input data-field="origin-lon" type="number" step="any" value="${escapeHtml(lon)}" /></label>
+    <label>Origin altitude m <input data-field="origin-alt" type="number" step="any" value="${escapeHtml(alt)}" /></label>
+  </div>`;
+}
+
+function annotatedFileHtml(group) {
+  const preview = previewModel(group);
+  const classif = group.classification || {};
+  const lines = preview.lines.slice(0, 8);
+  const headerCount = Math.max(0, preview.headerCount);
+  const markIndex = lines.length ? markLineIndex(lines, headerCount, classif.delimiter) : -1;
+  const markLine = markIndex >= 0 ? lines[markIndex] : "";
+  const cells = splitFields(markLine, classif.delimiter);
+  const count = Math.max(columnCount(group), cells.length);
+  const marks = [];
+  for (let i = 0; i < count; i += 1) {
+    const role = classif.columns?.[`col_${i}`] || "ignore";
+    marks.push(columnMarkHtml(i, cells[i] || "", role, classif));
+  }
+  const body = lines
+    .map((line, i) => {
+      const header = i < headerCount;
+      const marksHtml = i === markIndex
+        ? `<div class="schema-data" data-role="column-marks">${marks.join("")}${originFieldsHtml(group)}</div>`
+        : "";
+      return `<div class="schema-line${header ? " schema-header" : ""}" data-line-kind="${header ? "header" : "data"}">${header ? `<span class="schema-tag">header</span>` : ""}<pre class="schema-rawline">${escapeHtml(line)}</pre>${marksHtml}</div>`;
+    })
+    .join("");
+  const delimiter = delimiterChoice(classif.delimiter);
+  return `<div data-role="file-text">
+    <input type="hidden" data-field="header" value="${Number(classif.header_lines) || 0}" />
+    <input type="hidden" data-field="delimiter" value="${escapeHtml(delimiter)}" />
+    ${body}
+  </div>`;
 }
 
 function stageHtml(group, index, total) {
@@ -194,110 +291,37 @@ function stageHtml(group, index, total) {
   const names = (group.files || []).map((file) => file.name).join(", ");
   return `
     <div class="schema-stage">
-      <div class="schema-kicker">Schema ${index + 1} of ${total} · ${escapeHtml(preview.fileName)}</div>
-      <p class="schema-share">This layout is shared by ${preview.fileCount} ${preview.fileCount === 1 ? "file" : "files"}: ${escapeHtml(names)}</p>
-      ${rawLinesHtml(group)}
+      <div class="schema-kicker">Trajectory file format ${index + 1} of ${total} · ${escapeHtml(preview.fileName)}</div>
+      <p class="schema-share">This trajectory file format is shared by ${preview.fileCount} ${preview.fileCount === 1 ? "file" : "files"}: ${escapeHtml(names)}</p>
+      ${annotatedFileHtml(group)}
     </div>`;
 }
 
-function frameSummary(classif) {
-  const frames = classif?.frames || {};
-  const parts = [`position ${frames.position || ""}`];
-  if (frames.velocity) parts.push(`velocity ${frames.velocity}`);
-  if (frames.acceleration) parts.push(`acceleration ${frames.acceleration}`);
-  return parts.join(", ");
-}
-
-export function reviewCardHtml(group, index, total) {
-  const frames = frameSummary(group.classification);
+function actionCard(group) {
   const note = group.classification?.reasoning ? `<p class="schema-note">${escapeHtml(group.classification.reasoning)}</p>` : "";
-  const ask = canAccept(group)
-    ? `<p class="schema-ask">Confirm this schema? ${escapeHtml(frames)}</p>
-       <div class="schema-actions">
-         <button type="button" class="primary compact" data-act="schema-yes">Yes</button>
-         <button type="button" class="ghost compact" data-act="schema-no">No</button>
-         <button type="button" class="ghost compact" data-act="schema-cancel">Back</button>
-       </div>`
-    : `<p class="schema-ask">${escapeHtml(group.manual_reason || "This schema needs a manual assignment.")} Correct it before these files load.</p>
-       <div class="schema-actions">
-         <button type="button" class="primary compact" data-act="schema-no">Correct schema</button>
-         <button type="button" class="ghost compact" data-act="schema-cancel">Back</button>
-       </div>`;
-  return `${stageHtml(group, index, total)}<div class="schema-card">${note}${ask}</div>`;
-}
-
-function selectOptions(values, selected) {
-  return values
-    .map((value) => `<option value="${escapeHtml(value)}"${value === selected ? " selected" : ""}>${escapeHtml(value)}</option>`)
-    .join("");
-}
-
-function unitSelect(kind, selected) {
-  const values = UNIT_CHOICES[kind];
-  const current = values.includes(selected) ? selected : values[0];
-  return `<label>${kind[0].toUpperCase()}${kind.slice(1)} unit
-    <select data-field="${kind}">${selectOptions(values, current)}</select>
-  </label>`;
-}
-
-export function editorHtml(group, index, total) {
-  const classif = group.classification || {};
-  const units = classif.units || {};
-  const count = columnCount(group);
-  const preview = previewModel(group);
-  const roleRows = [];
-  for (let i = 0; i < count; i += 1) {
-    const selected = classif.columns?.[`col_${i}`] || preview.cells[i]?.role || "ignore";
-    const sample = preview.cells[i]?.text || "";
-    roleRows.push(`<label>Column ${i}${sample ? ` · ${escapeHtml(sample)}` : ""}
-      <select data-col="${i}">${ROLES.map((role) => `<option value="${role}"${role === selected ? " selected" : ""}>${role}</option>`).join("")}</select>
-    </label>`);
-  }
-  const frames = classif.frames || {};
-  const positionFrame = FRAMES.includes(frames.position) ? frames.position : "ECEF";
-  const velocityFrame = FRAMES.includes(frames.velocity) ? frames.velocity : "";
-  const accelerationFrame = FRAMES.includes(frames.acceleration) ? frames.acceleration : "";
-  const delimiter = delimiterChoice(classif.delimiter);
-  const local = positionFrame === "NED" || positionFrame === "NEU";
-  const originFile = (group.files || []).find((file) => file.origin_lat != null);
-  const origin = group.assigned_origin || {};
-  const lat = origin.lat ?? originFile?.origin_lat ?? "";
-  const lon = origin.lon ?? originFile?.origin_lon ?? "";
-  const alt = origin.alt ?? originFile?.origin_alt_m ?? "";
   const modelError = group.manual_reason
     ? `<p class="schema-error" data-role="model-error">${escapeHtml(group.manual_reason)}</p>`
     : "";
-  return `${stageHtml(group, index, total)}
-    <div class="schema-card schema-editor">
-      <p class="schema-ask">Correct this schema. The change applies to every file that shares it.</p>
-      ${modelError}
-      <div class="schema-form">
-        <label>Header lines <input data-field="header" type="number" min="0" step="1" value="${Number(classif.header_lines) || 0}" /></label>
-        <label>Delimiter <select data-field="delimiter">${DELIMITERS.map((item) => `<option value="${escapeHtml(item.value)}"${item.value === delimiter ? " selected" : ""}>${item.label}</option>`).join("")}</select></label>
-        <label>Position frame <select data-field="position-frame">${selectOptions(FRAMES, positionFrame)}</select></label>
-        <label>Velocity frame <select data-field="velocity-frame">${selectOptions(["", ...FRAMES], velocityFrame)}</select></label>
-        <label>Acceleration frame <select data-field="acceleration-frame">${selectOptions(["", ...FRAMES], accelerationFrame)}</select></label>
-        ${unitSelect("position", units.position || "m")}
-        ${unitSelect("velocity", units.velocity || "m/s")}
-        ${unitSelect("acceleration", units.acceleration || "m/s^2")}
-        ${unitSelect("orientation", units.orientation || "rad")}
-        ${unitSelect("mass", units.mass || "kg")}
-        ${roleRows.join("")}
-      </div>
-      <div data-role="origin-fields"${local ? "" : " hidden"}>
-        <p class="schema-note">Origin for NED and NEU files in this schema that do not already name one. A header origin on a file is kept.</p>
-        <div class="schema-form">
-          <label>Origin latitude <input data-field="origin-lat" type="number" step="any" value="${escapeHtml(lat)}" /></label>
-          <label>Origin longitude <input data-field="origin-lon" type="number" step="any" value="${escapeHtml(lon)}" /></label>
-          <label>Origin altitude m <input data-field="origin-alt" type="number" step="any" value="${escapeHtml(alt)}" /></label>
-        </div>
-      </div>
-      <p class="schema-error" data-role="editor-error"></p>
-      <div class="schema-actions">
-        <button type="button" class="primary compact" data-act="schema-save">Save schema</button>
-        <button type="button" class="ghost compact" data-act="schema-cancel">Back</button>
-      </div>
-    </div>`;
+  const ask = group.needs_manual || group.editor_required || group.correction_required
+    ? "Change the column marks on the line, then confirm this trajectory file format."
+    : "Confirm this trajectory file format, or change a column’s role, unit, or coordinate system on the line.";
+  return `<div class="schema-card">
+    ${modelError}${note}
+    <p class="schema-ask">${escapeHtml(ask)}</p>
+    <p class="schema-error" data-role="editor-error"></p>
+    <div class="schema-actions">
+      <button type="button" class="primary compact" data-act="schema-save">Confirm trajectory file format</button>
+      <button type="button" class="ghost compact" data-act="schema-cancel">Back</button>
+    </div>
+  </div>`;
+}
+
+export function reviewCardHtml(group, index, total) {
+  return `${stageHtml(group, index, total)}${actionCard(group)}`;
+}
+
+export function editorHtml(group, index, total) {
+  return reviewCardHtml(group, index, total);
 }
 
 export function summaryHtml(groups, errors) {
@@ -307,33 +331,52 @@ export function summaryHtml(groups, errors) {
   return `
     <div class="schema-summary" data-role="schema-summary">
       <p class="schema-ask">${escapeHtml(uniqueSchemaSummary(groups))}</p>
-      <p class="muted wind-hint">Load without reviewing uses each detected schema. Unsupported, low-confidence, and local frames without an origin open in the editor instead. Review walks each unique schema once.</p>
+      <p class="muted wind-hint">Load without reviewing uses each detected trajectory file format. Unsupported, low-confidence, and local frames without an origin stay on the column marks. Review walks each unique trajectory file format once.</p>
       ${errorBlock}
       <div class="schema-actions">
         <button type="button" class="primary compact" data-act="schema-load">Load without reviewing</button>
-        <button type="button" class="ghost compact" data-act="schema-review">Review schemas</button>
+        <button type="button" class="ghost compact" data-act="schema-review">Review trajectory file formats</button>
         <button type="button" class="ghost compact" data-act="schema-dismiss">Dismiss</button>
       </div>
     </div>`;
 }
 
+function columnRoles(root) {
+  const indexes = [...root.querySelectorAll("[data-field='role']")]
+    .map((select) => Number(select.dataset.col))
+    .filter((index) => Number.isFinite(index));
+  const unique = [...new Set(indexes)].sort((a, b) => a - b);
+  return unique.map((index) => ({
+    index,
+    role: root.querySelector(`[data-col='${index}'][data-field='role']`)?.value || "ignore",
+    unit: root.querySelector(`[data-col='${index}'][data-field='unit']`)?.value || "",
+    frame: root.querySelector(`[data-col='${index}'][data-field='frame']`)?.value || "",
+  }));
+}
+
+function channelValue(columns, channel, field, fallback) {
+  const found = columns.find((column) => channelOf(column.role) === channel && column[field]);
+  return found ? found[field] : fallback;
+}
+
 export function readEditor(root) {
   const value = (field) => root.querySelector(`[data-field='${field}']`)?.value ?? "";
-  const roles = [...root.querySelectorAll("[data-col]")].map((select) => select.value);
+  const columns = columnRoles(root);
+  const roles = columns.map((column) => column.role);
   const lat = value("origin-lat").trim();
   const lon = value("origin-lon").trim();
   const alt = value("origin-alt").trim();
   return {
     headerLines: Number(value("header")),
     delimiter: value("delimiter"),
-    positionFrame: value("position-frame"),
-    velocityFrame: value("velocity-frame"),
-    accelerationFrame: value("acceleration-frame"),
-    positionUnit: value("position"),
-    velocityUnit: value("velocity"),
-    accelerationUnit: value("acceleration"),
-    orientationUnit: value("orientation"),
-    massUnit: value("mass"),
+    positionFrame: channelValue(columns, "position", "frame", ""),
+    velocityFrame: channelValue(columns, "velocity", "frame", ""),
+    accelerationFrame: channelValue(columns, "acceleration", "frame", ""),
+    positionUnit: channelValue(columns, "position", "unit", "m"),
+    velocityUnit: channelValue(columns, "velocity", "unit", "m/s"),
+    accelerationUnit: channelValue(columns, "acceleration", "unit", "m/s^2"),
+    orientationUnit: channelValue(columns, "orientation", "unit", "rad"),
+    massUnit: channelValue(columns, "mass", "unit", "kg"),
     roles,
     originLat: lat === "" ? null : Number(lat),
     originLon: lon === "" ? null : Number(lon),
@@ -413,7 +456,7 @@ export function buildClassification(draft) {
     columns,
     confidence_score: 1,
     unsupported_flag: false,
-    reasoning: "Assigned in the schema editor.",
+    reasoning: "Assigned on the trajectory file format.",
   };
 }
 
@@ -456,18 +499,55 @@ function formatByteCount(value) {
   return `${Math.round(n)} B`;
 }
 
+function replaceChannelControls(cell, index, role, unit, frame) {
+  cell.querySelectorAll("[data-field='unit'], [data-field='frame']").forEach((node) => node.closest("label")?.remove());
+  const extra = document.createElement("span");
+  extra.innerHTML = unitFrameHtml(index, role, unit, frame);
+  while (extra.firstChild) cell.appendChild(extra.firstChild);
+}
+
+function syncChannel(root, index) {
+  const role = root.querySelector(`[data-col='${index}'][data-field='role']`)?.value || "";
+  const channel = channelOf(role);
+  if (!channel) return;
+  const unit = root.querySelector(`[data-col='${index}'][data-field='unit']`)?.value;
+  const frame = root.querySelector(`[data-col='${index}'][data-field='frame']`)?.value;
+  root.querySelectorAll("[data-field='role']").forEach((select) => {
+    if (select.dataset.col === String(index) || channelOf(select.value) !== channel) return;
+    const otherUnit = root.querySelector(`[data-col='${select.dataset.col}'][data-field='unit']`);
+    const otherFrame = root.querySelector(`[data-col='${select.dataset.col}'][data-field='frame']`);
+    if (otherUnit && unit) otherUnit.value = unit;
+    if (otherFrame && frame != null) otherFrame.value = frame;
+  });
+}
+
+function toggleOrigin(root) {
+  const block = root.querySelector("[data-role='origin-fields']");
+  if (!block) return;
+  const position = [...root.querySelectorAll("[data-field='role']")].find((select) => channelOf(select.value) === "position");
+  const frame = position
+    ? root.querySelector(`[data-col='${position.dataset.col}'][data-field='frame']`)?.value
+    : "";
+  block.hidden = frame !== "NED" && frame !== "NEU";
+}
+
 export function bindReview(root, handlers) {
-  root.querySelector("[data-act='schema-yes']")?.addEventListener("click", () => handlers.onYes?.());
-  root.querySelector("[data-act='schema-no']")?.addEventListener("click", () => handlers.onNo?.());
   root.querySelector("[data-act='schema-cancel']")?.addEventListener("click", () => handlers.onCancel?.());
-  root.querySelector("[data-act='schema-save']")?.addEventListener("click", () => handlers.onSave?.(readEditor(root)));
+  root.querySelector("[data-act='schema-save']")?.addEventListener("click", () => {
+    handlers.onSave?.(readEditor(root));
+  });
   root.querySelector("[data-act='schema-load']")?.addEventListener("click", () => handlers.onLoad?.());
   root.querySelector("[data-act='schema-review']")?.addEventListener("click", () => handlers.onReview?.());
   root.querySelector("[data-act='schema-dismiss']")?.addEventListener("click", () => handlers.onDismiss?.());
-  root.querySelector("[data-field='frame']")?.addEventListener("change", () => {
-    const block = root.querySelector("[data-role='origin-fields']");
-    if (!block) return;
-    const frame = root.querySelector("[data-field='frame']")?.value;
-    block.hidden = frame !== "NED" && frame !== "NEU";
+  root.addEventListener("change", (event) => {
+    const select = event.target.closest?.("select");
+    if (!select || !root.contains(select) || select.dataset.col == null) return;
+    const index = select.dataset.col;
+    if (select.dataset.field === "role") {
+      const cell = select.closest("[data-column]");
+      if (cell) replaceChannelControls(cell, index, select.value, "", "");
+    }
+    syncChannel(root, index);
+    toggleOrigin(root);
   });
 }
