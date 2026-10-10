@@ -1506,12 +1506,12 @@ fn commit_schema_assignments(
         if !may_load(&class, assignment.user_assigned) {
             let why = manual_reason(&class);
             let why = if why.is_empty() {
-                "schema is not usable".to_string()
+                "trajectory file format is not usable".to_string()
             } else {
                 why
             };
             for path in &assignment.paths {
-                errors.push(format!("{path}: schema needs a manual assignment ({why})"));
+                errors.push(format!("{path}: trajectory file format needs a manual assignment ({why})"));
             }
             continue;
         }

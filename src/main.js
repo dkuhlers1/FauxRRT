@@ -374,7 +374,7 @@ async function runClassify(cmd, dest) {
       hideSchemaReview();
       fileLoadError = errors.length
         ? errors.join("\n")
-        : "Classification returned no schema and no error.";
+        : "Classification returned no trajectory file format and no error.";
       els.progress.textContent = fileLoadError.split("\n")[0];
       return;
     }
@@ -458,8 +458,7 @@ function showNextSchema() {
   }
   const group = schemaSession.groups[index];
   showSchemaOverlay(reviewCardHtml(group, index, schemaSession.groups.length), {
-    onYes: () => confirmSchema(index),
-    onNo: () => rejectSchema(index),
+    onSave: (draft) => saveSchemaEditor(index, draft),
     onCancel: () => {
       hideSchemaReview();
       render();
@@ -586,7 +585,7 @@ async function commitSchemaGroups(groups) {
     if (errors.length) schemaSession.errors = errors;
     fileLoadError = errors.join("\n");
     els.progress.textContent = errors.length
-      ? `${errors.length} file(s) still need a schema`
+      ? `${errors.length} file(s) still need a trajectory file format`
       : result.tracks?.length
         ? `Loaded ${result.tracks.length} exclusive traj → ${destLabel}`
         : uniqueSchemaSummary(schemaSession.groups);

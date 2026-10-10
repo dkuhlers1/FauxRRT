@@ -70,7 +70,7 @@ pub fn parse_path_with(path: &Path, mapping: Option<&ColumnMapping>) -> Result<P
 }
 
 pub fn parse_text(text: &str, mapping: Option<&ColumnMapping>) -> Result<ParsedTrack, String> {
-    let preview = detect_preview(text).ok_or_else(|| "could not detect a columnar schema".to_string())?;
+    let preview = detect_preview(text).ok_or_else(|| "could not detect a columnar trajectory file format".to_string())?;
     let mut schema = detect_schema(&preview);
     if let Some(mapping) = mapping {
         schema.apply_mapping(mapping);

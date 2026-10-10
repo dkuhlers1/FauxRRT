@@ -50,12 +50,12 @@ function group(name, overrides = {}) {
   };
 }
 
-test("summary counts unique schemas and the files that share them", () => {
+test("summary counts unique trajectory file formats and the files that share them", () => {
   const groups = [
     group("a", { files: [file("a.csv"), file("b.csv")] }),
     group("c"),
   ];
-  assert.equal(uniqueSchemaSummary(groups), "2 unique schemas detected across 3 files.");
+  assert.equal(uniqueSchemaSummary(groups), "2 unique trajectory file formats detected across 3 files.");
 });
 
 test("decline loads confident schemas and holds manual ones", () => {
@@ -123,7 +123,7 @@ test("accepted schemas are not asked again", () => {
   assert.equal(uniqueSchemaSummary(groups).includes("2 already confirmed"), true);
 });
 
-test("review markup marks header lines and column roles", () => {
+test("review markup marks header lines and column roles on the file text", () => {
   const html = reviewCardHtml(group("a", {
     files: [{
       path: "/data/a.csv",
@@ -135,16 +135,27 @@ test("review markup marks header lines and column roles", () => {
     }],
   }), 0, 1);
   assert.match(html, /data-role="file-text"/);
-  assert.match(html, /# flight\n0,1,2,3\n1,4,5,6/);
+  assert.match(html, /<pre class="schema-rawline"># flight<\/pre>/);
+  assert.match(html, /<pre class="schema-rawline">0,1,2,3<\/pre>/);
+  assert.match(html, /<pre class="schema-rawline">1,4,5,6<\/pre>/);
+  assert.match(html, /data-line-kind="header"/);
+  assert.match(html, /data-role="column-marks"/);
+  assert.match(html, /data-field="role"/);
+  assert.match(html, /data-field="frame"/);
+  assert.match(html, /pos_x/);
+  assert.match(html, /Confirm trajectory file format/);
   assert.doesNotMatch(html, /schema-role/);
-  assert.match(html, /data-act="schema-yes"/);
+  assert.doesNotMatch(html, /Correct schema/);
+  assert.doesNotMatch(html, /Confirm this schema/);
   const tabbed = editorHtml(group("tab", {
     classification: { ...group("tab").classification, delimiter: "\t" },
   }), 0, 1);
-  assert.match(tabbed, /value="tab" selected/);
+  assert.match(tabbed, /data-field="delimiter" value="tab"/);
   const manual = reviewCardHtml(group("low", { needs_manual: true, manual_reason: "confidence 0.20 is low" }), 0, 1);
-  assert.doesNotMatch(manual, /data-act="schema-yes"/);
-  assert.match(manual, /Correct schema/);
+  assert.match(manual, /data-role="model-error"/);
+  assert.match(manual, /confidence 0.20 is low/);
+  assert.match(manual, /data-act="schema-save"/);
+  assert.doesNotMatch(manual, /data-field="position-frame"/);
 });
 
 test("editor requires an origin for a local frame that has none", () => {
@@ -163,9 +174,11 @@ test("editor requires an origin for a local frame that has none", () => {
   });
   const html = editorHtml(pending, 0, 1);
   assert.match(html, /data-field="header"/);
-  assert.match(html, /data-field="position-frame"/);
-  assert.match(html, /time,x,y,z\n0,1,2,3\n1,1,2,4/);
+  assert.match(html, /data-field="frame"/);
+  assert.match(html, /<pre class="schema-rawline">time,x,y,z<\/pre>/);
+  assert.match(html, /<pre class="schema-rawline">0,1,2,3<\/pre>/);
   assert.match(html, /Origin latitude/);
+  assert.doesNotMatch(html, /Correct this schema/);
   const draft = {
     headerLines: 0,
     delimiter: ",",
@@ -191,7 +204,7 @@ test("editor requires an origin for a local frame that has none", () => {
   assert.equal(assignmentOf(edited).paths[0], "/data/ned.csv");
 });
 
-test("a failed model schema opens the editor with the error", () => {
+test("a failed model format opens the column marks with the error", () => {
   const html = editorHtml(
     group("bad", {
       needs_manual: true,
@@ -204,6 +217,8 @@ test("a failed model schema opens the editor with the error", () => {
   assert.match(html, /data-role="model-error"/);
   assert.match(html, /model output was not a JSON object/);
   assert.match(html, /data-act="schema-save"/);
+  assert.match(html, /Confirm trajectory file format/);
+  assert.doesNotMatch(html, /Save schema/);
 });
 
 test("a rejected load command stays visible instead of becoming a blank object", () => {
