@@ -91,9 +91,12 @@ let missionWind = {
   source: "",
   time: "",
 };
-const objectLoadName = new Map();
+// Initialized before the top-level mission load. That await calls
+// applySnapshot / refreshRisk, which reach queueGlobeWind while later
+// `let` bindings are still in the temporal dead zone.
 let windShownStamp = "";
 let windRequestStamp = "";
+const objectLoadName = new Map();
 let objectNameDraft = null;
 let modeNameDraft = null;
 /** @type {number | null | undefined} undefined = expand first object */
