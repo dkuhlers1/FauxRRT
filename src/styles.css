@@ -436,6 +436,8 @@ input[type="number"], input[type="text"] {
   margin-bottom: 6px;
 }
 .dest-row select, .dest-row input { flex: 1; min-width: 0; }
+.dest-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+.dest-actions button { flex: 0 0 auto; }
 .dest-hint {
   font-size: 12px;
   color: var(--text);

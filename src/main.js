@@ -56,7 +56,13 @@ import {
   loadFailureMessage,
   uniqueSchemaSummary,
 } from "./schema-review.js";
-import { propagateStage, propagationModeName } from "./propagate-stage.js";
+import { propagateStage } from "./propagate-stage.js";
+import {
+  nextModeName,
+  nextObjectName,
+  resolveTrajectoryDest,
+  trajectoryDrawerDestHtml,
+} from "./trajectory-dest.js";
 
 const tracks = new Map();
 let schemaSession = null;
@@ -93,6 +99,8 @@ let missionWind = {
 let windShownStamp = "";
 let windRequestStamp = "";
 const objectLoadName = new Map();
+let objectNameDraft = null;
+let modeNameDraft = null;
 /** @type {number | null | undefined} undefined = expand first object */
 let expandedObjectId = undefined;
 let pendingExpandLast = false;
@@ -103,6 +111,10 @@ let drawerView = null;
 let drawerLoadMethod = null;
 /** @type {number | null} */
 let trajObjectId = null;
+/** @type {Map<number, number>} selected mode id per object */
+const selectedModeByObject = new Map();
+let destPromise = null;
+let pendingModeSelect = null;
 const sixDofEnv = {
   atmosphere: "standard_atmosphere",
   wind_speed_mps: 0,
@@ -194,7 +206,7 @@ els.fit?.addEventListener("click", () => {
   }
   flyToImpactsOrTracks(list);
 });
-els.addObject?.addEventListener("click", () => createObject());
+els.addObject?.addEventListener("click", () => addTrajectoryObject());
 els.showImpacts?.addEventListener("change", () => {
   setImpactVisible(els.showImpacts.checked);
   persistMissionUi();
@@ -1057,11 +1069,275 @@ async function deleteBoat(id) {
   render();
 }
 
-async function createObject() {
-  const name = `Object ${(riskModel.objects?.length || 0) + 1}`;
-  pendingFocus = { focusModeName: true };
-  pendingExpandLast = true;
-  await mutateRisk("create_object", { name, source: "files" });
+function shellMissing(err) {
+  return /TAURI|__TAURI|invoke/i.test(String(err));
+}
+
+function nextLocalId() {
+  let max = 0;
+  for (const obj of riskModel.objects || []) {
+    max = Math.max(max, Number(obj.id) || 0);
+    for (const mode of obj.modes || []) max = Math.max(max, Number(mode.id) || 0);
+  }
+  return max + 1;
+}
+
+function rememberMode(objectId, mode) {
+  if (!mode || objectId == null) return;
+  selectedModeByObject.set(objectId, mode.id);
+  objectLoadName.set(objectId, mode.name);
+}
+
+function selectedMode(obj) {
+  if (!obj) return null;
+  const modes = obj.modes || [];
+  if (pendingModeSelect && pendingModeSelect.objectId === obj.id) {
+    const pending = modes.find((mode) => mode.name === pendingModeSelect.name);
+    if (pending) {
+      pendingModeSelect = null;
+      rememberMode(obj.id, pending);
+      return pending;
+    }
+  }
+  const savedId = selectedModeByObject.get(obj.id);
+  if (savedId != null) {
+    const hit = modes.find((mode) => mode.id === savedId);
+    if (hit) return hit;
+  }
+  const savedName = objectLoadName.get(obj.id);
+  if (savedName) {
+    const hit = modes.find((mode) => mode.name.toLowerCase() === String(savedName).trim().toLowerCase());
+    if (hit) return hit;
+  }
+  return modes.find((mode) => mode.name.toLowerCase() === "nominal") || modes[0] || null;
+}
+
+function installLocalObject(name) {
+  if (!riskModel.objects) riskModel.objects = [];
+  if (!riskModel.unassigned) riskModel.unassigned = [];
+  const id = nextLocalId();
+  const modeId = id + 1;
+  const obj = {
+    id,
+    name,
+    source: "files",
+    modes: [{ id: modeId, name: "Nominal", probability: 1, tracks: [], track_count: 0, trajectory_prob_sum: 0 }],
+    valid: false,
+    failure_mode_sum: 1,
+    trajectory_prob_sum: 0,
+    issues: [],
+  };
+  riskModel.objects.push(obj);
+  trajObjectId = id;
+  expandedObjectId = id;
+  pendingExpandLast = false;
+  rememberMode(id, obj.modes[0]);
+  return obj;
+}
+
+async function createObjectWithNominal(name, opts = {}) {
+  let createdId = null;
+  try {
+    riskModel = await invoke("create_object", ipcArgs({ name, source: "files" }));
+    applyRiskToTracks();
+    syncTracksToModel();
+    const created = riskModel.objects?.[riskModel.objects.length - 1];
+    createdId = created?.id ?? null;
+    if (created && !(created.modes || []).length) {
+      riskModel = await invoke("create_failure_mode", ipcArgs({
+        objectId: created.id,
+        name: "Nominal",
+        probability: 1,
+      }));
+      applyRiskToTracks();
+      syncTracksToModel();
+    }
+    await refreshOverlays({ force: true, immediate: true });
+    await refreshMission();
+  } catch (err) {
+    if (shellMissing(err)) {
+      const obj = installLocalObject(name);
+      render();
+      if (opts.focusName) focusObjectNameField();
+      return obj;
+    }
+    els.progress.textContent = String(err);
+    return null;
+  }
+  const obj = riskModel.objects.find((item) => item.id === createdId) || riskModel.objects[riskModel.objects.length - 1];
+  if (obj) {
+    trajObjectId = obj.id;
+    expandedObjectId = obj.id;
+    pendingExpandLast = false;
+    rememberMode(obj.id, selectedMode(obj));
+  }
+  render();
+  if (opts.focusName) focusObjectNameField();
+  return obj || null;
+}
+
+function focusObjectNameField() {
+  const input = trajHost()?.querySelector("[data-role='obj-name']");
+  input?.focus();
+  input?.select();
+}
+
+async function ensureNominalMode(obj) {
+  if (!obj || (obj.modes || []).length) return obj;
+  try {
+    riskModel = await invoke("create_failure_mode", ipcArgs({
+      objectId: obj.id,
+      name: "Nominal",
+      probability: 1,
+    }));
+    applyRiskToTracks();
+    syncTracksToModel();
+    await refreshOverlays({ force: true, immediate: true });
+    await refreshMission();
+  } catch (err) {
+    if (!shellMissing(err)) {
+      els.progress.textContent = String(err);
+      return obj;
+    }
+    const mode = { id: nextLocalId(), name: "Nominal", probability: 1, tracks: [], track_count: 0, trajectory_prob_sum: 0 };
+    obj.modes = [mode];
+    rememberMode(obj.id, mode);
+    render();
+    return obj;
+  }
+  const fresh = riskModel.objects.find((item) => item.id === obj.id) || activeLoadObject();
+  if (fresh) rememberMode(fresh.id, selectedMode(fresh));
+  render();
+  return fresh || obj;
+}
+
+function ensureTrajectoryDestination() {
+  const objects = riskModel.objects || [];
+  const obj = activeLoadObject();
+  if (objects.length && obj && (obj.modes || []).length) return Promise.resolve(obj);
+  if (!destPromise) {
+    const run = !objects.length
+      ? createObjectWithNominal(nextObjectName(objects))
+      : ensureNominalMode(obj || objects[0]);
+    destPromise = Promise.resolve(run).finally(() => {
+      destPromise = null;
+    });
+  }
+  return destPromise;
+}
+
+function maybeEnsureDest() {
+  const objects = riskModel.objects || [];
+  const obj = activeLoadObject();
+  if (objects.length && obj && (obj.modes || []).length) return;
+  ensureTrajectoryDestination();
+}
+
+async function addTrajectoryObject() {
+  const name = nextObjectName(riskModel.objects);
+  await createObjectWithNominal(name, { focusName: true });
+}
+
+async function addTrajectoryMode() {
+  const obj = activeLoadObject() || await ensureTrajectoryDestination();
+  if (!obj) return;
+  const name = nextModeName(obj.modes);
+  const probability = (obj.modes || []).length ? 0 : 1;
+  pendingModeSelect = { objectId: obj.id, name };
+  try {
+    riskModel = await invoke("create_failure_mode", ipcArgs({
+      objectId: obj.id,
+      name,
+      probability,
+    }));
+    applyRiskToTracks();
+    syncTracksToModel();
+    await refreshOverlays({ force: true, immediate: true });
+    await refreshMission();
+    const fresh = riskModel.objects.find((item) => item.id === obj.id);
+    rememberMode(obj.id, selectedMode(fresh));
+    trajObjectId = obj.id;
+    render();
+  } catch (err) {
+    if (!shellMissing(err)) {
+      pendingModeSelect = null;
+      els.progress.textContent = String(err);
+      return;
+    }
+    const mode = {
+      id: nextLocalId(),
+      name,
+      probability,
+      tracks: [],
+      track_count: 0,
+      trajectory_prob_sum: 0,
+    };
+    if (!obj.modes) obj.modes = [];
+    obj.modes.push(mode);
+    pendingModeSelect = null;
+    rememberMode(obj.id, mode);
+    render();
+  }
+}
+
+async function commitDestEdits(obj) {
+  if (!obj) return obj;
+  const host = trajHost();
+  const objectName = fieldText(host?.querySelector("[data-role='obj-name']"));
+  if (objectName && objectName !== obj.name) {
+    try {
+      riskModel = await invoke("rename_object", ipcArgs({ id: obj.id, name: objectName }));
+      applyRiskToTracks();
+      syncTracksToModel();
+    } catch (err) {
+      if (!shellMissing(err)) throw err;
+      obj.name = objectName;
+    }
+  }
+  const fresh = riskModel.objects.find((item) => item.id === obj.id) || obj;
+  const mode = selectedMode(fresh);
+  const modeName = fieldText(host?.querySelector("[data-role='load-mode-name']"));
+  if (mode && modeName && modeName !== mode.name) {
+    try {
+      riskModel = await invoke("update_failure_mode", ipcArgs({ id: mode.id, name: modeName }));
+      applyRiskToTracks();
+      syncTracksToModel();
+      const renamed = (riskModel.objects.find((item) => item.id === obj.id)?.modes || []).find((item) => item.id === mode.id);
+      rememberMode(obj.id, renamed || { ...mode, name: modeName });
+    } catch (err) {
+      if (!shellMissing(err)) throw err;
+      mode.name = modeName;
+      rememberMode(obj.id, mode);
+    }
+  }
+  return riskModel.objects.find((item) => item.id === obj.id) || fresh;
+}
+
+async function requireLoadTarget() {
+  const obj = activeLoadObject() || await ensureTrajectoryDestination();
+  if (!obj) {
+    els.progress.textContent = "Add an object, then load trajectories.";
+    return null;
+  }
+  try {
+    await commitDestEdits(obj);
+  } catch (err) {
+    els.progress.textContent = String(err);
+    return null;
+  }
+  const fresh = activeLoadObject() || obj;
+  const mode = selectedMode(fresh);
+  const shown = fieldText(trajHost()?.querySelector("[data-role='load-mode-name']"));
+  const modeName = mode?.name || shown || "Nominal";
+  if (!modeName) {
+    els.progress.textContent = "Add a mode, then load trajectories.";
+    return null;
+  }
+  if (mode) rememberMode(fresh.id, mode);
+  else objectLoadName.set(fresh.id, modeName);
+  simDraft.destObjectId = fresh.id;
+  expandedObjectId = fresh.id;
+  return { objectId: fresh.id, modeName, objectName: fresh.name };
 }
 
 function isObjectExpanded(id) {
@@ -1226,14 +1502,6 @@ function ipcArgs(args) {
   return out;
 }
 
-function suggestedModeName(obj) {
-  const used = new Set((obj.modes || []).map((m) => m.name.trim().toLowerCase()));
-  for (const candidate of ["Nominal", "Failure", "Abort", "Staging"]) {
-    if (!used.has(candidate.toLowerCase())) return candidate;
-  }
-  return `Mode ${(obj.modes?.length || 0) + 1}`;
-}
-
 function fieldText(el) {
   const v = el?.value;
   return typeof v === "string" ? v.trim() : "";
@@ -1358,7 +1626,7 @@ function renderRisk() {
       )
       .join("");
     els.objectList.innerHTML = `
-      <div class="empty">Add an object, then open Trajectories to load CSVs, generate a flight, or branch from an existing state.</div>
+      <div class="empty">Open Trajectories to add Object 1, then load CSVs, generate a flight, or branch from an existing state.</div>
       ${recent ? `<div class="recent-missions"><div class="muted">Recent missions</div>${recent}</div>` : ""}`;
     els.objectList.querySelectorAll("[data-recent-path]").forEach((btn) => {
       btn.addEventListener("click", () => openRecent(btn.dataset.recentPath));
@@ -1388,7 +1656,7 @@ function renderRisk() {
     if (expanded) {
     const modesEl = card.querySelector(".modes");
     if (!obj.modes.length) {
-      modesEl.innerHTML = `<div class="empty">No modes yet. Name a mode in Trajectories, then load or generate flights.</div>`;
+      modesEl.innerHTML = `<div class="empty">No modes yet. Use + Mode in Trajectories, then load or generate flights.</div>`;
     }
     for (const mode of obj.modes) {
       const block = document.createElement("div");
@@ -1426,6 +1694,7 @@ function renderRisk() {
       objectMethod.delete(obj.id);
       objectLoadName.delete(obj.id);
       if (trajObjectId === obj.id) trajObjectId = null;
+      selectedModeByObject.delete(obj.id);
       if (rocketpyOpenId === obj.id) closeRocketPyBuilder({ render: false });
     });
     card.querySelector('[data-act="toggle-card"]').addEventListener("click", (ev) => {
@@ -2029,21 +2298,6 @@ function closeRocketPyBuilder(opts = {}) {
   if (opts.render !== false) render();
 }
 
-function requireModeNameFor(objectId) {
-  const host = trajHost();
-  const modeName = fieldText(host?.querySelector("[data-role='load-mode-name']"))
-    || objectLoadName.get(objectId)
-    || "";
-  if (!modeName) {
-    els.progress.textContent = "Enter a mode name, then fly 6DOF.";
-    openDrawer("trajectories");
-    trajHost()?.querySelector("[data-role='load-mode-name']")?.focus();
-    return "";
-  }
-  objectLoadName.set(objectId, modeName);
-  return modeName;
-}
-
 function globeWindStamp() {
   const w = missionWind;
   const sites = (riskModel.objects || []).map((obj) => {
@@ -2322,27 +2576,6 @@ function setObjectMethod(objectId, method) {
   render();
 }
 
-function loadModeFor(obj) {
-  const modes = obj.modes || [];
-  const saved = objectLoadName.get(obj.id);
-  if (saved) {
-    const match = modes.find((mode) => mode.name.toLowerCase() === saved.toLowerCase());
-    if (match) return match;
-  }
-  return modes.find((mode) => mode.name.toLowerCase() === "nominal") || modes[0] || null;
-}
-
-function requireModeName(host, obj) {
-  const name = fieldText(host.querySelector("[data-role='load-mode-name']"));
-  if (!name) {
-    els.progress.textContent = "Enter a mode name, then add trajectories.";
-    host.querySelector("[data-role='load-mode-name']")?.focus();
-    return "";
-  }
-  objectLoadName.set(obj.id, name);
-  return name;
-}
-
 function trajHost() {
   return document.getElementById("drawer-trajectories");
 }
@@ -2497,41 +2730,31 @@ function restoreFieldFocus(root, focus) {
 function renderTrajectoryDrawer() {
   const root = trajHost();
   if (!root || drawerView !== "trajectories") return;
+  maybeEnsureDest();
   const focus = captureFieldFocus(root);
   const obj = activeLoadObject();
+  const mode = selectedMode(obj);
+  if (obj && mode) rememberMode(obj.id, mode);
+  const dest = resolveTrajectoryDest(riskModel.objects, {
+    objectId: obj?.id,
+    modeId: mode?.id,
+    modeName: mode?.name || (obj ? objectLoadName.get(obj.id) : ""),
+  });
   const method = drawerLoadMethod;
-  const objects = riskModel.objects || [];
-  const modeName = obj
-    ? (objectLoadName.get(obj.id) || loadModeFor(obj)?.name || suggestedModeName(obj))
-    : "";
-  if (obj && modeName && !String(objectLoadName.get(obj.id) || "").trim()) {
-    objectLoadName.set(obj.id, modeName);
-  }
-  const destLabel = escapeHtml(modeName || "the mode");
-  const objectOptions = objects
-    .map((o) => `<option value="${o.id}"${obj && o.id === obj.id ? " selected" : ""}>${escapeHtml(o.name)}</option>`)
-    .join("");
-  const modeOptions = (obj?.modes || [])
-    .map((mode) => `<option value="${escapeHtml(mode.name)}"></option>`)
-    .join("");
+  const modeName = dest.mode?.name || "Nominal";
+  const destLabel = escapeHtml(modeName);
   const paths = [
     ["files", "From file", "Load recorded flights from CSV or text files, or from a folder."],
     ["generate", "Generate", "Build a 3DOF ballistic flight or a 6DOF flight."],
     ["from-state", "From state vector", "Branch a spent stage, FTS debris, or a nav failure from a state on an existing trajectory."],
   ];
   root.innerHTML = `
-    <div class="drawer-dest">
-      ${objects.length ? `
-        <label class="dest-row">Object
-          <select data-role="traj-object" aria-label="Object that receives new trajectories">${objectOptions}</select>
-        </label>
-        <label class="dest-row">Mode
-          <input type="text" data-role="load-mode-name" list="traj-mode-names" value="${escapeHtml(modeName)}" placeholder="e.g. Nominal" aria-label="Mode that receives new trajectories" />
-        </label>
-        <datalist id="traj-mode-names">${modeOptions}</datalist>
-        <p class="muted wind-hint">New trajectories go into this object and mode. A new mode name creates the mode.</p>
-      ` : `<div class="dest-hint">Add an object in the risk model first. Each load path below is how flights get into a mode.</div>`}
-    </div>
+    ${trajectoryDrawerDestHtml({
+      objects: riskModel.objects,
+      objectId: obj?.id,
+      modeId: mode?.id,
+      modeName: mode?.name,
+    })}
     ${paths.map(([id, title, blurb]) => `
       <section class="load-path${method === id ? "" : " collapsed"}" data-load-path="${id}">
         <button type="button" class="load-path-head" data-load-path-btn="${id}" aria-expanded="${method === id}">
@@ -2540,25 +2763,132 @@ function renderTrajectoryDrawer() {
         </button>
         <div class="load-path-body" data-load-body="${id}"></div>
       </section>`).join("")}`;
+  root.querySelector("[data-act='add-object']")?.addEventListener("click", () => {
+    addTrajectoryObject();
+  });
+  root.querySelector("[data-act='add-mode']")?.addEventListener("click", () => {
+    addTrajectoryMode();
+  });
   root.querySelector("[data-role='traj-object']")?.addEventListener("change", (ev) => {
-    trajObjectId = Number(ev.target.value);
+    const id = Number(ev.target.value);
+    if (!Number.isFinite(id)) return;
+    objectNameDraft = null;
+    modeNameDraft = null;
+    trajObjectId = id;
+    expandedObjectId = id;
     render();
   });
-  root.querySelector("[data-role='load-mode-name']")?.addEventListener("input", (ev) => {
-    if (obj) objectLoadName.set(obj.id, ev.target.value.trim());
+  root.querySelector("[data-role='traj-mode']")?.addEventListener("change", (ev) => {
+    const current = activeLoadObject();
+    if (!current) return;
+    const id = Number(ev.target.value);
+    const picked = (current.modes || []).find((item) => item.id === id || String(item.id) === ev.target.value);
+    if (!picked) return;
+    modeNameDraft = null;
+    rememberMode(current.id, picked);
+    render();
+  });
+  const objectNameInput = root.querySelector("[data-role='obj-name']");
+  objectNameInput?.addEventListener("input", () => {
+    objectNameDraft = { id: activeLoadObject()?.id ?? null, value: objectNameInput.value };
+  });
+  objectNameInput?.addEventListener("change", (ev) => {
+    const name = ev.target.value.trim();
+    objectNameDraft = null;
+    if (!name) return;
+    const current = activeLoadObject();
+    if (!current) {
+      ensureTrajectoryDestination().then((created) => {
+        if (created && name !== created.name) renameTrajectoryObject(created, name);
+      });
+      return;
+    }
+    if (name === current.name) return;
+    renameTrajectoryObject(current, name);
+  });
+  const modeNameInput = root.querySelector("[data-role='load-mode-name']");
+  modeNameInput?.addEventListener("input", () => {
+    const current = activeLoadObject();
+    modeNameDraft = { objectId: current?.id ?? null, modeId: selectedMode(current)?.id ?? null, value: modeNameInput.value };
+  });
+  modeNameInput?.addEventListener("change", (ev) => {
+    const name = ev.target.value.trim();
+    modeNameDraft = null;
+    if (!name) return;
+    const apply = (current) => {
+      const picked = selectedMode(current);
+      if (!current || !picked || name === picked.name) return;
+      renameTrajectoryMode(current, picked, name);
+    };
+    const current = activeLoadObject();
+    if (!current) {
+      ensureTrajectoryDestination().then(apply);
+      return;
+    }
+    apply(current);
   });
   root.querySelectorAll("[data-load-path-btn]").forEach((btn) => {
-    btn.addEventListener("click", () => selectLoadPath(btn.dataset.loadPathBtn, obj));
+    btn.addEventListener("click", () => selectLoadPath(btn.dataset.loadPathBtn, activeLoadObject()));
   });
   if (method === "files") fillFileLoad(root.querySelector("[data-load-body='files']"), obj, destLabel);
   if (method === "generate") fillGenerateEntry(root.querySelector("[data-load-body='generate']"), obj, destLabel);
   if (method === "from-state") fillStateEntry(root.querySelector("[data-load-body='from-state']"), obj, destLabel);
   if (method !== "from-state") setStateMarker(null);
+  const nameInput = root.querySelector("[data-role='obj-name']");
+  if (nameInput && objectNameDraft && (objectNameDraft.id == null || objectNameDraft.id === obj?.id)) {
+    nameInput.value = objectNameDraft.value;
+  }
+  const modeInput = root.querySelector("[data-role='load-mode-name']");
+  if (modeInput && modeNameDraft
+    && modeNameDraft.objectId === (obj?.id ?? null)
+    && modeNameDraft.modeId === (mode?.id ?? null)) {
+    modeInput.value = modeNameDraft.value;
+  }
   restoreFieldFocus(root, focus);
   refreshSiteMarkers();
 }
 
-function selectLoadPath(method, obj) {
+async function renameTrajectoryObject(obj, name) {
+  try {
+    riskModel = await invoke("rename_object", ipcArgs({ id: obj.id, name }));
+    applyRiskToTracks();
+    syncTracksToModel();
+    await refreshOverlays({ force: true, immediate: true });
+    await refreshMission();
+    render();
+  } catch (err) {
+    if (!shellMissing(err)) {
+      els.progress.textContent = String(err);
+      return;
+    }
+    obj.name = name;
+    render();
+  }
+}
+
+async function renameTrajectoryMode(obj, mode, name) {
+  try {
+    riskModel = await invoke("update_failure_mode", ipcArgs({ id: mode.id, name }));
+    applyRiskToTracks();
+    syncTracksToModel();
+    await refreshOverlays({ force: true, immediate: true });
+    await refreshMission();
+    const renamed = (riskModel.objects.find((item) => item.id === obj.id)?.modes || []).find((item) => item.id === mode.id);
+    rememberMode(obj.id, renamed || { ...mode, name });
+    render();
+  } catch (err) {
+    if (!shellMissing(err)) {
+      els.progress.textContent = String(err);
+      return;
+    }
+    mode.name = name;
+    rememberMode(obj.id, mode);
+    render();
+  }
+}
+
+async function selectLoadPath(method, obj) {
+  if (!obj) obj = activeLoadObject() || await ensureTrajectoryDestination();
   if (drawerLoadMethod === method) {
     drawerLoadMethod = null;
     if (obj) objectMethod.delete(obj.id);
@@ -2591,31 +2921,22 @@ function selectLoadPath(method, obj) {
 
 function fillFileLoad(body, obj, destLabel) {
   if (!body) return;
+  const label = obj ? destLabel : "Nominal";
   body.innerHTML = `
-    <div class="dest-hint">${obj
-      ? `Import recorded flights into <strong>${destLabel}</strong>. A new name creates another mode. Trajectories in a mode are exclusive.`
-      : "Add an object and a mode name, then import recorded flights."}</div>
+    <div class="dest-hint">Import recorded flights into <strong>${label}</strong> on ${obj ? "this object" : "Object 1"}. Trajectories in a mode are exclusive.</div>
     <div class="gen-sites">
       <button type="button" data-act="load-files" class="primary compact">Choose files…</button>
       <button type="button" data-act="load-folder" class="ghost compact">Choose folder…</button>
     </div>
     ${detectionProgressHtml(fileLoadProgress)}
     ${fileLoadError ? `<p class="schema-error" data-role="load-failure">${escapeHtml(fileLoadError)}</p>` : ""}`;
-  const needObject = () => {
-    els.progress.textContent = "Add an object, name a mode, then Load files or Generate.";
+  const loadInto = async (cmd) => {
+    const target = await requireLoadTarget();
+    if (!target) return;
+    runClassify(cmd, { object_id: target.objectId, mode_name: target.modeName });
   };
-  body.querySelector("[data-act='load-files']").addEventListener("click", () => {
-    if (!obj) return needObject();
-    const name = requireModeName(trajHost(), obj);
-    if (!name) return;
-    runClassify("load_files", { object_id: obj.id, mode_name: name });
-  });
-  body.querySelector("[data-act='load-folder']").addEventListener("click", () => {
-    if (!obj) return needObject();
-    const name = requireModeName(trajHost(), obj);
-    if (!name) return;
-    runClassify("load_folder", { object_id: obj.id, mode_name: name });
-  });
+  body.querySelector("[data-act='load-files']").addEventListener("click", () => loadInto("load_files"));
+  body.querySelector("[data-act='load-folder']").addEventListener("click", () => loadInto("load_folder"));
 }
 
 function fillGenerateEntry(body, obj, destLabel) {
@@ -2623,10 +2944,18 @@ function fillGenerateEntry(body, obj, destLabel) {
   if (!obj) {
     body.innerHTML = `
       <div class="method-toggle engine-toggle" role="group" aria-label="Trajectory engine">
-        <button type="button" data-engine="3dof" class="compact" disabled>3DOF ballistic</button>
-        <button type="button" data-engine="rocketpy" class="ghost compact" disabled>6DOF</button>
+        <button type="button" data-engine="3dof" class="compact">3DOF ballistic</button>
+        <button type="button" data-engine="rocketpy" class="ghost compact">6DOF</button>
       </div>
-      <div class="dest-hint">Add an object, then generate a 3DOF ballistic flight or open the 6DOF builder.</div>`;
+      <div class="dest-hint">Generates into Object 1. Choose an engine to set the launch and aim.</div>`;
+    body.querySelectorAll("[data-engine]").forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        const ready = await ensureTrajectoryDestination();
+        if (!ready) return;
+        generateEngine.set(ready.id, btn.dataset.engine);
+        setObjectMethod(ready.id, "generate");
+      });
+    });
     return;
   }
   fillGenerateForm(body, obj, destLabel);
@@ -2635,7 +2964,7 @@ function fillGenerateEntry(body, obj, destLabel) {
 function fillStateEntry(body, obj, destLabel) {
   if (!body) return;
   if (!obj) {
-    body.innerHTML = `<div class="dest-hint">Add an object, then branch a spent stage, FTS debris, or a nav failure into one of its modes.</div>`;
+    body.innerHTML = `<div class="dest-hint">Object 1 receives a spent stage, FTS debris, or a nav failure. Load or generate a source trajectory first.</div>`;
     setStateMarker(null);
     return;
   }
@@ -3404,23 +3733,6 @@ function readSimForm() {
   if (catalog != null && catalog > 0) simDraft.catalogId = catalog;
 }
 
-function destModeName(objectId) {
-  const shown = fieldText(trajHost()?.querySelector("[data-role='load-mode-name']"));
-  const stored = objectId != null ? (objectLoadName.get(objectId) || "") : "";
-  const modeName = propagationModeName(shown, stored);
-  if (modeName && objectId != null) objectLoadName.set(objectId, modeName);
-  return modeName;
-}
-
-function simDestination() {
-  const expandedId = Number(document.querySelector(".object-card:not(.collapsed)")?.dataset.objectId);
-  const objectId = simDraft.destObjectId
-    || (Number.isFinite(expandedId) ? expandedId : null)
-    || null;
-  const modeName = destModeName(objectId);
-  return { objectId, objectName: null, modeName };
-}
-
 function ensureCatalogId() {
   if (simDraft.catalogId && catalogs.some((c) => c.id === simDraft.catalogId)) {
     return simDraft.catalogId;
@@ -3514,11 +3826,8 @@ async function runSimStage() {
     els.progress.textContent = "Pick a source trajectory first.";
     return;
   }
-  const dest = simDestination();
-  if (!dest.objectId || !dest.modeName) {
-    els.progress.textContent = "Enter a mode name, then propagate the spent stage onto this object.";
-    return;
-  }
+  const dest = await requireLoadTarget();
+  if (!dest?.objectId || !dest.modeName) return;
   const dist = simDraft.stage.dist || "point";
   if (dist === "uniform" && simDraft.stage.tMin != null && simDraft.stage.tMax != null) {
     simDraft.timeS = (Number(simDraft.stage.tMin) + Number(simDraft.stage.tMax)) / 2;
@@ -3532,7 +3841,7 @@ async function runSimStage() {
     els.progress.textContent = "Pick a separation time on the source trajectory.";
     return;
   }
-  const shownMode = fieldText(trajHost()?.querySelector("[data-role='load-mode-name']"));
+  const shownMode = dest.modeName;
   setBusy(true);
   els.progress.textContent = dist === "point" ? "Propagating spent stage…" : `Propagating spent stage (${simDraft.stage.count} times)…`;
   try {
@@ -3568,11 +3877,8 @@ async function runSimFts() {
     els.progress.textContent = "Pick a source trajectory first.";
     return;
   }
-  const dest = simDestination();
-  if (!dest.objectId || !dest.modeName) {
-    els.progress.textContent = "Enter a mode name for FTS debris on this object.";
-    return;
-  }
+  const dest = await requireLoadTarget();
+  if (!dest?.objectId || !dest.modeName) return;
   const sample = await ensureInFlightSample();
   const timeS = sample?.time_s ?? simDraft.timeS;
   if (timeS == null || Number.isNaN(Number(timeS))) {
@@ -3614,11 +3920,8 @@ async function runSimNav() {
     return;
   }
   simDraft.trackId = trackId;
-  const dest = simDestination();
-  if (!dest.objectId || !dest.modeName) {
-    els.progress.textContent = "Enter a mode name for nav + FTS on this object.";
-    return;
-  }
+  const dest = await requireLoadTarget();
+  if (!dest?.objectId || !dest.modeName) return;
   const sample = await ensureInFlightSample();
   let times = Array.isArray(simDraft.nav.times) ? simDraft.nav.times.slice() : [];
   const sliderTime = Number(simHost()?.querySelector("[data-sim='time']")?.value);
@@ -3668,17 +3971,12 @@ async function runSimNav() {
 }
 
 async function runGenerate(objectId) {
+  const target = await requireLoadTarget();
+  if (!target) return;
+  objectId = target.objectId;
   const obj = riskModel.objects.find((o) => o.id === objectId);
   if (!obj) return;
-  const card = document.querySelector(`[data-object-id="${objectId}"]`);
-  const modeName = fieldText(card?.querySelector("[data-role='load-mode-name']"))
-    || objectLoadName.get(objectId)
-    || "";
-  if (!modeName) {
-    els.progress.textContent = "Enter a mode name, then generate.";
-    card?.querySelector("[data-role='load-mode-name']")?.focus();
-    return;
-  }
+  const modeName = target.modeName;
   objectLoadName.set(objectId, modeName);
   const draft = draftFor(obj);
   const spec = {
@@ -3728,10 +4026,12 @@ async function runGenerate(objectId) {
 }
 
 async function runRocketPy(objectId) {
+  const target = await requireLoadTarget();
+  if (!target) return;
+  objectId = target.objectId;
   const obj = riskModel.objects.find((o) => o.id === objectId);
   if (!obj) return;
-  const modeName = requireModeNameFor(objectId);
-  if (!modeName) return;
+  const modeName = target.modeName;
   const spec = mergeRocketPySpec(rocketpyDraftFor(obj));
   generateEngine.set(objectId, "rocketpy");
   objectMethod.set(objectId, "generate");
@@ -4098,6 +4398,11 @@ async function applySnapshot(snap, fit) {
   rocketpyDrafts.clear();
   objectMethod.clear();
   objectLoadName.clear();
+  selectedModeByObject.clear();
+  pendingModeSelect = null;
+  objectNameDraft = null;
+  modeNameDraft = null;
+  trajObjectId = null;
   closeRocketPyBuilder({ render: false });
   simDraft.trackId = 0;
   simDraft.timeS = null;
