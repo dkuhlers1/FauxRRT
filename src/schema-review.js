@@ -130,13 +130,31 @@ export function assignmentOf(group) {
   };
 }
 
+function isWhitespaceDelimiter(delimiter) {
+  return delimiter === "whitespace" || delimiter === "space" || delimiter === "tab" || delimiter === "\\t" || delimiter === "\t";
+}
+
+function numericCount(cells) {
+  return cells.filter((cell) => cell !== "" && Number.isFinite(Number(cell))).length;
+}
+
 export function splitFields(line, delimiter) {
   if (!line) return [];
-  if (delimiter === "whitespace" || delimiter === "space") {
+  if (isWhitespaceDelimiter(delimiter)) {
     return line.trim().split(/\s+/).filter((part) => part.length > 0);
   }
-  const ch = delimiter === "\\t" || delimiter === "tab" ? "\t" : delimiter || ",";
+  const ch = delimiter || ",";
   return line.split(ch).map((part) => part.trim());
+}
+
+/** Spaces, tabs, and runs of both separate data columns. A comma header can stay a comma. */
+export function splitDataFields(line, delimiter) {
+  const fields = splitFields(line, delimiter);
+  if (isWhitespaceDelimiter(delimiter)) return fields;
+  const whitespace = splitFields(line, "whitespace");
+  const white = numericCount(whitespace);
+  if (white >= 2 && white > numericCount(fields)) return whitespace;
+  return fields;
 }
 
 /** First lines of the file, unchanged, including the header and the original column text. */
@@ -343,7 +361,7 @@ function sampledLatLon({ lines, delimiter, columns, columnUnits, headerLines = 0
   const lons = [];
   const start = Math.max(0, headerLines);
   (lines || []).slice(start).forEach((line) => {
-    const cells = splitFields(line, delimiter);
+    const cells = splitDataFields(line, delimiter);
     const lat = Number(cells[latIndex]);
     const lon = Number(cells[lonIndex]);
     if (!Number.isFinite(lat) || !Number.isFinite(lon)) return;

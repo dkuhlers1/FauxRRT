@@ -97,7 +97,7 @@ pub fn parse_with_schema(text: &str, schema: DetectedSchema) -> Result<ParsedTra
         if crate::schema::is_comment_line(line) {
             continue;
         }
-        let fields = delim.split(line.trim_end());
+        let fields = delim.split_data(line.trim_end());
         if fields.len() < 2 {
             continue;
         }
@@ -246,7 +246,7 @@ pub fn to_internal_track(
         if line_index < classification.header_lines as usize || line.trim().is_empty() {
             continue;
         }
-        let fields = delim.split(line.trim_end());
+        let fields = delim.split_data(line.trim_end());
         if !marked_numbers(&fields, &needed) {
             if line_has_numeric_row(line) {
                 delimiter_miss += 1;

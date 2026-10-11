@@ -165,7 +165,7 @@ impl Delimiter {
 
     pub fn split(self, line: &str) -> Vec<String> {
         match self {
-            Delimiter::Whitespace => line.split_whitespace().map(|s| s.to_string()).collect(),
+            Delimiter::Whitespace => whitespace_cells(line),
             other => {
                 let ch = match other {
                     Delimiter::Comma => ',',
@@ -178,6 +178,27 @@ impl Delimiter {
             }
         }
     }
+
+    /// Split a data row. Spaces, tabs, and runs of both are one separator.
+    /// A comma, semicolon, or pipe is kept when it separates more numbers than whitespace does.
+    pub fn split_data(self, line: &str) -> Vec<String> {
+        if matches!(self, Delimiter::Whitespace | Delimiter::Tab) {
+            return whitespace_cells(line);
+        }
+        let fields = self.split(line);
+        let whitespace = whitespace_cells(line);
+        let chosen = numeric_cell_count(&fields);
+        let white = numeric_cell_count(&whitespace);
+        if white >= 2 && white > chosen { whitespace } else { fields }
+    }
+}
+
+fn whitespace_cells(line: &str) -> Vec<String> {
+    line.split_whitespace().map(|s| s.to_string()).collect()
+}
+
+fn numeric_cell_count(cells: &[String]) -> usize {
+    cells.iter().filter(|cell| parse_number(cell).is_some()).count()
 }
 
 pub fn is_comment_line(line: &str) -> bool {
@@ -695,5 +716,18 @@ mod tests {
         let schema = detect_schema(&preview);
         assert_eq!(schema.frame, Frame::Ecef);
         assert_eq!(schema.x_col, Some(0));
+    }
+
+    #[test]
+    fn spaces_tabs_and_runs_are_one_separator() {
+        let line = "0.00\t\t30.330000 \t 0.000000  -86.590000";
+        let cells = vec!["0.00".to_string(), "30.330000".into(), "0.000000".into(), "-86.590000".into()];
+        assert_eq!(Delimiter::Whitespace.split_data(line), cells);
+        assert_eq!(Delimiter::Tab.split_data(line), cells);
+        assert_eq!(Delimiter::Comma.split_data(line), cells);
+        assert_eq!(
+            Delimiter::Comma.split_data("0,30.33,-86.59,0"),
+            vec!["0".to_string(), "30.33".into(), "-86.59".into(), "0".into()]
+        );
     }
 }

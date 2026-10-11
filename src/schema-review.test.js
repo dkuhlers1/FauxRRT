@@ -542,3 +542,51 @@ test("radian header values that look like degrees warn without blocking confirm"
   assert.equal(radianLatitudeWarning(realRadians), "");
   assert.equal(angleUnitWarning(realRadians), "");
 });
+
+test("mixed spaces and tabs keep the radian warning without blocking confirm", () => {
+  const mixed = group("mixed", {
+    files: [{
+      path: "/data/mixed.traj",
+      name: "mixed.traj",
+      excerpt: "time, lat(rad), alt_out, lon(rad)\n0.00\t\t30.330000 \t 0.000000  -86.590000\n1.00 \t 30.309023\t\t391.871457\t-86.571993\n",
+      origin_lat: null,
+      origin_lon: null,
+      origin_alt_m: null,
+    }],
+    classification: {
+      header_lines: 1,
+      delimiter: ",",
+      frames: { position: "LLA" },
+      units: { position: "m" },
+      columns: { col_0: "time", col_1: "pos_lat", col_2: "pos_alt", col_3: "pos_lon" },
+      column_units: { col_1: "rad", col_2: "m", col_3: "rad" },
+      confidence_score: 0.95,
+      unsupported_flag: false,
+      reasoning: "Read from the header.",
+    },
+  });
+  assert.equal(angleUnitWarning(mixed), ANGLE_LOOKS_LIKE_DEGREES);
+  assert.equal(radianLatitudeWarning(mixed), RADIAN_LATITUDE_OUTSIDE);
+  const html = reviewCardHtml(mixed, 0, 1);
+  assert.match(html, /data-role="unit-warning"/);
+  assert.match(html, /data-role="radian-latitude"/);
+  assert.match(html, /Confirm trajectory file format/);
+  assert.doesNotMatch(html, /disabled/);
+  const problems = editorProblems({
+    headerLines: 1,
+    delimiter: ",",
+    positionFrame: "LLA",
+    positionUnit: "m",
+    roles: ["time", "pos_lat", "pos_alt", "pos_lon"],
+    columnUnits: { col_1: "rad", col_2: "m", col_3: "rad" },
+  }, mixed);
+  assert.equal(problems.length, 0);
+  const tabbed = structuredClone(mixed);
+  tabbed.classification.delimiter = "tab";
+  assert.equal(angleUnitWarning(tabbed), ANGLE_LOOKS_LIKE_DEGREES);
+  assert.equal(radianLatitudeWarning(tabbed), RADIAN_LATITUDE_OUTSIDE);
+  const degrees = structuredClone(mixed);
+  degrees.classification.column_units = { col_1: "deg", col_2: "m", col_3: "deg" };
+  assert.equal(angleUnitWarning(degrees), "");
+  assert.equal(radianLatitudeWarning(degrees), "");
+});
