@@ -39,8 +39,9 @@ use mission::{
     UNTITLED,
 };
 use classify::{
-    excerpt_of, file_origin, group_files, interpret_header, may_load, manual_reason, normalize_classification,
-    origin_from_text, GroupedFile, LlamaServerPool, SchemaAssignment, SchemaGroup, TrajectoryClassification, CANCELLED,
+    excerpt_of, file_origin, group_files, may_load, manual_reason, normalize_classification, origin_from_text,
+    finish_with_model, interpret_header, GroupedFile, LlamaRuntime, LlamaServerPool, SchemaAssignment, SchemaGroup,
+    TrajectoryClassification, CANCELLED,
 };
 use parse::{parse_path_with, parse_text, parse_with_classification, read_trajectory_text, ParsedTrack};
 use pick::{pick_kml_sources, pick_trajectory_folder, pick_trajectory_sources};
@@ -61,8 +62,8 @@ pub struct AppState {
     store: Mutex<Store>,
     mission: Mutex<MissionSession>,
     classify_cancel: Arc<AtomicBool>,
-    /// Resident llama-server. It stays idle unless a later action asks for it.
-    /// Choose files does not start it. Cancel and app exit still shut it down.
+    /// Resident llama-server. Choose files starts it only after the dialog returns
+    /// and after the local excerpt scan. Cancel and app exit shut it down.
     llama: Arc<LlamaServerPool>,
     /// Last globe animation field. Historical profiles stay out of the mission file.
     wind_anim: Mutex<Option<WindAnimCache>>,
@@ -181,13 +182,14 @@ fn picked_paths(files: Vec<PathBuf>) -> PickedPaths {
 }
 
 /// Read headers after the file dialog has returned. The dialog itself is the command
-/// that opens it. Column marks are interpreted off the UI thread.
+/// that opens it. The excerpt scan and the model run off the UI thread.
 #[tauri::command]
 async fn classify_picked(app: AppHandle, state: State<'_, AppState>, paths: Vec<String>) -> Result<ClassifyResult, String> {
     let cancel = Arc::clone(&state.classify_cancel);
     cancel.store(false, Ordering::SeqCst);
+    let pool = Arc::clone(&state.llama);
     let files: Vec<PathBuf> = paths.into_iter().map(PathBuf::from).collect();
-    tauri::async_runtime::spawn_blocking(move || classify_paths(&app, files, &cancel))
+    tauri::async_runtime::spawn_blocking(move || classify_paths(&app, files, &cancel, &pool))
         .await
         .map_err(|err| format!("classification task failed: {err}"))?
 }
@@ -1386,7 +1388,12 @@ fn resolve_load_mode(
     Ok(Some(store.ensure_named_mode(object_id, name)?))
 }
 
-fn classify_paths(app: &AppHandle, files: Vec<PathBuf>, cancel: &Arc<AtomicBool>) -> Result<ClassifyResult, String> {
+fn classify_paths(
+    app: &AppHandle,
+    files: Vec<PathBuf>,
+    cancel: &Arc<AtomicBool>,
+    pool: &Arc<LlamaServerPool>,
+) -> Result<ClassifyResult, String> {
     let started = Instant::now();
     let total = files.len();
     if total == 0 {
@@ -1398,7 +1405,7 @@ fn classify_paths(app: &AppHandle, files: Vec<PathBuf>, cancel: &Arc<AtomicBool>
         });
     }
     let mut errors = Vec::new();
-    let mut ready = Vec::new();
+    let mut loaded = Vec::new();
     for (index, path) in files.iter().enumerate() {
         if cancel.load(Ordering::SeqCst) {
             return Err(CANCELLED.into());
@@ -1409,16 +1416,69 @@ fn classify_paths(app: &AppHandle, files: Vec<PathBuf>, cancel: &Arc<AtomicBool>
             ProgressEvent {
                 done: index + 1,
                 total,
-                file: format!("Reading {name}"),
+                file: format_detection_label(&name),
                 bytes: 0,
                 bytes_total: 0,
                 device: String::new(),
             },
         );
         match read_trajectory_text(path) {
-            Ok(text) => ready.push(grouped_classification(path, &text, interpret_header(&text))),
+            Ok(text) => {
+                let local = interpret_header(&text);
+                loaded.push((index, path.clone(), text, local));
+            }
             Err(err) => errors.push(err),
         }
+    }
+    let progress_name = loaded.first().map(|(_, path, _, _)| file_name(path)).unwrap_or_default();
+    let runtime = if loaded.is_empty() {
+        None
+    } else {
+        match app.path().app_data_dir() {
+            Ok(dir) => match LlamaRuntime::ensure(
+                &dir,
+                cancel,
+                &|note| {
+                    emit_progress(
+                        app,
+                        ProgressEvent {
+                            done: 0,
+                            total,
+                            file: format!("{}: {}", format_detection_label(&progress_name), note.label),
+                            bytes: note.bytes,
+                            bytes_total: note.bytes_total,
+                            device: note.device,
+                        },
+                    );
+                },
+                pool,
+            ) {
+                Ok(runtime) => Some(runtime),
+                Err(err) if err == CANCELLED || err.contains(CANCELLED) => return Err(CANCELLED.into()),
+                Err(_) => None,
+            },
+            Err(_) => None,
+        }
+    };
+    let mut ready = Vec::new();
+    for (index, path, text, local) in loaded {
+        if cancel.load(Ordering::SeqCst) {
+            return Err(CANCELLED.into());
+        }
+        let name = file_name(&path);
+        emit_progress(
+            app,
+            ProgressEvent {
+                done: index + 1,
+                total,
+                file: format_detection_label(&name),
+                bytes: 0,
+                bytes_total: 0,
+                device: String::new(),
+            },
+        );
+        let class = finish_with_model(local, &text, runtime.as_ref().map(|item| item as &dyn classify::TextCompleter))?;
+        ready.push(grouped_classification(&path, &text, class));
     }
     Ok(ClassifyResult {
         groups: group_files(ready),
@@ -1426,6 +1486,11 @@ fn classify_paths(app: &AppHandle, files: Vec<PathBuf>, cancel: &Arc<AtomicBool>
         elapsed_ms: started.elapsed().as_millis() as u64,
         file_count: total,
     })
+}
+
+/// Progress line while Llama is identifying a trajectory file format.
+pub fn format_detection_label(name: &str) -> String {
+    format!("Detecting trajectory file format for {name}")
 }
 
 fn grouped_classification(path: &Path, text: &str, class: TrajectoryClassification) -> (GroupedFile, TrajectoryClassification) {
@@ -2606,7 +2671,7 @@ mod classify_command_tests {
         let src = include_str!("lib.rs");
         let body = function_source(src, "async fn classify_picked(");
         assert!(body.contains("spawn_blocking"), "{body}");
-        assert!(!body.to_ascii_lowercase().contains("llama"), "{body}");
+        assert!(!body.contains("LlamaRuntime::ensure"), "{body}");
         assert!(src.contains("state.llama.shutdown()"), "Cancel must stop llama-server");
         assert!(src.contains("RunEvent::Exit"), "app exit must stop llama-server");
     }
@@ -2616,10 +2681,19 @@ mod classify_command_tests {
         let src = include_str!("lib.rs");
         let classify = function_source(src, "fn classify_paths(");
         assert!(classify.contains("interpret_header"), "{classify}");
-        assert!(!classify.to_ascii_lowercase().contains("llama"), "{classify}");
+        assert!(classify.contains("finish_with_model"), "{classify}");
+        assert!(classify.contains("format_detection_label"));
+        let scan = classify.find("interpret_header").expect("local scan");
+        let ensure = classify.find("LlamaRuntime::ensure").expect("resident model");
+        assert!(scan < ensure, "the excerpt scan finishes before the model starts");
+        assert!(!classify.contains("reader_needs_model"));
+        assert_eq!(
+            super::format_detection_label("eglin_traj_format_2.traj"),
+            "Detecting trajectory file format for eglin_traj_format_2.traj"
+        );
         let picked = function_source(src, "async fn classify_picked(");
         assert!(picked.contains("spawn_blocking"));
-        assert!(!picked.to_ascii_lowercase().contains("llama"), "{picked}");
+        assert!(!picked.contains("LlamaRuntime::ensure"));
         let dialog = function_source(src, "fn load_files(");
         assert!(dialog.contains("pick_trajectory_sources"));
         assert!(!dialog.to_ascii_lowercase().contains("llama"), "{dialog}");

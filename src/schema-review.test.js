@@ -12,6 +12,9 @@ import {
   editorProblems,
   markCorrection,
   nextPendingIndex,
+  angleUnitWarning,
+  ANGLE_LOOKS_LIKE_DEGREES,
+  ANGLE_LOOKS_LIKE_RADIANS,
   reviewCardHtml,
   reviewHtmlAfterRead,
   formatLoadProgress,
@@ -348,6 +351,17 @@ test("load progress shows bytes, files, and the device", () => {
     "Classifying track.csv (1/3) · Vulkan",
   );
   assert.equal(
+    formatLoadProgress({
+      file: "Detecting trajectory file format for eglin_traj_format_2.traj",
+      done: 1,
+      total: 2,
+      device: "",
+      bytes: 0,
+      bytes_total: 0,
+    }),
+    "Detecting trajectory file format for eglin_traj_format_2.traj (1/2)",
+  );
+  assert.equal(
     formatLoadProgress({ file: "Classifying track.csv", done: 1, total: 2, device: "CUDA, 32 layers", bytes: 0, bytes_total: 0 }),
     "Classifying track.csv (1/2) · CUDA, 32 layers",
   );
@@ -370,4 +384,101 @@ test("load progress shows bytes, files, and the device", () => {
     formatLoadProgress({ file: "No GPU found; classifying on CPU", device: "CPU", done: 0, total: 1 }),
     "No GPU found; classifying on CPU",
   );
+});
+
+function trajGroup(name, classification) {
+  const excerpt = fs.readFileSync(new URL(`../samples/${name}`, import.meta.url), "utf8");
+  return {
+    layout_id: name,
+    needs_manual: false,
+    manual_reason: "",
+    status: "pending",
+    loaded: false,
+    files: [{
+      path: `/data/${name}`,
+      name,
+      excerpt,
+      origin_lat: null,
+      origin_lon: null,
+      origin_alt_m: null,
+    }],
+    classification,
+  };
+}
+
+test("radian header values that look like degrees warn without blocking confirm", () => {
+  const format2 = trajGroup("eglin_traj_format_2.traj", {
+    header_lines: 3,
+    delimiter: "whitespace",
+    frames: { position: "LLA" },
+    units: { position: "m" },
+    columns: { col_0: "time", col_1: "pos_lat", col_2: "pos_alt", col_3: "pos_lon" },
+    column_units: { col_1: "rad", col_2: "m", col_3: "rad" },
+    confidence_score: 0.95,
+    unsupported_flag: false,
+    reasoning: "Read from the header.",
+  });
+  assert.equal(angleUnitWarning(format2), ANGLE_LOOKS_LIKE_DEGREES);
+  const html = reviewCardHtml(format2, 0, 1);
+  assert.match(html, /data-role="unit-warning"/);
+  assert.match(html, /values look like degrees/);
+  assert.match(html, /Check the header/);
+  assert.match(html, /schema-cell-text">lat\(rad\)/);
+  assert.match(html, /data-col="1" data-field="unit"[\s\S]*value="rad" selected/);
+  assert.match(html, /data-col="3" data-field="unit"[\s\S]*value="rad" selected/);
+  assert.match(html, /Confirm trajectory file format/);
+  assert.doesNotMatch(html, /disabled/);
+  const problems = editorProblems({
+    headerLines: 3,
+    delimiter: "whitespace",
+    positionFrame: "LLA",
+    positionUnit: "m",
+    roles: ["time", "pos_lat", "pos_alt", "pos_lon"],
+    columnUnits: { col_1: "rad", col_2: "m", col_3: "rad" },
+  }, format2);
+  assert.equal(problems.length, 0);
+  const switched = structuredClone(format2);
+  switched.classification.column_units = { col_1: "deg", col_2: "m", col_3: "deg" };
+  assert.equal(angleUnitWarning(switched), "");
+
+  const format1 = trajGroup("eglin_traj_format_1.traj", {
+    header_lines: 2,
+    delimiter: "whitespace",
+    frames: { position: "LLA" },
+    units: { position: "m" },
+    columns: { col_0: "time", col_1: "pos_lat", col_2: "pos_lon", col_3: "pos_alt" },
+    column_units: { col_1: "deg", col_2: "deg", col_3: "m" },
+    confidence_score: 0.95,
+    unsupported_flag: false,
+    reasoning: "Read from the header.",
+  });
+  assert.equal(angleUnitWarning(format1), "");
+  const plain = reviewCardHtml(format1, 0, 1);
+  assert.doesNotMatch(plain, /data-role="unit-warning"/);
+  assert.match(plain, /schema-cell-text">lat</);
+  assert.match(plain, /data-col="1" data-field="unit"[\s\S]*value="deg" selected/);
+
+  const small = group("small", {
+    files: [{
+      path: "/data/small.csv",
+      name: "small.csv",
+      excerpt: "time,lat,lon,alt\n0,0.50,-1.20,10\n1,0.40,-1.10,12\n",
+      origin_lat: null,
+      origin_lon: null,
+      origin_alt_m: null,
+    }],
+    classification: {
+      header_lines: 1,
+      delimiter: ",",
+      frames: { position: "LLA" },
+      units: { position: "m" },
+      columns: { col_0: "time", col_1: "pos_lat", col_2: "pos_lon", col_3: "pos_alt" },
+      column_units: { col_1: "deg", col_2: "deg", col_3: "m" },
+      confidence_score: 0.95,
+      unsupported_flag: false,
+      reasoning: "Read from the header.",
+    },
+  });
+  assert.equal(angleUnitWarning(small), ANGLE_LOOKS_LIKE_RADIANS);
+  assert.match(reviewCardHtml(small, 0, 1), /values look like radians/);
 });

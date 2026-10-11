@@ -350,8 +350,11 @@ async function runClassify(cmd, dest) {
       return;
     }
     setBusy(true);
-    if (els.cancelClassify) els.cancelClassify.hidden = false;
-    fileLoadProgress = "Reading trajectory columns…";
+    if (els.cancelClassify) {
+      els.cancelClassify.hidden = false;
+      els.cancelClassify.disabled = false;
+    }
+    fileLoadProgress = "Detecting trajectory file format…";
     els.progress.textContent = fileLoadProgress;
     render();
     const result = await invoke("classify_picked", { paths });

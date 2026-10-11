@@ -265,7 +265,24 @@ function columnMarkHtml(index, cellText, role, classif) {
   </div>`;
 }
 
-function markLineIndex(lines, headerCount, delimiter) {
+function markLineIndex(lines, headerCount, delimiter, columnCount) {
+  const spanEnd = headerCount > 0 ? Math.min(headerCount, lines.length) : 0;
+  let best = -1;
+  let bestScore = -1;
+  for (let i = 0; i < spanEnd; i += 1) {
+    const line = String(lines[i] || "");
+    const cells = splitFields(line, delimiter);
+    if (cells.length < 2) continue;
+    let score = cells.length;
+    if (columnCount > 1 && cells.length === columnCount) score += 100;
+    if (line.includes(",") || line.includes("(") || line.includes(")")) score += 20;
+    score += Math.max(0, 5 - i);
+    if (score > bestScore) {
+      bestScore = score;
+      best = i;
+    }
+  }
+  if (best >= 0) return best;
   const lastHeader = headerCount > 0 ? Math.min(headerCount, lines.length) - 1 : -1;
   if (lastHeader >= 0 && splitFields(lines[lastHeader] || "", delimiter).length > 1) return lastHeader;
   for (let i = Math.max(headerCount, 0); i < lines.length; i += 1) {
@@ -290,14 +307,82 @@ function originFieldsHtml(group) {
   </div>`;
 }
 
+export const ANGLE_LOOKS_LIKE_DEGREES =
+  "Latitude and longitude are marked as radians, but the values look like degrees. Check the header for an error.";
+export const ANGLE_LOOKS_LIKE_RADIANS =
+  "Latitude and longitude are marked as degrees, but the values look like radians. Check the header for an error.";
+
+function columnIndex(columns, role) {
+  const hit = Object.entries(columns || {}).find(([, value]) => value === role);
+  if (!hit) return -1;
+  const index = Number(String(hit[0]).replace(/^col_/, ""));
+  return Number.isFinite(index) ? index : -1;
+}
+
+/** Warn when the numbers disagree with the header unit. Confirmation stays available. */
+export function angleUnitWarning(group) {
+  const classif = group?.classification || {};
+  const excerpt = group?.files?.[0]?.excerpt || "";
+  return angleWarningText({
+    lines: excerpt.split(/\r?\n/),
+    delimiter: classif.delimiter,
+    columns: classif.columns || {},
+    columnUnits: classif.column_units || {},
+    headerLines: Number(classif.header_lines) || 0,
+  });
+}
+
+export function angleWarningText({ lines, delimiter, columns, columnUnits, headerLines = 0 }) {
+  const latIndex = columnIndex(columns, "pos_lat");
+  const lonIndex = columnIndex(columns, "pos_lon");
+  if (latIndex < 0 || lonIndex < 0) return "";
+  const latUnit = columnUnits?.[`col_${latIndex}`] || "deg";
+  const lonUnit = columnUnits?.[`col_${lonIndex}`] || "deg";
+  const lats = [];
+  const lons = [];
+  const start = Math.max(0, headerLines);
+  (lines || []).slice(start).forEach((line) => {
+    const cells = splitFields(line, delimiter);
+    const lat = Number(cells[latIndex]);
+    const lon = Number(cells[lonIndex]);
+    if (!Number.isFinite(lat) || !Number.isFinite(lon)) return;
+    lats.push(lat);
+    lons.push(lon);
+  });
+  if (!lats.length) return "";
+  const halfPi = Math.PI / 2 + 1e-6;
+  const pi = Math.PI + 1e-6;
+  const latRad = latUnit === "rad";
+  const lonRad = lonUnit === "rad";
+  if (latRad || lonRad) {
+    const latOutside = latRad && lats.some((value) => Math.abs(value) > halfPi);
+    const lonOutside = lonRad && lons.some((value) => Math.abs(value) > pi);
+    return latOutside || lonOutside ? ANGLE_LOOKS_LIKE_DEGREES : "";
+  }
+  const inside = lats.every((value) => Math.abs(value) <= halfPi) && lons.every((value) => Math.abs(value) <= pi);
+  return inside ? ANGLE_LOOKS_LIKE_RADIANS : "";
+}
+
+function headerCells(line, delimiter, count) {
+  const primary = splitFields(line, delimiter);
+  const messy = primary.some((cell) => /[,;|]$/.test(cell));
+  if (primary.length === count && !messy) return primary;
+  for (const alt of [",", "\t", ";", "|", "whitespace"]) {
+    const cells = splitFields(line, alt);
+    if (cells.length === count && cells.length > 1) return cells;
+  }
+  return primary;
+}
+
 function annotatedFileHtml(group) {
   const preview = previewModel(group);
   const classif = group.classification || {};
   const lines = preview.lines.slice(0, 8);
   const headerCount = Math.max(0, preview.headerCount);
-  const markIndex = lines.length ? markLineIndex(lines, headerCount, classif.delimiter) : -1;
+  const namedCount = columnCount(group);
+  const markIndex = lines.length ? markLineIndex(lines, headerCount, classif.delimiter, namedCount) : -1;
   const markLine = markIndex >= 0 ? lines[markIndex] : "";
-  const cells = splitFields(markLine, classif.delimiter);
+  const cells = headerCells(markLine, classif.delimiter, namedCount);
   const count = Math.max(columnCount(group), cells.length);
   const marks = [];
   for (let i = 0; i < count; i += 1) {
@@ -322,6 +407,7 @@ function annotatedFileHtml(group) {
     <div class="schema-file-scroll">
       ${body}
     </div>
+    ${angleUnitWarning(group) ? `<p class="schema-warn" data-role="unit-warning">${escapeHtml(angleUnitWarning(group))}</p>` : ""}
     ${originFieldsHtml(group)}
   </div>`;
 }
