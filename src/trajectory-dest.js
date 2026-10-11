@@ -105,28 +105,34 @@ export function applyShownName(items, currentId, shown) {
   return { action: "rename", id: current?.id ?? currentId ?? null, name };
 }
 
-function nameChoices(items, current) {
+function nameMenu(items, current, pickAttr) {
   return items
-    .filter((item) => String(item.id) !== String(current.id))
-    .map((item) => `<option value="${escapeHtml(item.name)}"></option>`)
+    .map((item) => {
+      const currentAttr = String(item.id) === String(current.id) ? ` aria-current="true"` : "";
+      return `<li><button type="button" class="name-menu-item" data-${pickAttr}="${escapeHtml(item.id)}"${currentAttr}>${escapeHtml(item.name)}</button></li>`;
+    })
     .join("");
 }
 
 export function trajectoryDrawerDestHtml(input = {}) {
   const dest = resolveTrajectoryDest(input.objects, input);
-  const objectChoices = nameChoices(dest.objects, dest.object);
-  const modeChoices = nameChoices(dest.object.modes, dest.mode);
   return `<div class="drawer-dest" data-role="traj-dest">
     <div class="dest-name-row">
       <button type="button" data-act="add-object" class="primary compact">+ Object</button>
-      <input type="text" data-role="obj-name" aria-label="Object name" value="${escapeHtml(dest.object.name)}" list="traj-object-names" />
-      <datalist id="traj-object-names">${objectChoices}</datalist>
+      <div class="name-combo">
+        <input type="text" data-role="obj-name" aria-label="Object name" aria-controls="traj-object-menu" value="${escapeHtml(dest.object.name)}" />
+        <button type="button" class="name-combo-open" data-act="toggle-object-list" aria-label="Choose object" aria-controls="traj-object-menu">▾</button>
+        <ul class="name-menu" id="traj-object-menu" data-role="object-menu" hidden>${nameMenu(dest.objects, dest.object, "pick-object")}</ul>
+      </div>
     </div>
     <div class="dest-name-row">
       <button type="button" data-act="add-mode" class="primary compact">+ Mode</button>
-      <input type="text" data-role="load-mode-name" aria-label="Mode name" value="${escapeHtml(dest.mode.name)}" list="traj-mode-names" />
-      <datalist id="traj-mode-names">${modeChoices}</datalist>
+      <div class="name-combo">
+        <input type="text" data-role="load-mode-name" aria-label="Mode name" aria-controls="traj-mode-menu" value="${escapeHtml(dest.mode.name)}" />
+        <button type="button" class="name-combo-open" data-act="toggle-mode-list" aria-label="Choose mode" aria-controls="traj-mode-menu">▾</button>
+        <ul class="name-menu" id="traj-mode-menu" data-role="mode-menu" hidden>${nameMenu(dest.object.modes, dest.mode, "pick-mode")}</ul>
+      </div>
     </div>
-    <p class="muted wind-hint">The name in each field is where the next trajectory loads. Edit it to rename. Choose another saved name in that same field to switch.</p>
+    <p class="muted wind-hint">The name in each field is where the next trajectory loads. Edit it to rename. Open the list to switch to any object, or any mode on this object.</p>
   </div>`;
 }

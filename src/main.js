@@ -1235,11 +1235,14 @@ function maybeEnsureDest() {
 }
 
 async function addTrajectoryObject() {
+  objectNameDraft = null;
+  modeNameDraft = null;
   const name = nextObjectName(riskModel.objects);
   await createObjectWithNominal(name, { focusName: true });
 }
 
 async function addTrajectoryMode() {
+  modeNameDraft = null;
   const obj = activeLoadObject() || await ensureTrajectoryDestination();
   if (!obj) return;
   const name = nextModeName(obj.modes);
@@ -2740,6 +2743,62 @@ function restoreFieldFocus(root, focus) {
   }
 }
 
+function closeNameMenus(root) {
+  root?.querySelectorAll(".name-menu").forEach((menu) => {
+    menu.hidden = true;
+  });
+  root?.querySelectorAll(".name-combo-open").forEach((btn) => {
+    btn.setAttribute("aria-expanded", "false");
+  });
+}
+
+function bindNameMenus(root) {
+  if (!root.dataset.menuBound) {
+    root.dataset.menuBound = "1";
+    root.addEventListener("click", (ev) => {
+      if (ev.target.closest(".name-combo")) return;
+      closeNameMenus(root);
+    });
+  }
+  root.querySelectorAll("[data-act='toggle-object-list'], [data-act='toggle-mode-list']").forEach((btn) => {
+    btn.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      const menu = document.getElementById(btn.getAttribute("aria-controls"));
+      const open = menu?.hidden !== false;
+      closeNameMenus(root);
+      if (menu && open) {
+        menu.hidden = false;
+        btn.setAttribute("aria-expanded", "true");
+      }
+    });
+  });
+  root.querySelectorAll("[data-pick-object]").forEach((btn) => {
+    btn.addEventListener("mousedown", (ev) => ev.preventDefault());
+    btn.addEventListener("click", () => {
+      const raw = btn.dataset.pickObject;
+      const numeric = Number(raw);
+      objectNameDraft = null;
+      modeNameDraft = null;
+      trajObjectId = Number.isFinite(numeric) ? numeric : raw;
+      expandedObjectId = trajObjectId;
+      render();
+    });
+  });
+  root.querySelectorAll("[data-pick-mode]").forEach((btn) => {
+    btn.addEventListener("mousedown", (ev) => ev.preventDefault());
+    btn.addEventListener("click", () => {
+      const current = activeLoadObject();
+      if (!current) return;
+      const raw = btn.dataset.pickMode;
+      const picked = (current.modes || []).find((item) => String(item.id) === raw);
+      if (!picked) return;
+      modeNameDraft = null;
+      rememberMode(current.id, picked);
+      render();
+    });
+  });
+}
+
 function renderTrajectoryDrawer() {
   const root = trajHost();
   if (!root || drawerView !== "trajectories") return;
@@ -2782,6 +2841,7 @@ function renderTrajectoryDrawer() {
   root.querySelector("[data-act='add-mode']")?.addEventListener("click", () => {
     addTrajectoryMode();
   });
+  bindNameMenus(root);
   const objectNameInput = root.querySelector("[data-role='obj-name']");
   objectNameInput?.addEventListener("input", () => {
     objectNameDraft = { id: activeLoadObject()?.id ?? null, value: objectNameInput.value };
