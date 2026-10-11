@@ -1799,26 +1799,33 @@ pub const CLASSIFY_CONTEXT: &str = "2048";
 /// The classification object is a few hundred tokens. A long generation is prose, not a schema.
 pub const CLASSIFY_PREDICT: &str = "384";
 
-/// Llama 3.1 8B repeating layers. `-ngl` gets this count (or fewer when VRAM is known and tight).
+/// Llama 3.1 8B repeating blocks. This is not the `-ngl` count.
 pub const MODEL_LAYERS: u32 = 32;
+/// Slots passed to `-ngl` for a full offload. llama.cpp b11538 counts the output
+/// tensor as one extra layer and assigns devices with
+/// `i_gpu_start = n_layer + 1 - n_gpu_layers`. Passing 32 leaves repeating layer 0
+/// on the CPU (VRAM still rises). 33 puts every repeating block and the output
+/// head on the GPU. Token embeddings stay on the CPU either way.
+pub const GPU_LAYERS: u32 = MODEL_LAYERS + 1;
 const MIB_PER_LAYER: u64 = 160;
 const RESERVE_MIB: u64 = 1536;
 
 /// GPU layers to pass as `-ngl`.
 ///
-/// CUDA and Vulkan always get a non-zero count. Unknown free VRAM offloads every layer:
-/// `nvidia-smi` often prints nothing useful for free memory on Windows (WDDM), and treating
-/// that as zero layers is what left VRAM flat. A GPU that cannot initialize is a failed
-/// server start, and that is the only path to `-ngl 0`.
+/// CUDA and Vulkan always get a non-zero count. Unknown free VRAM offloads every
+/// repeating block and the output head (`GPU_LAYERS`, 33). Passing only the repeating
+/// count (32) leaves layer 0 on the CPU and every token syncs. `nvidia-smi` often
+/// prints nothing useful for free memory on Windows (WDDM); that is not zero layers.
+/// A GPU that cannot initialize is a failed server start, and that is the only path to `-ngl 0`.
 pub fn gpu_layers(backend: GpuBackend, free_mib: Option<u64>) -> u32 {
     if backend == GpuBackend::Cpu {
         return 0;
     }
     let Some(free) = free_mib else {
-        return MODEL_LAYERS;
+        return GPU_LAYERS;
     };
     let budget = free.saturating_sub(RESERVE_MIB);
-    ((budget / MIB_PER_LAYER) as u32).clamp(1, MODEL_LAYERS)
+    ((budget / MIB_PER_LAYER) as u32).clamp(1, GPU_LAYERS)
 }
 
 /// CPU is used when no GPU was found, or when the GPU backend failed to start.
@@ -3678,22 +3685,22 @@ mod tests {
     fn gpu_offload_is_nonzero_unless_the_backend_is_cpu() {
         let help = "usage --fit [on|off] -ngl N --n-gpu-layers N --temp N";
         let cuda = offload_args(GpuBackend::Cuda, help);
-        assert_eq!(cuda, vec!["-ngl".to_string(), "32".to_string()]);
+        assert_eq!(cuda, vec!["-ngl".to_string(), "33".to_string()]);
         assert!(!cuda.iter().any(|arg| arg == "auto" || arg == "all" || arg == "on" || arg == "0"));
         assert_eq!(offload_args(GpuBackend::Cpu, help), vec!["-ngl".to_string(), "0".to_string()]);
         assert!(offload_args(GpuBackend::Cuda, "usage --temp N").is_empty());
         let capped = offload_args_with(GpuBackend::Cuda, "usage -ngl N", Some(8_192));
-        assert_eq!(capped, vec!["-ngl".to_string(), "32".to_string()]);
+        assert_eq!(capped, vec!["-ngl".to_string(), "33".to_string()]);
         assert_eq!(
             offload_args_with(GpuBackend::Vulkan, "usage -ngl N", None),
-            vec!["-ngl".to_string(), "32".to_string()]
+            vec!["-ngl".to_string(), "33".to_string()]
         );
         assert_eq!(
             offload_args_with(GpuBackend::Cuda, "usage -ngl N", Some(2_000)),
             vec!["-ngl".to_string(), "2".to_string()]
         );
-        assert_eq!(gpu_layers(GpuBackend::Cuda, None), 32);
-        assert_eq!(gpu_layers(GpuBackend::Vulkan, None), 32);
+        assert_eq!(gpu_layers(GpuBackend::Cuda, None), 33);
+        assert_eq!(gpu_layers(GpuBackend::Vulkan, None), 33);
         assert_eq!(gpu_layers(GpuBackend::Cpu, None), 0);
         assert_eq!(gpu_layers(GpuBackend::Cpu, Some(16_000)), 0);
         assert_eq!(gpu_layers(GpuBackend::Cuda, Some(2_000)), 2);
@@ -3718,12 +3725,12 @@ mod tests {
         assert!(cuda.windows(2).any(|pair| pair == ["-m", "model.gguf"]), "{cuda:?}");
         assert!(cuda.windows(2).any(|pair| pair == ["-c", "2048"]), "{cuda:?}");
         assert!(cuda.windows(2).any(|pair| pair == ["--fit", "off"]), "{cuda:?}");
-        assert!(cuda.windows(2).any(|pair| pair == ["-ngl", "32"]), "{cuda:?}");
+        assert!(cuda.windows(2).any(|pair| pair == ["-ngl", "33"]), "{cuda:?}");
         assert!(cuda.windows(2).any(|pair| pair == ["--host", "127.0.0.1"]), "{cuda:?}");
         assert!(cuda.windows(2).any(|pair| pair == ["--port", "8081"]), "{cuda:?}");
         assert!(!cuda.iter().any(|arg| arg == "auto" || arg == "131072"));
         let vulkan = server_args(GpuBackend::Vulkan, help, Path::new("model.gguf"), 9, None);
-        assert!(vulkan.windows(2).any(|pair| pair == ["-ngl", "32"]), "{vulkan:?}");
+        assert!(vulkan.windows(2).any(|pair| pair == ["-ngl", "33"]), "{vulkan:?}");
         let cpu = server_args(GpuBackend::Cpu, help, Path::new("model.gguf"), 9, Some(16_000));
         assert!(cpu.windows(2).any(|pair| pair == ["-ngl", "0"]), "{cpu:?}");
         assert!(cpu.windows(2).any(|pair| pair == ["-c", "2048"]), "{cpu:?}");
@@ -3731,7 +3738,7 @@ mod tests {
         let pinned = server_args(GpuBackend::Cuda, "", Path::new("model.gguf"), 8081, None);
         assert_eq!(
             pinned,
-            ["-m", "model.gguf", "-c", "2048", "--fit", "off", "-ngl", "32", "--device", "CUDA0", "--host", "127.0.0.1", "--port", "8081"]
+            ["-m", "model.gguf", "-c", "2048", "--fit", "off", "-ngl", "33", "--device", "CUDA0", "--host", "127.0.0.1", "--port", "8081"]
                 .into_iter()
                 .map(str::to_string)
                 .collect::<Vec<_>>()
@@ -4425,13 +4432,13 @@ ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()
         let cancel = Arc::new(AtomicBool::new(false));
         let info = pool.start_or_fallback(&spec, || Ok(spec.clone()), &cancel).unwrap();
         assert_eq!(info.backend, GpuBackend::Cuda);
-        assert_eq!(info.layers, 32);
+        assert_eq!(info.layers, 33);
         assert!(!info.fell_back);
         assert_eq!(pool.launch_count(), 1);
         let runtime = LlamaRuntime::from_info(Arc::clone(&pool), info, Arc::clone(&cancel));
         assert_eq!(runtime.backend, GpuBackend::Cuda);
-        assert_eq!(runtime.layers, 32);
-        assert_eq!(runtime.status_device(), "CUDA, 32 layers");
+        assert_eq!(runtime.layers, 33);
+        assert_eq!(runtime.status_device(), "CUDA, 33 layers");
         let excerpt = "time,lat,lon,alt\n0,32.4,-106.4,1000\n";
         let first = classify_with(&runtime, excerpt).unwrap();
         let second = classify_with(&runtime, excerpt).unwrap();
@@ -4441,7 +4448,7 @@ ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()
         let argv = fs::read_to_string(&log).unwrap();
         assert_eq!(argv.lines().count(), 1, "{argv}");
         assert!(argv.contains("\"-ngl\""), "{argv}");
-        assert!(argv.contains("\"32\""), "{argv}");
+        assert!(argv.contains("\"33\""), "{argv}");
         assert!(argv.contains("\"-c\""), "{argv}");
         assert!(argv.contains("\"2048\""), "{argv}");
         assert!(argv.contains("\"--fit\""), "{argv}");
@@ -4480,7 +4487,7 @@ ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()
         let left = left.join().unwrap().unwrap();
         let right = right.join().unwrap().unwrap();
         assert_eq!(left.backend, GpuBackend::Cuda);
-        assert_eq!(right.layers, 32);
+        assert_eq!(right.layers, 33);
         assert_eq!(pool.launch_count(), 1, "the opening server was relaunched");
         assert_eq!(fs::read_to_string(&log).unwrap().lines().count(), 1);
         pool.shutdown();
@@ -4535,7 +4542,7 @@ ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()
         assert_eq!(pool.launch_count(), 2, "a healthy server was relaunched");
         let lines: Vec<_> = fs::read_to_string(&log).unwrap().lines().map(str::to_string).collect();
         assert_eq!(lines.len(), 2, "{lines:?}");
-        assert!(lines[0].contains("\"32\""), "GPU attempt was not 32 layers: {}", lines[0]);
+        assert!(lines[0].contains("\"33\""), "GPU attempt was not 33 layers: {}", lines[0]);
         assert!(lines[1].contains("\"-ngl\"") && lines[1].contains("\"0\""), "{}", lines[1]);
         pool.shutdown();
         let _ = fs::remove_dir_all(&dir);
