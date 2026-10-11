@@ -633,6 +633,15 @@ export function applyEditorDraft(group, draft) {
   };
 }
 
+/** Moving indicator plus the detection line. Empty when detection is not running. */
+export function detectionProgressHtml(text) {
+  if (!text) return "";
+  return `<div class="schema-detect" data-role="load-progress">
+    <div class="schema-detect-bar" aria-hidden="true"><span></span></div>
+    <p class="schema-detect-text" data-role="load-progress-text">${escapeHtml(text)}</p>
+  </div>`;
+}
+
 export function formatLoadProgress(payload) {
   if (!payload) return "";
   const file = payload.file || "";

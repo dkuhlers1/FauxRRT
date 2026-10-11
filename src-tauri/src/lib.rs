@@ -40,7 +40,7 @@ use mission::{
 };
 use classify::{
     excerpt_of, file_origin, group_files, may_load, manual_reason, normalize_classification, origin_from_text,
-    finish_with_model, interpret_header, GroupedFile, LlamaRuntime, LlamaServerPool, SchemaAssignment, SchemaGroup,
+    finish_with_model, interpret_header, warm_installed_model, GroupedFile, LlamaRuntime, LlamaServerPool, SchemaAssignment, SchemaGroup,
     TrajectoryClassification, CANCELLED,
 };
 use parse::{parse_path_with, parse_text, parse_with_classification, read_trajectory_text, ParsedTrack};
@@ -62,8 +62,8 @@ pub struct AppState {
     store: Mutex<Store>,
     mission: Mutex<MissionSession>,
     classify_cancel: Arc<AtomicBool>,
-    /// Resident llama-server. Choose files starts it only after the dialog returns
-    /// and after the local excerpt scan. Cancel and app exit shut it down.
+    /// Resident llama-server. If the GGUF is already on disk it starts when the app
+    /// opens. Choose files reuses it. Cancel and app exit shut it down.
     llama: Arc<LlamaServerPool>,
     /// Last globe animation field. Historical profiles stay out of the mission file.
     wind_anim: Mutex<Option<WindAnimCache>>,
@@ -1466,6 +1466,7 @@ fn classify_paths(
             return Err(CANCELLED.into());
         }
         let name = file_name(&path);
+        let device = runtime.as_ref().map(|item| item.status_device()).unwrap_or_default();
         emit_progress(
             app,
             ProgressEvent {
@@ -1474,7 +1475,7 @@ fn classify_paths(
                 file: format_detection_label(&name),
                 bytes: 0,
                 bytes_total: 0,
-                device: String::new(),
+                device,
             },
         );
         let class = finish_with_model(local, &text, runtime.as_ref().map(|item| item as &dyn classify::TextCompleter))?;
@@ -2470,6 +2471,32 @@ fn mission_info(app: &AppHandle, state: &AppState) -> Result<MissionInfo, String
     })
 }
 
+fn warm_llama_in_background(app: AppHandle) {
+    let Some(state) = app.try_state::<AppState>() else {
+        return;
+    };
+    let pool = Arc::clone(&state.llama);
+    let cancel = Arc::clone(&state.classify_cancel);
+    std::thread::spawn(move || {
+        let Ok(dir) = app.path().app_data_dir() else {
+            return;
+        };
+        let _ = warm_installed_model(&dir, &cancel, &|note| {
+            let _ = app.emit(
+                "load-progress",
+                ProgressEvent {
+                    done: 0,
+                    total: 0,
+                    file: note.label,
+                    bytes: note.bytes,
+                    bytes_total: note.bytes_total,
+                    device: note.device,
+                },
+            );
+        }, &pool);
+    });
+}
+
 fn session_file_path(app: &AppHandle) -> Option<PathBuf> {
     let dir = app.path().app_data_dir().ok()?;
     let _ = std::fs::create_dir_all(&dir);
@@ -2517,8 +2544,8 @@ fn sanitize_filename(name: &str) -> String {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    // The resident server is constructed idle. Choosing files reads headers locally
-    // and does not start it.
+    // If the GGUF is already on disk, the resident server starts in the background.
+    // A missing weight is not downloaded until Choose files needs it.
     tauri::Builder::default()
         .manage(AppState {
             store: Mutex::new(Store::new()),
@@ -2527,6 +2554,10 @@ pub fn run() {
             llama: Arc::new(LlamaServerPool::new()),
             wind_anim: Mutex::new(None),
             resolved_wind: Mutex::new(HashMap::new()),
+        })
+        .setup(|app| {
+            warm_llama_in_background(app.handle().clone());
+            Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             load_files,
@@ -2699,6 +2730,14 @@ mod classify_command_tests {
         assert!(!dialog.to_ascii_lowercase().contains("llama"), "{dialog}");
         assert!(!dialog.contains("interpret_header"));
         assert!(!dialog.contains("classify_paths"));
+        let setup = function_source(src, ".setup(|app|");
+        assert!(setup.contains("warm_llama_in_background"), "{setup}");
+        assert!(!setup.contains("download_to"));
+        assert!(!setup.contains("GGUF_URL"));
+        let warm = function_source(include_str!("classify.rs"), "pub fn warm_installed_model(");
+        let guard = warm.find("installed_model").expect("disk check");
+        let ensure = warm.find("LlamaRuntime::ensure").expect("start installed server");
+        assert!(guard < ensure, "a missing GGUF must return before any download");
     }
 
     fn function_source<'a>(src: &'a str, signature: &str) -> &'a str {
