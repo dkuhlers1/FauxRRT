@@ -116,6 +116,11 @@ body {
   pointer-events: none;
   z-index: 5;
 }
+.risk-isoline-canvas {
+  position: absolute;
+  pointer-events: none;
+  z-index: 4;
+}
 .wind-legend {
   position: absolute;
   z-index: 6;
