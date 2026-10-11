@@ -520,10 +520,14 @@ pub fn canonical_frame(raw: &str) -> Option<&'static str> {
 }
 
 pub fn canonical_delimiter(raw: &str) -> String {
+    // trim() would erase a delimiter that is only a tab, and the next pass would store "".
+    if raw.chars().any(|ch| ch == '\t') && raw.chars().all(|ch| ch.is_whitespace()) {
+        return "\t".into();
+    }
     let t = raw.trim().to_ascii_lowercase();
     match t.as_str() {
         "," | "comma" | "csv" => ",".into(),
-        "\t" | "\\t" | "tab" | "tsv" => "\t".into(),
+        "\\t" | "tab" | "tsv" => "\t".into(),
         ";" | "semicolon" => ";".into(),
         "|" | "pipe" => "|".into(),
         "whitespace" | "space" | "spaces" | " " => "whitespace".into(),
@@ -4114,11 +4118,18 @@ s,rad,rad,m
         assert!((track.lla[5] as f64 - 391.871457).abs() < 1e-2, "alt m {}", track.lla[5]);
 
         let mut tabs = local.clone();
-        tabs.delimiter = "\t".into();
+        tabs.delimiter = "tab".into();
+        normalize_classification(&mut tabs);
+        assert_eq!(tabs.delimiter, "\t");
         let split = crate::parse::parse_with_classification(&format3, &tabs, None).unwrap_err();
         assert_eq!(split, crate::parse::DELIMITER_MISSED_COLUMNS);
         assert!(!split.contains("at least two valid"), "{split}");
         assert!(!split.contains("outside"), "{split}");
+
+        let mut commas = local.clone();
+        commas.delimiter = ",".into();
+        let comma_err = crate::parse::parse_with_classification(&format3, &commas, None).unwrap_err();
+        assert_eq!(comma_err, crate::parse::DELIMITER_MISSED_COLUMNS);
 
         let junk = "time, lat(rad), alt_out, lon(rad)\nrandom not needed line\naother random linerandom not needed line\n";
         let mut junk_class = local.clone();
