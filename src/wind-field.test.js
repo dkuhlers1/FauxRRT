@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import fs from "node:fs";
 import test from "node:test";
 import { DEFAULT_WIND_ALPHA, MAX_WIND_PARTICLES, setSurfaceWindAlpha, surfaceWindAlpha } from "./wind-layer.js";
 import {
@@ -214,6 +215,28 @@ test("off wind samples as a miss", () => {
   const out = { u: 1, v: 1, speed: 1, miss: false };
   sampleWindInto({ kind: "off" }, 10, 10, out);
   assert.equal(out.miss, true);
+});
+
+test("windShownStamp is initialized before the trajectory-load path reads it", () => {
+  const src = fs.readFileSync(new URL("./main.js", import.meta.url), "utf8");
+  const decl = src.indexOf("let windShownStamp = ");
+  const startup = src.indexOf('await invoke("open_last_mission")');
+  assert.ok(decl >= 0, "windShownStamp needs an initializer");
+  assert.ok(startup > decl, "the startup load resumes before a later let would initialize");
+  assert.equal(src.indexOf("windShownStamp"), decl + "let ".length);
+
+  const startupBlock = src.slice(startup, src.indexOf("async function runLoad"));
+  assert.match(startupBlock, /applySnapshot\(/);
+  assert.match(startupBlock, /await refreshRisk\(\)/);
+
+  const refresh = src.slice(src.indexOf("async function refreshRisk"), src.indexOf("function syncTracksToModel"));
+  assert.match(refresh, /applyMissionWind\(/);
+  const runLoad = src.slice(src.indexOf("async function runLoad("), src.indexOf("async function runLoadBoats"));
+  assert.match(runLoad, /await refreshRisk\(\)/);
+  const apply = src.slice(src.indexOf("function applyMissionWind"), src.indexOf("function renderWindPanel"));
+  assert.match(apply, /queueGlobeWind\(\)/);
+  const queue = src.slice(src.indexOf("function queueGlobeWind"), src.indexOf("function windSpecFromMission"));
+  assert.match(queue, /stamp === windShownStamp/);
 });
 
 test("batch URL asks Open-Meteo GFS for 10 m wind", () => {
