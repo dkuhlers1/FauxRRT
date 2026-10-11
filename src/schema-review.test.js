@@ -15,6 +15,7 @@ import {
   angleUnitWarning,
   ANGLE_LOOKS_LIKE_DEGREES,
   ANGLE_LOOKS_LIKE_RADIANS,
+  detectionProgressHtml,
   reviewCardHtml,
   reviewHtmlAfterRead,
   formatLoadProgress,
@@ -361,6 +362,25 @@ test("load progress shows bytes, files, and the device", () => {
     }),
     "Detecting trajectory file format for eglin_traj_format_2.traj (1/2)",
   );
+  assert.equal(
+    formatLoadProgress({
+      file: "Detecting trajectory file format for eglin_traj_format_2.traj",
+      done: 1,
+      total: 2,
+      device: "CUDA, 32 layers",
+      bytes: 0,
+      bytes_total: 0,
+    }),
+    "Detecting trajectory file format for eglin_traj_format_2.traj (1/2) · CUDA, 32 layers",
+  );
+  const moving = detectionProgressHtml("Detecting trajectory file format for eglin_traj_format_2.traj (1/2)");
+  assert.match(moving, /schema-detect-bar/);
+  assert.match(moving, /data-role="load-progress-text"/);
+  assert.match(moving, /Detecting trajectory file format for eglin_traj_format_2\.traj \(1\/2\)/);
+  assert.equal(detectionProgressHtml(""), "");
+  const css = fs.readFileSync(new URL("./styles.css", import.meta.url), "utf8");
+  assert.match(css, /@keyframes schema-indet/);
+  assert.match(css, /\.schema-detect-bar span\s*\{[^}]*animation:\s*schema-indet/);
   assert.equal(
     formatLoadProgress({ file: "Classifying track.csv", done: 1, total: 2, device: "CUDA, 32 layers", bytes: 0, bytes_total: 0 }),
     "Classifying track.csv (1/2) · CUDA, 32 layers",

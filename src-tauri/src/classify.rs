@@ -1879,7 +1879,9 @@ pub fn offload_args_with(backend: GpuBackend, help: &str, free_mib: Option<u64>)
 }
 
 /// Arguments for one long-lived `llama-server`. Context stays 2048 and `--fit off` so the KV
-/// cache cannot grow toward the model's 131072-token default. `-ngl` is never `auto`.
+/// cache cannot grow toward the model's 131072-token default. `-ngl` is never `auto` and never
+/// zero on CUDA: that is the flag that copies the GGUF layers into GPU memory.
+/// `--device CUDA0` pins those layers to the NVIDIA device instead of leaving them on CPU.
 pub fn server_args(backend: GpuBackend, help: &str, model: &Path, port: u16, free_mib: Option<u64>) -> Vec<String> {
     let mut args = vec!["-m".into(), model.display().to_string()];
     args.extend(memory_args(help));
@@ -1890,6 +1892,9 @@ pub fn server_args(backend: GpuBackend, help: &str, model: &Path, port: u16, fre
         Some(free) => offload_args_with(backend, "-ngl", Some(free)),
     };
     args.extend(ngl);
+    if backend == GpuBackend::Cuda && (help.is_empty() || help_has(help, "--device") || help_has(help, "-dev")) {
+        push_flag(&mut args, "--device", "CUDA0");
+    }
     push_flag(&mut args, "--host", "127.0.0.1");
     push_flag(&mut args, "--port", &port.to_string());
     if help_has(help, "-np") || help_has(help, "--parallel") {
@@ -2049,6 +2054,21 @@ impl LlamaServerPool {
         }
     }
 
+    /// Port of a server that is already spawned for this model and has not exited.
+    /// Health may still be pending while the GGUF is opening. A second caller waits
+    /// on that process instead of killing it and launching another.
+    fn starting_port(&self, model: &Path) -> Option<u16> {
+        let mut slot = self.slot.lock().unwrap_or_else(|err| err.into_inner());
+        let running = slot.as_mut()?;
+        if running.model.as_path() != model {
+            return None;
+        }
+        match running.child.try_wait() {
+            Ok(None) => Some(running.port),
+            _ => None,
+        }
+    }
+
     fn current_for_model(&self, model: &Path) -> Option<ServerInfo> {
         let (port, info) = {
             let slot = self.slot.lock().unwrap_or_else(|err| err.into_inner());
@@ -2068,6 +2088,18 @@ impl LlamaServerPool {
         let _gate = self.gate.lock().unwrap_or_else(|err| err.into_inner());
         if let Some(info) = self.current_for_model(&spec.model) {
             return Ok(info);
+        }
+        if let Some(port) = self.starting_port(&spec.model) {
+            drop(_gate);
+            self.wait_until_ready(port, cancel)?;
+            return self
+                .slot
+                .lock()
+                .unwrap_or_else(|err| err.into_inner())
+                .as_ref()
+                .filter(|running| running.model.as_path() == spec.model)
+                .map(RunningServer::info)
+                .ok_or_else(|| CANCELLED.into());
         }
         self.stop_slot();
         if cancel.load(Ordering::SeqCst) {
@@ -2124,6 +2156,14 @@ impl LlamaServerPool {
                 return Err(server_failure(&format!("llama-server exited ({code:?}): {tail}")));
             }
             if health_ok(port) {
+                let (backend, log) = self.offload_log(port)?;
+                if gpu_offload_failed(backend, &log) {
+                    self.shutdown();
+                    return Err(format!(
+                        "llama-server did not offload layers onto the GPU: {}",
+                        log.trim()
+                    ));
+                }
                 return Ok(());
             }
             if started.elapsed() >= SERVER_START_TIMEOUT {
@@ -2133,6 +2173,19 @@ impl LlamaServerPool {
             }
             thread::sleep(Duration::from_millis(50));
         }
+    }
+
+    fn offload_log(&self, port: u16) -> Result<(GpuBackend, String), String> {
+        let slot = self.slot.lock().unwrap_or_else(|err| err.into_inner());
+        let Some(running) = slot.as_ref() else {
+            return Err("llama-server stopped before it was ready".into());
+        };
+        if running.port != port {
+            return Err(CANCELLED.into());
+        }
+        let err = tail_text(&running.stderr);
+        let out = tail_text(&running.stdout);
+        Ok((running.backend, format!("{err}\n{out}")))
     }
 
     fn copy_logs(&self) -> String {
@@ -2196,6 +2249,15 @@ fn spawn_server(spec: &ServerSpec, port: u16) -> Result<RunningServer, String> {
     }
     for (key, value) in &spec.extra_env {
         cmd.env(key, value);
+    }
+    #[cfg(windows)]
+    if let Some(dir) = spec.program.parent() {
+        let dir = dir.to_string_lossy().to_string();
+        let joined = match std::env::var("PATH") {
+            Ok(existing) if !existing.is_empty() => format!("{dir};{existing}"),
+            _ => dir,
+        };
+        cmd.env("PATH", joined);
     }
     #[cfg(windows)]
     {
@@ -2341,7 +2403,11 @@ pub fn classify_excerpt_with_resident_model(
 
 impl LlamaRuntime {
     pub fn status_device(&self) -> String {
-        device_label(self.backend, self.layers)
+        if self.spec.fell_back {
+            device_message(GpuBackend::Cpu, self.layers, true)
+        } else {
+            device_label(self.backend, self.layers)
+        }
     }
 
     fn from_info(pool: Arc<LlamaServerPool>, info: ServerInfo, cancel: Arc<AtomicBool>) -> Self {
@@ -2571,6 +2637,30 @@ pair ::= string ws ":" ws string
 "#
 }
 
+/// The GGUF already on disk, if any. A missing or partial file is not a download.
+pub fn installed_model(data_dir: &Path) -> Option<PathBuf> {
+    if let Ok(path) = std::env::var("FAUXRRT_LLAMA_MODEL") {
+        let path = PathBuf::from(path);
+        return path.is_file().then_some(path);
+    }
+    let dest = data_dir.join("models").join(GGUF_FILENAME);
+    let ready = dest.is_file() && fs::metadata(&dest).map(|meta| meta.len() >= GGUF_MIN_BYTES).unwrap_or(false);
+    ready.then_some(dest)
+}
+
+/// Start the resident server when the GGUF is already installed. Does not download weights.
+pub fn warm_installed_model(
+    data_dir: &Path,
+    cancel: &Arc<AtomicBool>,
+    progress: &dyn Fn(ClassifyNote),
+    pool: &Arc<LlamaServerPool>,
+) -> Result<(), String> {
+    if installed_model(data_dir).is_none() {
+        return Ok(());
+    }
+    LlamaRuntime::ensure(data_dir, cancel, progress, pool).map(|_| ())
+}
+
 pub fn ensure_model(
     data_dir: &Path,
     cancel: &AtomicBool,
@@ -2619,31 +2709,227 @@ fn server_override() -> Option<PathBuf> {
     cli.parent().map(|dir| dir.join(name)).filter(|path| path.is_file())
 }
 
+/// True when llama.cpp stayed up but left the weights on the CPU.
+/// An empty log is not a failure: the test server never prints an offload line.
+pub fn gpu_offload_failed(backend: GpuBackend, log: &str) -> bool {
+    if backend == GpuBackend::Cpu || log.trim().is_empty() {
+        return false;
+    }
+    let lower = log.to_ascii_lowercase();
+    if lower.contains("failed to initialize cuda")
+        || lower.contains("failed to load cuda")
+        || lower.contains("no cuda devices")
+        || lower.contains("cuda driver version is insufficient")
+        || lower.contains("ggml_cuda_init: failed")
+    {
+        return true;
+    }
+    offload_count(&lower, "offloaded ") == Some(0) || offload_count(&lower, "offloading ") == Some(0)
+}
+
+fn offload_count(lower: &str, marker: &str) -> Option<u32> {
+    let rest = lower.split(marker).nth(1)?;
+    let digits: String = rest.chars().take_while(|ch| ch.is_ascii_digit()).collect();
+    if digits.is_empty() {
+        None
+    } else {
+        digits.parse().ok()
+    }
+}
+
+/// The file beside `llama-server` that means this build can place layers on CUDA.
+pub fn binary_has_cuda(path: &Path) -> bool {
+    let Some(dir) = path.parent() else {
+        return false;
+    };
+    walkdir::WalkDir::new(dir)
+        .max_depth(2)
+        .into_iter()
+        .filter_map(|entry| entry.ok())
+        .any(|entry| entry.file_name().to_string_lossy().to_ascii_lowercase().contains("ggml-cuda"))
+}
+
+fn cuda_runtime_present(dir: &Path) -> bool {
+    if cfg!(windows) {
+        dir.join("cudart64_12.dll").is_file() && dir.join("cublas64_12.dll").is_file()
+    } else {
+        walkdir::WalkDir::new(dir)
+            .max_depth(2)
+            .into_iter()
+            .filter_map(|entry| entry.ok())
+            .any(|entry| entry.file_name().to_string_lossy().to_ascii_lowercase().contains("libcudart"))
+    }
+}
+
+/// CUDA runtime redistributable published next to the llama.cpp CUDA build.
+/// The Windows CUDA zip does not contain these DLLs. Without them `ggml-cuda.dll`
+/// fails to load, llama-server stays on CPU, and GPU memory stays flat.
+pub fn cuda_runtime_asset() -> (String, String) {
+    let name = if cfg!(windows) {
+        "cudart-llama-bin-win-cuda-12.4-x64.zip".to_string()
+    } else {
+        format!("cudart-llama-{LLAMA_TAG}-bin-ubuntu-cuda-12.8-x64.tar.gz")
+    };
+    let url = format!("{LLAMA_RELEASE}/{name}");
+    (name, url)
+}
+
+fn is_cuda_runtime_file(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    [
+        "cudart",
+        "cublas",
+        "nvrtc",
+        "nvjitlink",
+        "libcudart",
+        "libcublas",
+        "libnvrtc",
+        "libnvjitlink",
+    ]
+    .iter()
+    .any(|prefix| lower.starts_with(prefix))
+}
+
 /// llama-server binary, its `--help` text, the backend it will run, and whether the GPU
 /// binary failed to launch (missing CUDA/Vulkan loader) before the model was loaded.
+/// An NVIDIA machine always gets the CUDA build here. The CPU build is started later,
+/// only after that CUDA process fails to initialize.
 fn ensure_server(
     data_dir: &Path,
     probed: GpuBackend,
     cancel: &AtomicBool,
     progress: &dyn Fn(ClassifyNote),
 ) -> Result<(PathBuf, String, GpuBackend, bool), String> {
+    if probed == GpuBackend::Cuda {
+        let program = prepare_cuda_server(data_dir, cancel, progress)?;
+        let help = cli_help(&program, cancel).unwrap_or_default();
+        return Ok((program, help, GpuBackend::Cuda, false));
+    }
     if let Some(path) = server_override() {
         if !path.is_file() {
             return Err(format!("FAUXRRT_LLAMA_SERVER is not a file: {}", path.display()));
         }
         let help = cli_help(&path, cancel)?;
-        // Keep the probed GPU even when --help is hard to parse. A binary that cannot
-        // offload fails at server start, and that is the visible CPU fallback.
         return Ok((path, help, probed, false));
     }
     let primary = install_backend(data_dir, probed, cancel, progress)?;
-    if probed != GpuBackend::Cpu && !cli_launches(&primary, cancel)? {
+    if probed == GpuBackend::Vulkan && !cli_launches(&primary, cancel)? {
         let cpu = install_backend(data_dir, GpuBackend::Cpu, cancel, progress)?;
         let help = cli_help(&cpu, cancel)?;
         return Ok((cpu, help, GpuBackend::Cpu, true));
     }
     let help = cli_help(&primary, cancel)?;
     Ok((primary, help, probed, false))
+}
+
+fn cuda_candidates(data_dir: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    if let Some(path) = server_override() {
+        if path.is_file() && binary_has_cuda(&path) {
+            found.push(path);
+        }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            for name in ["llama-server.exe", "llama-server"] {
+                let path = dir.join(name);
+                if path.is_file() && binary_has_cuda(&path) {
+                    found.push(path);
+                }
+            }
+        }
+    }
+    let root = data_dir.join("llama.cpp").join(backend_dir_name(GpuBackend::Cuda));
+    if let Some(path) = find_cuda_server(&root) {
+        found.push(path);
+    }
+    found
+}
+
+fn prepare_cuda_server(
+    data_dir: &Path,
+    cancel: &AtomicBool,
+    progress: &dyn Fn(ClassifyNote),
+) -> Result<PathBuf, String> {
+    for path in cuda_candidates(data_dir) {
+        let Some(dir) = path.parent() else { continue };
+        if cuda_runtime_present(dir) {
+            return Ok(path);
+        }
+        if ensure_cuda_runtime(&path, data_dir, cancel, progress).is_ok() && cuda_runtime_present(dir) {
+            return Ok(path);
+        }
+    }
+    let program = install_backend(data_dir, GpuBackend::Cuda, cancel, progress)?;
+    ensure_cuda_runtime(&program, data_dir, cancel, progress)?;
+    if !binary_has_cuda(&program) {
+        return Err(
+            "the CUDA llama.cpp build is missing ggml-cuda. The CPU build is not started while an NVIDIA GPU is present."
+                .into(),
+        );
+    }
+    Ok(program)
+}
+
+fn ensure_cuda_runtime(
+    server: &Path,
+    data_dir: &Path,
+    cancel: &AtomicBool,
+    progress: &dyn Fn(ClassifyNote),
+) -> Result<(), String> {
+    let Some(dir) = server.parent() else {
+        return Ok(());
+    };
+    if cuda_runtime_present(dir) {
+        return Ok(());
+    }
+    let staging = data_dir.join("llama.cpp").join("cuda-runtime");
+    fs::create_dir_all(&staging).map_err(|err| err.to_string())?;
+    let (name, url) = cuda_runtime_asset();
+    let archive = staging.join(&name);
+    download_to(&url, &archive, cancel, &|status, bytes, total| {
+        let label = if status.is_empty() {
+            "Downloading CUDA runtime"
+        } else {
+            status
+        };
+        note(progress, label, bytes, total, "CUDA");
+    })?;
+    extract_archive(&archive, &staging, cancel)?;
+    copy_cuda_runtime(&staging, dir)?;
+    if cuda_runtime_present(dir) {
+        Ok(())
+    } else {
+        Err("CUDA runtime archive did not contain cudart".into())
+    }
+}
+
+fn copy_cuda_runtime(from: &Path, to: &Path) -> Result<(), String> {
+    for entry in walkdir::WalkDir::new(from).into_iter().filter_map(|entry| entry.ok()) {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy();
+        if !is_cuda_runtime_file(&name) {
+            continue;
+        }
+        let dest = to.join(entry.file_name());
+        if dest == entry.path() {
+            continue;
+        }
+        fs::copy(entry.path(), &dest).map_err(|err| format!("copy {name}: {err}"))?;
+    }
+    Ok(())
+}
+
+fn find_cuda_server(root: &Path) -> Option<PathBuf> {
+    let names = ["llama-server", "llama-server.exe"];
+    walkdir::WalkDir::new(root)
+        .into_iter()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| names.iter().any(|name| entry.file_name().to_string_lossy().eq_ignore_ascii_case(name)))
+        .map(|entry| entry.into_path())
+        .find(|path| binary_has_cuda(path))
 }
 
 fn install_backend(
@@ -2653,7 +2939,7 @@ fn install_backend(
     progress: &dyn Fn(ClassifyNote),
 ) -> Result<PathBuf, String> {
     let root = data_dir.join("llama.cpp").join(backend_dir_name(backend));
-    if let Some(found) = find_server(&root) {
+    if let Some(found) = locate_server(&root, backend) {
         return Ok(found);
     }
     fs::create_dir_all(&root).map_err(|e| e.to_string())?;
@@ -2669,7 +2955,21 @@ fn install_backend(
         note(progress, &label, bytes, total, device);
     })?;
     extract_archive(&archive, &root, cancel)?;
-    find_server(&root).ok_or_else(|| format!("llama.cpp archive did not contain llama-server ({url})"))
+    locate_server(&root, backend).ok_or_else(|| {
+        if backend == GpuBackend::Cuda {
+            format!("llama.cpp CUDA archive did not contain a CUDA llama-server ({url})")
+        } else {
+            format!("llama.cpp archive did not contain llama-server ({url})")
+        }
+    })
+}
+
+fn locate_server(root: &Path, backend: GpuBackend) -> Option<PathBuf> {
+    if backend == GpuBackend::Cuda {
+        find_cuda_server(root)
+    } else {
+        find_server(root)
+    }
 }
 
 pub fn cli_asset(backend: GpuBackend) -> (String, String) {
@@ -3427,6 +3727,44 @@ mod tests {
         let cpu = server_args(GpuBackend::Cpu, help, Path::new("model.gguf"), 9, Some(16_000));
         assert!(cpu.windows(2).any(|pair| pair == ["-ngl", "0"]), "{cpu:?}");
         assert!(cpu.windows(2).any(|pair| pair == ["-c", "2048"]), "{cpu:?}");
+        assert!(!cpu.iter().any(|arg| arg == "CUDA0"), "{cpu:?}");
+        let pinned = server_args(GpuBackend::Cuda, "", Path::new("model.gguf"), 8081, None);
+        assert_eq!(
+            pinned,
+            ["-m", "model.gguf", "-c", "2048", "--fit", "off", "-ngl", "32", "--device", "CUDA0", "--host", "127.0.0.1", "--port", "8081"]
+                .into_iter()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_cpu_binary_is_not_the_cuda_server_and_flat_vram_is_a_failure() {
+        let dir = std::env::temp_dir().join(format!("fauxrrt-cuda-bin-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let cpu = dir.join("llama-server.exe");
+        fs::write(&cpu, b"cpu").unwrap();
+        assert!(!binary_has_cuda(&cpu), "a binary with no ggml-cuda library is not the CUDA build");
+        fs::write(dir.join("ggml-cuda.dll"), b"cuda").unwrap();
+        assert!(binary_has_cuda(&cpu));
+        assert!(!cuda_runtime_present(&dir));
+        fs::write(dir.join("cudart64_12.dll"), b"rt").unwrap();
+        fs::write(dir.join("cublas64_12.dll"), b"blas").unwrap();
+        if cfg!(windows) {
+            assert!(cuda_runtime_present(&dir));
+        }
+        let (name, url) = cuda_runtime_asset();
+        assert!(name.contains("cudart") && name.contains("cuda-12.4") || name.contains("cuda-12.8"), "{name}");
+        assert!(url.contains(LLAMA_TAG) || url.contains("cudart-llama-bin-win"), "{url}");
+        assert!(url.starts_with(LLAMA_RELEASE), "{url}");
+        assert!(!gpu_offload_failed(GpuBackend::Cuda, ""));
+        assert!(!gpu_offload_failed(GpuBackend::Cuda, "offloaded 32/33 layers to GPU\nCUDA0 buffer size = 4800 MiB"));
+        assert!(gpu_offload_failed(GpuBackend::Cuda, "llm_load_tensors: offloaded 0/33 layers to GPU"));
+        assert!(gpu_offload_failed(GpuBackend::Cuda, "offloading 0 repeating layers to GPU"));
+        assert!(gpu_offload_failed(GpuBackend::Cuda, "ggml_cuda_init: failed to initialize CUDA"));
+        assert!(!gpu_offload_failed(GpuBackend::Cpu, "offloaded 0/33 layers to GPU"));
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -4041,6 +4379,35 @@ sys.stderr.write("ggml_cuda_init: failed to initialize CUDA\n")
 sys.exit(1)
 "#;
 
+    const SLOW_LLAMA_SERVER: &str = r#"#!/usr/bin/env python3
+import json, os, sys, time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+args = sys.argv[1:]
+port = int(args[args.index("--port") + 1])
+log = os.environ.get("FAUXRRT_LAUNCH_LOG")
+if log:
+    with open(log, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(args) + "\n")
+time.sleep(2.0)
+
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def do_GET(self):
+        body = b'{"status":"ok"}'
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, fmt, *args):
+        return
+
+ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()
+"#;
+
     #[cfg(unix)]
     #[test]
     fn second_classification_does_not_relaunch_the_server() {
@@ -4091,6 +4458,52 @@ sys.exit(1)
 
     #[cfg(unix)]
     #[test]
+    fn a_second_start_waits_on_the_server_that_is_still_opening() {
+        let dir = std::env::temp_dir().join(format!("fauxrrt-warm-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let program = write_exe(&dir, "llama-server", SLOW_LLAMA_SERVER);
+        let log = dir.join("launches.jsonl");
+        let model = dir.join("model.gguf");
+        let spec = server_spec(program, model, GpuBackend::Cuda, &log);
+        let pool = Arc::new(LlamaServerPool::new());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let first = Arc::clone(&pool);
+        let second = Arc::clone(&pool);
+        let spec_a = spec.clone();
+        let spec_b = spec.clone();
+        let cancel_a = Arc::clone(&cancel);
+        let cancel_b = Arc::clone(&cancel);
+        let left = thread::spawn(move || first.start_or_fallback(&spec_a, || Ok(spec_a.clone()), &cancel_a));
+        thread::sleep(Duration::from_millis(400));
+        let right = thread::spawn(move || second.start_or_fallback(&spec_b, || Ok(spec_b.clone()), &cancel_b));
+        let left = left.join().unwrap().unwrap();
+        let right = right.join().unwrap().unwrap();
+        assert_eq!(left.backend, GpuBackend::Cuda);
+        assert_eq!(right.layers, 32);
+        assert_eq!(pool.launch_count(), 1, "the opening server was relaunched");
+        assert_eq!(fs::read_to_string(&log).unwrap().lines().count(), 1);
+        pool.shutdown();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_partial_gguf_is_not_warmed() {
+        if std::env::var_os("FAUXRRT_LLAMA_MODEL").is_some() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("fauxrrt-partial-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        assert!(installed_model(&dir).is_none());
+        let dest = dir.join("models").join(GGUF_FILENAME);
+        fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        fs::write(&dest, b"not a model").unwrap();
+        assert!(installed_model(&dir).is_none(), "a partial weight must not start llama-server");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn cpu_server_starts_only_after_the_gpu_backend_exits() {
         let dir = std::env::temp_dir().join(format!("fauxrrt-fallback-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
@@ -4102,13 +4515,18 @@ sys.exit(1)
         let preferred = server_spec(crash, model.clone(), GpuBackend::Cuda, &log);
         let cpu_spec = server_spec(cpu, model, GpuBackend::Cpu, &log);
         let pool = Arc::new(LlamaServerPool::new());
-        let cancel = AtomicBool::new(false);
+        let cancel = Arc::new(AtomicBool::new(false));
         let info = pool
             .start_or_fallback(&preferred, || Ok(cpu_spec.clone()), &cancel)
             .unwrap();
         assert!(info.fell_back);
         assert_eq!(info.backend, GpuBackend::Cpu);
         assert_eq!(info.layers, 0);
+        let runtime = LlamaRuntime::from_info(Arc::clone(&pool), info, Arc::clone(&cancel));
+        assert_eq!(
+            runtime.status_device(),
+            "GPU runtime failed; classifying on CPU, 0 layers"
+        );
         assert_eq!(pool.launch_count(), 2);
         let again = pool
             .start_or_fallback(&preferred, || Ok(cpu_spec.clone()), &cancel)

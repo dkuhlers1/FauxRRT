@@ -51,6 +51,7 @@ import {
   markCorrection,
   nextPendingIndex,
   reviewCardHtml,
+  detectionProgressHtml,
   formatLoadProgress,
   loadFailureMessage,
   uniqueSchemaSummary,
@@ -61,6 +62,7 @@ const tracks = new Map();
 let schemaSession = null;
 let fileLoadError = "";
 let fileLoadProgress = "";
+let detectingFormat = false;
 let boats = [];
 let selectedId = null;
 let selectedBoatId = null;
@@ -280,10 +282,11 @@ try {
   await listen("load-progress", ({ payload }) => {
     const text = formatLoadProgress(payload);
     if (!text) return;
-    fileLoadProgress = text;
     if (els.progress) els.progress.textContent = text;
-    const slot = document.querySelector("#drawer-trajectories [data-role='load-progress']");
-    if (slot) slot.textContent = text;
+    if (!detectingFormat) return;
+    fileLoadProgress = text;
+    const label = document.querySelector("#drawer-trajectories [data-role='load-progress-text']");
+    if (label) label.textContent = text;
   });
 } catch {
   /* previewed outside the Tauri shell */
@@ -354,15 +357,17 @@ async function runClassify(cmd, dest) {
       els.progress.textContent = fileLoadError;
       return;
     }
+    detectingFormat = true;
+    fileLoadProgress = "Detecting trajectory file format…";
+    els.progress.textContent = fileLoadProgress;
+    render();
     setBusy(true);
     if (els.cancelClassify) {
       els.cancelClassify.hidden = false;
       els.cancelClassify.disabled = false;
     }
-    fileLoadProgress = "Detecting trajectory file format…";
-    els.progress.textContent = fileLoadProgress;
-    render();
     const result = await invoke("classify_picked", { paths });
+    detectingFormat = false;
     fileLoadProgress = "";
     const groups = (result?.groups || []).map((group) => ({
       ...group,
@@ -393,6 +398,7 @@ async function runClassify(cmd, dest) {
   } catch (err) {
     schemaSession = null;
     hideSchemaReview();
+    detectingFormat = false;
     fileLoadProgress = "";
     fileLoadError = loadFailureMessage(err);
     els.progress.textContent = fileLoadError;
@@ -2593,7 +2599,7 @@ function fillFileLoad(body, obj, destLabel) {
       <button type="button" data-act="load-files" class="primary compact">Choose files…</button>
       <button type="button" data-act="load-folder" class="ghost compact">Choose folder…</button>
     </div>
-    ${fileLoadProgress ? `<p class="muted" data-role="load-progress">${escapeHtml(fileLoadProgress)}</p>` : ""}
+    ${detectionProgressHtml(fileLoadProgress)}
     ${fileLoadError ? `<p class="schema-error" data-role="load-failure">${escapeHtml(fileLoadError)}</p>` : ""}`;
   const needObject = () => {
     els.progress.textContent = "Add an object, name a mode, then Load files or Generate.";
