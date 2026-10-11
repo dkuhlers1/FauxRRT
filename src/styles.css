@@ -443,8 +443,51 @@ input[type="number"], input[type="text"] {
   align-items: center;
   gap: 8px;
 }
-.dest-name-row input { flex: 1; min-width: 0; }
-.dest-name-row button { flex: 0 0 auto; }
+.dest-name-row > button { flex: 0 0 auto; }
+.name-combo {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: stretch;
+}
+.name-combo input {
+  flex: 1;
+  min-width: 0;
+  border-top-right-radius: 0;
+  border-bottom-right-radius: 0;
+}
+.name-combo-open {
+  border-top-left-radius: 0;
+  border-bottom-left-radius: 0;
+  padding: 0 8px;
+}
+.name-menu {
+  position: absolute;
+  z-index: 6;
+  top: calc(100% + 2px);
+  left: 0;
+  right: 0;
+  margin: 0;
+  padding: 4px;
+  list-style: none;
+  background: #101820;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  max-height: 180px;
+  overflow: auto;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+}
+.name-menu[hidden] { display: none; }
+.name-menu-item {
+  display: block;
+  width: 100%;
+  text-align: left;
+  background: transparent;
+  border: 0;
+  border-radius: 4px;
+}
+.name-menu-item[aria-current="true"] { background: rgba(61, 158, 255, 0.16); }
 .dest-hint {
   font-size: 12px;
   color: var(--text);
