@@ -923,261 +923,190 @@ export function clearVesselRisk() {
   }
 }
 
-let isolineLines = null;
-let isolineLabels = null;
 let showIsolines = true;
-
-// Screen-space polyline ribbons are centered on the path. At 120 m the lower
-// half of a 2.5 px line is inside the ellipsoid, so the depth test drops it,
-// and the translucent risk hexes cover whatever remains. Lift the same lon/lat
-// above that ribbon, and keep a depth-fail pass for fragments the globe still
-// occludes.
-const ISOLINE_MIN_LIFT_M = 2500;
-const ISOLINE_MAX_LIFT_M = 80000;
-const ISOLINE_CHUNK = 2000;
 let lastIsolineInput = null;
-let lastIsolineLift = 0;
-let isolineCameraBound = false;
+let isolineCanvas = null;
+let isolineOverlayBound = false;
+const isolineScratch3 = { current: null };
+const isolineScratch2 = { current: null };
 
-function isolineLiftMeters(lines) {
-  let west = Infinity;
-  let east = -Infinity;
-  let south = Infinity;
-  let north = -Infinity;
+// The KDE heatmap and the vessel-risk hexes are translucent Cesium primitives.
+// They are drawn after opaque geometry, so a polyline in the scene — even one
+// lifted off the ellipsoid — is covered by the field the analyst is looking at.
+// These contours are painted in screen space, above that WebGL canvas.
+
+function isolineCss(level) {
+  const exp = Math.log10(Math.max(Number(level) || 0, 1e-12));
+  const t = Math.min(1, Math.max(0, (exp + 4) / 4));
+  const g = Math.round(214 - 130 * t);
+  const b = Math.round(70 + 50 * (1 - t));
+  return `rgb(255,${g},${b})`;
+}
+
+function isolineScratches(Cesium) {
+  if (!isolineScratch3.current) isolineScratch3.current = new Cesium.Cartesian3();
+  if (!isolineScratch2.current) isolineScratch2.current = new Cesium.Cartesian2();
+  return [isolineScratch3.current, isolineScratch2.current];
+}
+
+function projectIsoline(Cesium, project, lon, lat, cssW, cssH) {
+  const [scratch3, scratch2] = isolineScratches(Cesium);
+  Cesium.Cartesian3.fromDegrees(lon, lat, 0, Cesium.Ellipsoid.WGS84, scratch3);
+  if (viewer.scene.mode === Cesium.SceneMode.SCENE3D) {
+    const cam = viewer.camera.positionWC;
+    const facing = scratch3.x * cam.x + scratch3.y * cam.y + scratch3.z * cam.z;
+    const r2 = scratch3.x * scratch3.x + scratch3.y * scratch3.y + scratch3.z * scratch3.z;
+    if (facing <= r2) return null;
+  }
+  const win = project(viewer.scene, scratch3, scratch2);
+  if (!win || !Number.isFinite(win.x) || !Number.isFinite(win.y)) return null;
+  if (win.x < -80 || win.y < -80 || win.x > cssW + 80 || win.y > cssH + 80) return null;
+  return { x: win.x, y: win.y };
+}
+
+function placeIsolineCanvas(host) {
+  const parent = isolineCanvas.parentElement;
+  const parentRect = parent.getBoundingClientRect();
+  const hostRect = host.getBoundingClientRect();
+  isolineCanvas.style.left = `${hostRect.left - parentRect.left}px`;
+  isolineCanvas.style.top = `${hostRect.top - parentRect.top}px`;
+  isolineCanvas.style.width = `${hostRect.width}px`;
+  isolineCanvas.style.height = `${hostRect.height}px`;
+}
+
+function ensureIsolineOverlay() {
+  if (!viewer || isolineCanvas) return;
+  const host = viewer.scene.canvas;
+  const parent = host.closest("#globe") || viewer.container || host.parentElement;
+  if (getComputedStyle(parent).position === "static") parent.style.position = "relative";
+  isolineCanvas = document.createElement("canvas");
+  isolineCanvas.className = "risk-isoline-canvas";
+  isolineCanvas.dataset.riskIsolines = "on";
+  isolineCanvas.setAttribute("aria-hidden", "true");
+  // Above the WebGL canvas (KDE and vessel hexes) and below the wind overlay.
+  isolineCanvas.style.position = "absolute";
+  isolineCanvas.style.pointerEvents = "none";
+  isolineCanvas.style.zIndex = "4";
+  parent.appendChild(isolineCanvas);
+  if (!isolineOverlayBound) {
+    isolineOverlayBound = true;
+    viewer.scene.preRender.addEventListener(drawIsolineOverlay);
+  }
+}
+
+function drawIsolineOverlay() {
+  try {
+    paintIsolineCanvas();
+  } catch {
+    // A failed projection must not stop the Cesium render loop.
+  }
+}
+
+function paintIsolineCanvas() {
+  if (!viewer || !isolineCanvas) return;
+  const host = viewer.scene.canvas;
+  const cssW = host.clientWidth || 0;
+  const cssH = host.clientHeight || 0;
+  if (cssW < 2 || cssH < 2) return;
+  placeIsolineCanvas(host);
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const bufW = Math.floor(cssW * dpr);
+  const bufH = Math.floor(cssH * dpr);
+  if (isolineCanvas.width !== bufW || isolineCanvas.height !== bufH) {
+    isolineCanvas.width = bufW;
+    isolineCanvas.height = bufH;
+  }
+  const ctx = isolineCanvas.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, cssW, cssH);
+  const lines = showIsolines ? lastIsolineInput : null;
+  if (!lines?.length) return;
+  const Cesium = window.Cesium;
+  const project = Cesium?.SceneTransforms?.worldToWindowCoordinates
+    || Cesium?.SceneTransforms?.wgs84ToWindowCoordinates;
+  if (!project) return;
+  const jump = Math.max(cssW, cssH) * 0.65;
+  ctx.lineJoin = "round";
+  ctx.lineCap = "round";
+  ctx.font = "600 13px sans-serif";
+  ctx.textBaseline = "middle";
   for (const line of lines) {
     const flat = line?.line || [];
+    if (flat.length < 4) continue;
+    const runs = [];
+    let run = [];
+    let prev = null;
     for (let i = 0; i + 1 < flat.length; i += 2) {
       const lon = Number(flat[i]);
       const lat = Number(flat[i + 1]);
       if (!Number.isFinite(lon) || !Number.isFinite(lat)) continue;
-      west = Math.min(west, lon);
-      east = Math.max(east, lon);
-      south = Math.min(south, lat);
-      north = Math.max(north, lat);
-    }
-  }
-  let spanLift = ISOLINE_MIN_LIFT_M;
-  if (Number.isFinite(west)) {
-    let lonSpan = east - west;
-    if (lonSpan > 180) lonSpan = 360 - lonSpan;
-    const spanM = Math.max(lonSpan, north - south, 0) * 111_000;
-    spanLift = Math.max(ISOLINE_MIN_LIFT_M, spanM * 0.04);
-  }
-  const cameraH = viewer?.camera?.positionCartographic?.height;
-  const canvasH = Math.max(viewer?.scene?.canvas?.clientHeight || 800, 1);
-  const ribbonM = Number.isFinite(cameraH) && cameraH > 0
-    ? (2.5 * 0.5) * (cameraH / canvasH)
-    : 0;
-  return Math.min(ISOLINE_MAX_LIFT_M, Math.max(spanLift, ribbonM * 4 + 400));
-}
-
-function bindIsolineCamera() {
-  if (isolineCameraBound || !viewer) return;
-  isolineCameraBound = true;
-  viewer.camera.moveEnd.addEventListener(() => {
-    if (!showIsolines || !lastIsolineInput?.length || !isolineLines) return;
-    const next = isolineLiftMeters(lastIsolineInput);
-    if (lastIsolineLift > 0 && Math.abs(next - lastIsolineLift) / lastIsolineLift < 0.35) return;
-    paintRiskIsolines(lastIsolineInput);
-  });
-}
-
-function isolineRings(Cesium, flat, height) {
-  const rings = [];
-  let current = [];
-  let prevLon = null;
-  let prevLat = null;
-  const flush = () => {
-    if (current.length >= 2) rings.push(current);
-    current = [];
-    prevLon = null;
-    prevLat = null;
-  };
-  for (let i = 0; i + 1 < flat.length; i += 2) {
-    const lon = Number(flat[i]);
-    const lat = Number(flat[i + 1]);
-    if (!Number.isFinite(lon) || !Number.isFinite(lat)) continue;
-    if (prevLon != null && Math.abs(lon - prevLon) > 180) flush();
-    if (
-      prevLon != null
-      && Math.abs(lon - prevLon) < 1e-10
-      && Math.abs(lat - prevLat) < 1e-10
-    ) {
-      continue;
-    }
-    current.push(Cesium.Cartesian3.fromDegrees(lon, lat, height));
-    prevLon = lon;
-    prevLat = lat;
-  }
-  flush();
-  return rings;
-}
-
-function chunkPositions(positions) {
-  if (positions.length <= ISOLINE_CHUNK) return [positions];
-  const out = [];
-  for (let i = 0; i < positions.length - 1; i += ISOLINE_CHUNK - 1) {
-    const slice = positions.slice(i, Math.min(positions.length, i + ISOLINE_CHUNK));
-    if (slice.length >= 2) out.push(slice);
-  }
-  return out;
-}
-
-function isolineAppearance(Cesium, color, depthMask) {
-  const appearance = {
-    material: Cesium.Material.fromType("Color", { color: Cesium.Color.clone(color) }),
-    translucent: false,
-  };
-  if (depthMask === false) appearance.renderState = { depthMask: false };
-  return new Cesium.PolylineMaterialAppearance(appearance);
-}
-
-function removeIsolinePrimitives() {
-  if (isolineLines && viewer) {
-    viewer.scene.primitives.remove(isolineLines);
-    isolineLines = null;
-  }
-  if (isolineLabels && viewer) {
-    viewer.scene.primitives.remove(isolineLabels);
-    isolineLabels = null;
-  }
-}
-
-let isolinePainting = false;
-
-function paintRiskIsolines(lines) {
-  if (isolinePainting) return;
-  isolinePainting = true;
-  try {
-    removeIsolinePrimitives();
-    if (!viewer || !lines?.length) {
-      requestRender();
-      return;
-    }
-    const Cesium = window.Cesium;
-    const height = isolineLiftMeters(lines);
-    lastIsolineLift = height;
-    bindIsolineCamera();
-    const groups = new Map();
-    const labels = [];
-    for (const line of lines) {
-      const flat = line?.line || [];
-      if (flat.length < 4) continue;
-      const rings = isolineRings(Cesium, flat, height);
-      if (!rings.length) continue;
-      const color = isolineColor(Cesium, Number(line.level));
-      const key = `${color.red.toFixed(3)},${color.green.toFixed(3)},${color.blue.toFixed(3)}`;
-      let group = groups.get(key);
-      if (!group) {
-        group = { color, instances: [] };
-        groups.set(key, group);
+      const xy = projectIsoline(Cesium, project, lon, lat, cssW, cssH);
+      if (!xy) {
+        if (run.length) runs.push(run);
+        run = [];
+        prev = null;
+        continue;
       }
-      let labelAt = rings[0];
-      for (const ring of rings) {
-        if (ring.length > labelAt.length) labelAt = ring;
-        for (const slice of chunkPositions(ring)) {
-          group.instances.push(new Cesium.GeometryInstance({
-            geometry: new Cesium.PolylineGeometry({
-              positions: slice,
-              width: 2.5,
-              vertexFormat: Cesium.PolylineMaterialAppearance.VERTEX_FORMAT,
-              arcType: Cesium.ArcType.GEODESIC,
-            }),
-          }));
-        }
+      if (prev && Math.hypot(xy.x - prev.x, xy.y - prev.y) > jump) {
+        if (run.length) runs.push(run);
+        run = [xy];
+      } else if (!prev || Math.hypot(xy.x - prev.x, xy.y - prev.y) > 0.4) {
+        run.push(xy);
       }
-      labels.push({
-        position: labelAt[Math.floor(labelAt.length / 2)],
-        text: line.label || formatIsolineLabel(line.level),
-      });
+      prev = xy;
     }
-    if (!groups.size) {
-      requestRender();
-      return;
+    if (run.length) runs.push(run);
+    const drawable = runs.filter((part) => part.length >= 2);
+    if (!drawable.length) continue;
+    const color = isolineCss(line.level);
+    ctx.beginPath();
+    for (const part of drawable) {
+      ctx.moveTo(part[0].x, part[0].y);
+      for (let i = 1; i < part.length; i++) ctx.lineTo(part[i].x, part[i].y);
     }
-    isolineLines = viewer.scene.primitives.add(new Cesium.PrimitiveCollection());
-    for (const group of groups.values()) {
-      isolineLines.add(new Cesium.Primitive({
-        geometryInstances: group.instances,
-        appearance: isolineAppearance(Cesium, group.color, true),
-        depthFailAppearance: isolineAppearance(Cesium, group.color, false),
-        asynchronous: false,
-        allowPicking: false,
-      }));
-    }
-    isolineLabels = viewer.scene.primitives.add(new Cesium.LabelCollection());
-    for (const label of labels) {
-      isolineLabels.add({
-        position: label.position,
-        text: label.text,
-        font: "600 13px sans-serif",
-        fillColor: Cesium.Color.WHITE,
-        outlineColor: Cesium.Color.BLACK,
-        outlineWidth: 3,
-        style: Cesium.LabelStyle.FILL_AND_OUTLINE,
-        disableDepthTestDistance: Number.POSITIVE_INFINITY,
-        eyeOffset: new Cesium.Cartesian3(0, 0, -Math.min(height, 8000)),
-        pixelOffset: new Cesium.Cartesian2(10, -8),
-        showBackground: false,
-      });
-    }
-    isolineLines.show = showIsolines;
-    isolineLabels.show = showIsolines;
-    viewer.scene.primitives.raiseToTop(isolineLines);
-    viewer.scene.primitives.raiseToTop(isolineLabels);
-    requestRender();
-    requestAnimationFrame(() => requestRender());
-  } finally {
-    isolinePainting = false;
+    ctx.strokeStyle = "rgba(0,0,0,0.9)";
+    ctx.lineWidth = 4.5;
+    ctx.stroke();
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 2.5;
+    ctx.stroke();
+    let best = drawable[0];
+    for (const part of drawable) if (part.length > best.length) best = part;
+    const at = best[Math.floor(best.length / 2)];
+    const text = line.label || formatIsolineLabel(line.level);
+    if (!text) continue;
+    const x = at.x + 10;
+    const y = at.y - 8;
+    ctx.lineWidth = 3;
+    ctx.strokeStyle = "#000";
+    ctx.strokeText(text, x, y);
+    ctx.fillStyle = "#fff";
+    ctx.fillText(text, x, y);
   }
 }
 
 export function setRiskIsolines(lines) {
-  lastIsolineInput = lines?.length ? lines : null;
-  lastIsolineLift = 0;
-  if (!lastIsolineInput) {
+  if (!lines?.length) {
     clearRiskIsolines();
     requestRender();
     return;
   }
-  paintRiskIsolines(lastIsolineInput);
+  lastIsolineInput = lines;
+  ensureIsolineOverlay();
+  drawIsolineOverlay();
+  requestRender();
 }
 
 export function setRiskIsolinesVisible(visible) {
-  const next = Boolean(visible);
-  const turnedOn = next && !showIsolines;
-  showIsolines = next;
-  if (!showIsolines) {
-    if (isolineLines) isolineLines.show = false;
-    if (isolineLabels) isolineLabels.show = false;
-    requestRender();
-    return;
-  }
-  if ((turnedOn || !isolineLines) && lastIsolineInput?.length) {
-    lastIsolineLift = 0;
-    paintRiskIsolines(lastIsolineInput);
-    return;
-  }
-  if (isolineLines) isolineLines.show = true;
-  if (isolineLabels) isolineLabels.show = true;
+  showIsolines = Boolean(visible);
+  ensureIsolineOverlay();
+  drawIsolineOverlay();
   requestRender();
 }
 
 export function clearRiskIsolines() {
   lastIsolineInput = null;
-  lastIsolineLift = 0;
-  removeIsolinePrimitives();
-}
-
-function isolineColor(Cesium, level) {
-  const exp = Math.log10(Math.max(level, 1e-12));
-  const t = Math.min(1, Math.max(0, (exp + 4) / 4));
-  return Cesium.Color.fromBytes(
-    255,
-    Math.round(214 - 130 * t),
-    Math.round(70 + 50 * (1 - t)),
-    255,
-  );
+  if (isolineCanvas && viewer) drawIsolineOverlay();
 }
 
 function formatIsolineLabel(level) {
