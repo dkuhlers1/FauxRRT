@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::schema::{
-    detect_delimiter, detect_preview, detect_schema, is_comment_line, parse_number, row_is_header, ColumnRole, Delimiter,
+    detect_preview, detect_schema, is_comment_line, parse_number, row_is_header, ColumnRole, Delimiter,
     DetectedSchema, Frame,
 };
 
@@ -50,14 +50,20 @@ Supported units, and only these:
 Column roles, and only these names: time, pos_x, pos_y, pos_z, pos_lat, pos_lon, pos_alt, pos_n, pos_e, pos_d, pos_u, vel_x, vel_y, vel_z, vel_n, vel_e, vel_d, vel_u, acc_x, acc_y, acc_z, acc_n, acc_e, acc_d, acc_u, orientation_roll, orientation_pitch, orientation_yaw, mass, ignore.
 
 Position columns are required.
-LLA uses pos_lat, pos_lon, and pos_alt. The position unit is the altitude unit. Latitude and longitude stay in degrees.
+LLA uses pos_lat, pos_lon, and pos_alt. The position unit is the altitude distance only.
+Latitude and longitude are angles. Trust a unit written on that column, including a parenthetical note such as lat(rad) or lon(rad), or a unit row. Do not change a stated unit because the numbers look like degrees or radians. When the header states no angle unit, latitude and longitude are degrees.
+alt_out is altitude.
+A junk line before or after the header is not a column name. header_lines counts every line before the first data row, including junk lines.
+When the header row uses a different delimiter from the data rows, delimiter is the data delimiter.
+Columns may be reordered. Match each name to its own column.
+Put each column unit in column_units. Latitude and longitude are deg or rad. Altitude is m, km, or ft.
 ECEF and ECI use pos_x, pos_y, pos_z.
 NED uses pos_n, pos_e, pos_d for north, east, and down.
 NEU uses pos_n, pos_e, pos_u for north, east, and up.
 Velocity, acceleration, and orientation use the same axis names when those columns exist.
 
 Read the names in the excerpt. They are not a fixed dictionary, and a named header is still your job.
-lat, latitude, lon, longitude, alt, and altitude are LLA position: pos_lat, pos_lon, pos_alt.
+lat, latitude, lon, longitude, alt, altitude, and alt_out are LLA position: pos_lat, pos_lon, pos_alt.
 x-ecr, y-ecr, and z-ecr are Earth-centered rotating position, which is ECEF: pos_x, pos_y, and pos_z. Match each column by the axis in its name. z-ecr may appear before y-ecr.
 north, east, and down are NED: pos_n, pos_e, and pos_d.
 Return that identification only. Do not convert coordinates into another frame.
@@ -72,7 +78,7 @@ Set confidence_score below 0.6 when the layout is ambiguous. Do not guess past a
 reasoning is one short classification note, not a conversation.
 
 Return exactly this JSON shape and no other field names:
-{"header_lines":1,"delimiter":",","frames":{"position":"ECEF","velocity":"NED"},"units":{"position":"m","velocity":"m/s"},"columns":{"col_0":"time","col_1":"pos_x","col_2":"pos_y","col_3":"pos_z","col_4":"vel_n","col_5":"vel_e","col_6":"vel_d"},"confidence_score":0.85,"unsupported_flag":false,"reasoning":"position ECEF, velocity NED"}
+{"header_lines":1,"delimiter":",","frames":{"position":"ECEF","velocity":"NED"},"units":{"position":"m","velocity":"m/s"},"columns":{"col_0":"time","col_1":"pos_x","col_2":"pos_y","col_3":"pos_z","col_4":"vel_n","col_5":"vel_e","col_6":"vel_d"},"column_units":{"col_1":"m","col_2":"m","col_3":"m","col_4":"m/s","col_5":"m/s","col_6":"m/s"},"confidence_score":0.85,"unsupported_flag":false,"reasoning":"position ECEF, velocity NED"}
 "#;
 
 const JSON_SCHEMA: &str = r#"{
@@ -105,6 +111,7 @@ const JSON_SCHEMA: &str = r#"{
       }
     },
     "columns": { "type": "object", "additionalProperties": { "type": "string" } },
+    "column_units": { "type": "object", "additionalProperties": { "type": "string" } },
     "confidence_score": { "type": "number", "minimum": 0, "maximum": 1 },
     "unsupported_flag": { "type": "boolean" },
     "reasoning": { "type": "string" }
@@ -1097,64 +1104,248 @@ pub fn partial_schema_guess(text: &str) -> TrajectoryClassification {
     class
 }
 
-/// Read column names and an optional unit row. This is the Choose-files classifier.
-/// It does not start a model. Unrecognized columns stay unset for the review window.
+/// Read column names and an optional unit row. This does not start a model.
+/// Unrecognized columns stay unset for the review window.
 pub fn interpret_header(text: &str) -> TrajectoryClassification {
-    let lines: Vec<&str> = text.lines().map(|line| line.trim_end()).collect();
-    let content: Vec<(usize, &str)> = lines
-        .iter()
-        .enumerate()
-        .filter(|(_, line)| !line.trim().is_empty() && !is_comment_line(line))
-        .map(|(index, line)| (index, *line))
-        .collect();
-    let sample: Vec<&str> = content.iter().take(40).map(|(_, line)| *line).collect();
-    let delimiter = detect_delimiter(&sample).unwrap_or(Delimiter::Comma);
+    classification_from_scan(&scan_header(text), None)
+}
 
-    let mut names: Option<Vec<String>> = None;
-    let mut unit_row: Option<Vec<String>> = None;
-    let mut cursor = 0usize;
-    if let Some((_, line)) = content.first() {
+pub const ANGLE_LOOKS_LIKE_DEGREES: &str =
+    "Latitude and longitude are marked as radians, but the values look like degrees. Check the header for an error.";
+pub const ANGLE_LOOKS_LIKE_RADIANS: &str =
+    "Latitude and longitude are marked as degrees, but the values look like radians. Check the header for an error.";
+const MODEL_DID_NOT_RUN: &str = "The model did not run.";
+
+/// Warn when stored angle units disagree with the numbers. The stored unit is left unchanged.
+pub fn angle_unit_warning(text: &str, class: &TrajectoryClassification) -> Option<String> {
+    let roles = column_roles(class);
+    let lat_index = roles.iter().find(|(_, role)| role.as_str() == "pos_lat").map(|(index, _)| *index);
+    let lon_index = roles.iter().find(|(_, role)| role.as_str() == "pos_lon").map(|(index, _)| *index);
+    let (Some(lat_index), Some(lon_index)) = (lat_index, lon_index) else {
+        return None;
+    };
+    let lat_unit = column_unit(class, "pos_lat");
+    let lon_unit = column_unit(class, "pos_lon");
+    let Ok(delimiter) = delimiter_of(&class.delimiter) else {
+        return None;
+    };
+    let mut lats = Vec::new();
+    let mut lons = Vec::new();
+    for line in text.lines().skip(class.header_lines as usize) {
         let cells = delimiter.split(line);
-        if row_is_header(&cells) && !row_is_units(&cells) {
-            names = Some(cells);
-            cursor = 1;
-            if let Some((_, line)) = content.get(cursor) {
-                let cells = delimiter.split(line);
+        let Some(lat) = cells.get(lat_index).and_then(|cell| parse_number(cell)) else {
+            continue;
+        };
+        let Some(lon) = cells.get(lon_index).and_then(|cell| parse_number(cell)) else {
+            continue;
+        };
+        lats.push(lat);
+        lons.push(lon);
+    }
+    if lats.is_empty() {
+        return None;
+    }
+    let half_pi = std::f64::consts::FRAC_PI_2 + 1e-6;
+    let pi = std::f64::consts::PI + 1e-6;
+    let lat_rad = lat_unit == "rad";
+    let lon_rad = lon_unit == "rad";
+    if lat_rad || lon_rad {
+        let lat_outside = lat_rad && lats.iter().any(|value| value.abs() > half_pi);
+        let lon_outside = lon_rad && lons.iter().any(|value| value.abs() > pi);
+        if lat_outside || lon_outside {
+            return Some(ANGLE_LOOKS_LIKE_DEGREES.to_string());
+        }
+        return None;
+    }
+    let inside = lats.iter().all(|value| value.abs() <= half_pi) && lons.iter().all(|value| value.abs() <= pi);
+    inside.then(|| ANGLE_LOOKS_LIKE_RADIANS.to_string())
+}
+
+/// Local scan of the first excerpt, then Llama on that same short slice.
+/// A unit written in the header is kept. If the model is missing or fails, the local guess is returned.
+pub fn read_trajectory_format(text: &str, model: Option<&dyn TextCompleter>) -> Result<TrajectoryClassification, String> {
+    let local = interpret_header(text);
+    finish_with_model(local, text, model)
+}
+
+pub fn finish_with_model(
+    local: TrajectoryClassification,
+    text: &str,
+    model: Option<&dyn TextCompleter>,
+) -> Result<TrajectoryClassification, String> {
+    let Some(model) = model else {
+        let mut local = local;
+        note_model_did_not_run(&mut local);
+        return Ok(local);
+    };
+    match classify_with(model, &excerpt_of(text)) {
+        Ok(model_class) => Ok(classification_from_scan(&scan_header(text), Some(&model_class))),
+        Err(err) if err == CANCELLED || err.contains(CANCELLED) => Err(err),
+        Err(_) => {
+            let mut local = local;
+            note_model_did_not_run(&mut local);
+            Ok(local)
+        }
+    }
+}
+
+fn note_model_did_not_run(class: &mut TrajectoryClassification) {
+    if class.reasoning.contains(MODEL_DID_NOT_RUN) {
+        return;
+    }
+    if class.reasoning.trim().is_empty() {
+        class.reasoning = MODEL_DID_NOT_RUN.to_string();
+    } else {
+        class.reasoning = format!("{} {MODEL_DID_NOT_RUN}", class.reasoning.trim());
+    }
+}
+
+struct HeaderScan {
+    names: Vec<String>,
+    unit_row: Option<Vec<String>>,
+    data_width: usize,
+    data_delim: Delimiter,
+    header_lines: u32,
+}
+
+fn scan_header(text: &str) -> HeaderScan {
+    let lines: Vec<&str> = text.lines().map(|line| line.trim_end()).take(EXCERPT_LINES).collect();
+    let candidates: Vec<&str> = lines
+        .iter()
+        .copied()
+        .filter(|line| !is_comment_line(line) && line.chars().any(|ch| ch.is_ascii_digit()))
+        .take(40)
+        .collect();
+    let data_delim = best_data_delimiter(&candidates);
+    let first_data = lines.iter().position(|line| is_data_line(line, data_delim));
+    let data_width = first_data.map(|index| data_delim.split(lines[index]).len()).unwrap_or(0);
+    let search_end = first_data.unwrap_or(lines.len());
+    let mut best: Option<(usize, Delimiter, i32, Vec<String>)> = None;
+    for (index, line) in lines.iter().enumerate().take(search_end) {
+        if is_comment_line(line) {
+            continue;
+        }
+        for delim in HEADER_DELIMS {
+            let cells = delim.split(line);
+            if cells.len() < 2 || !row_is_header(&cells) || row_is_units(&cells) {
+                continue;
+            }
+            let named = cells.iter().filter(|cell| identify_header_name(cell).is_some()).count();
+            if named == 0 {
+                continue;
+            }
+            let trailing = cells
+                .iter()
+                .filter(|cell| cell.ends_with([',', ';', '|']))
+                .count() as i32;
+            let score = named as i32 * 10 + cells.len() as i32 - trailing * 5;
+            let replace = best.as_ref().map(|(_, _, best_score, _)| score >= *best_score).unwrap_or(true);
+            if replace {
+                best = Some((index, delim, score, cells));
+            }
+        }
+    }
+    let (header_index, header_delim, names) = match best {
+        Some((index, delim, _, cells)) => (Some(index), delim, cells),
+        None => (None, data_delim, Vec::new()),
+    };
+    let mut unit_row = None;
+    if let Some(header_index) = header_index {
+        let next = header_index + 1;
+        if next < search_end {
+            let line = lines[next];
+            if !is_comment_line(line) {
+                let cells = header_delim.split(line);
                 if row_is_units(&cells) {
                     unit_row = Some(cells);
-                    cursor += 1;
                 }
             }
         }
     }
-    let header_lines = if let Some((index, _)) = content.get(cursor) {
-        *index as u32
-    } else if names.is_some() {
-        lines.len() as u32
+    let header_lines = if names.is_empty() {
+        first_data.unwrap_or(0) as u32
     } else {
-        0
+        first_data.unwrap_or(lines.len()) as u32
     };
+    HeaderScan {
+        names,
+        unit_row,
+        data_width,
+        data_delim,
+        header_lines,
+    }
+}
 
-    let width = names
-        .as_ref()
-        .map(|cells| cells.len())
-        .or_else(|| content.get(cursor).map(|(_, line)| delimiter.split(line).len()))
-        .unwrap_or(0);
+const HEADER_DELIMS: [Delimiter; 5] = [
+    Delimiter::Tab,
+    Delimiter::Comma,
+    Delimiter::Semicolon,
+    Delimiter::Pipe,
+    Delimiter::Whitespace,
+];
 
+fn best_data_delimiter(lines: &[&str]) -> Delimiter {
+    let mut best = (Delimiter::Comma, 0i32);
+    for delim in HEADER_DELIMS {
+        let mut score = 0i32;
+        for line in lines {
+            let cells = delim.split(line);
+            let numbers = cells.iter().filter(|cell| parse_number(cell).is_some()).count();
+            if cells.len() >= 2 && numbers >= 2 && numbers * 2 >= cells.len() {
+                score += 10 + numbers as i32;
+            }
+        }
+        score += match delim {
+            Delimiter::Comma => 2,
+            Delimiter::Tab => 1,
+            _ => 0,
+        };
+        if score > best.1 {
+            best = (delim, score);
+        }
+    }
+    best.0
+}
+
+fn is_data_line(line: &str, delim: Delimiter) -> bool {
+    if is_comment_line(line) {
+        return false;
+    }
+    let cells = delim.split(line);
+    let numbers = cells.iter().filter(|cell| parse_number(cell).is_some()).count();
+    cells.len() >= 2 && numbers >= 2 && numbers * 2 >= cells.len()
+}
+
+fn classification_from_scan(scan: &HeaderScan, model: Option<&TrajectoryClassification>) -> TrajectoryClassification {
+    let width = if !scan.names.is_empty() { scan.names.len() } else { scan.data_width };
     let mut identified: Vec<(String, Option<&'static str>, String)> = Vec::new();
     for index in 0..width {
-        let raw_name = names.as_ref().and_then(|cells| cells.get(index)).map(String::as_str).unwrap_or("");
+        let raw_name = scan.names.get(index).map(String::as_str).unwrap_or("");
+        let key = format!("col_{index}");
         let mut hit = identify_header_name(raw_name);
-        if let Some(cells) = &unit_row {
+        if hit.is_none() {
+            if let Some(role) = model.and_then(|class| class.columns.get(&key)) {
+                if !role.trim().is_empty() {
+                    let unit = model.and_then(|class| class.column_units.get(&key)).cloned().unwrap_or_default();
+                    hit = Some((role.clone(), None, unit));
+                }
+            }
+        }
+        if let Some(cells) = &scan.unit_row {
             if let Some(token) = cells.get(index).and_then(|cell| unit_token(cell)) {
                 if token != "s" {
-                    if let Some((role, _frame, _)) = hit.as_mut() {
+                    if let Some((role, _frame, unit)) = hit.as_mut() {
                         *role = promote_role(role, &token);
-                    }
-                    if let Some((_, _, unit)) = hit.as_mut() {
                         *unit = token;
                     }
                 }
+            }
+        }
+        // A recognized angle name with no stated unit stays degrees, even if a model said radians.
+        if let Some((role, _, unit)) = hit.as_mut() {
+            let named = scan.names.get(index).is_some_and(|name| identify_header_name(name).is_some());
+            if named && unit.is_empty() && (*role == "pos_lat" || *role == "pos_lon") {
+                *unit = "deg".to_string();
             }
         }
         identified.push(hit.unwrap_or_else(|| (String::new(), None, String::new())));
@@ -1178,20 +1369,20 @@ pub fn interpret_header(text: &str) -> TrajectoryClassification {
     let has_orientation = identified.iter().any(|(role, _, _)| role.starts_with("orientation_"));
     let has_mass = identified.iter().any(|(role, _, _)| role == "mass");
     let complete = position_complete(&position, &columns);
-    let unknown = names
-        .as_ref()
-        .is_some_and(|cells| cells.iter().any(|cell| !cell.trim().is_empty() && identify_header_name(cell).is_none()));
+    let unknown = !scan.names.is_empty()
+        && scan.names.iter().any(|cell| !cell.trim().is_empty() && identify_header_name(cell).is_none());
     let confidence = if complete && !unknown { 0.95 } else { 0.2 };
-    let reasoning = if names.is_none() {
+    let reasoning = if scan.names.is_empty() {
         "No header row. Mark each column on the trajectory file format.".to_string()
     } else if unknown || !complete {
         "Read from the header. Unrecognized columns are unset.".to_string()
     } else {
         "Read from the header.".to_string()
     };
+    let delimiter = scan.data_delim;
 
     let mut class = TrajectoryClassification {
-        header_lines,
+        header_lines: scan.header_lines,
         delimiter: delimiter_label(delimiter),
         frames: ChannelFrames {
             position,
@@ -1214,6 +1405,7 @@ pub fn interpret_header(text: &str) -> TrajectoryClassification {
     normalize_classification(&mut class);
     class
 }
+
 
 fn delimiter_label(delimiter: Delimiter) -> String {
     match delimiter {
@@ -1401,6 +1593,11 @@ fn compact_vector(base: &str) -> Option<(String, Option<&'static str>)> {
 }
 
 fn axis_component(token: &str) -> Option<(&'static str, Option<&'static str>)> {
+    if let Some(rest) = token.strip_prefix("alt_") {
+        if !rest.is_empty() {
+            return Some(("alt", Some("LLA")));
+        }
+    }
     match token {
         "lat" | "latitude" | "geodetic_lat" | "geodetic_latitude" | "latd" => Some(("lat", Some("LLA"))),
         "lon" | "long" | "lng" | "longitude" | "geodetic_lon" | "geodetic_longitude" | "lond" => Some(("lon", Some("LLA"))),
@@ -2362,7 +2559,7 @@ pub fn run_bounded(mut cmd: Command, timeout: Duration, cancel: &AtomicBool) -> 
 }
 
 fn classification_grammar() -> &'static str {
-    r#"root ::= "{" ws "\"header_lines\":" ws number ws "," ws "\"delimiter\":" ws string ws "," ws "\"frames\":" ws frames ws "," ws "\"units\":" ws units ws "," ws "\"columns\":" ws columns ws "," ws "\"confidence_score\":" ws number ws "," ws "\"unsupported_flag\":" ws boolean ws "," ws "\"reasoning\":" ws string ws "}"
+    r#"root ::= "{" ws "\"header_lines\":" ws number ws "," ws "\"delimiter\":" ws string ws "," ws "\"frames\":" ws frames ws "," ws "\"units\":" ws units ws "," ws "\"columns\":" ws columns ws ("," ws "\"column_units\":" ws columns)? ws "," ws "\"confidence_score\":" ws number ws "," ws "\"unsupported_flag\":" ws boolean ws "," ws "\"reasoning\":" ws string ws "}"
 ws ::= [ \t\n]*
 number ::= "-"? [0-9]+ ("." [0-9]+)?
 boolean ::= "true" | "false"
@@ -2934,6 +3131,10 @@ mod tests {
         assert!(SYSTEM_PROMPT.contains("x-ecr") && SYSTEM_PROMPT.contains("y-ecr") && SYSTEM_PROMPT.contains("z-ecr"));
         assert!(SYSTEM_PROMPT.contains("north, east, and down"));
         assert!(SYSTEM_PROMPT.contains("Do not convert coordinates"));
+        assert!(SYSTEM_PROMPT.contains("lat(rad)"));
+        assert!(SYSTEM_PROMPT.contains("Do not change a stated unit"));
+        assert!(SYSTEM_PROMPT.contains("column_units"));
+        assert!(!SYSTEM_PROMPT.contains("Latitude and longitude stay in degrees"));
         assert!(SYSTEM_PROMPT.contains("frames.position"));
         assert!(SYSTEM_PROMPT.contains("frames.velocity"));
         assert!(SYSTEM_PROMPT.contains("frames.acceleration"));
@@ -3428,6 +3629,108 @@ s,rad,rad,m
         assert_eq!(partial.columns.get("col_2").map(String::as_str), Some("pos_lat"));
         assert_eq!(partial.frames.position, "LLA");
         assert!(partial.confidence_score < 0.6);
+    }
+
+    fn sample_text(name: &str) -> String {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("samples").join(name);
+        fs::read_to_string(path).unwrap()
+    }
+
+    #[test]
+    fn odd_eglin_formats_keep_the_header_unit_and_warn() {
+        let format1 = sample_text("eglin_traj_format_1.traj");
+        let format2 = sample_text("eglin_traj_format_2.traj");
+        let clean = sample_text("eglin_keywest_6dof.csv");
+        let local1 = interpret_header(&format1);
+        assert_eq!(local1.header_lines, 2);
+        assert_eq!(local1.delimiter, "whitespace");
+        assert_eq!(local1.columns.get("col_1").map(String::as_str), Some("pos_lat"));
+        assert_eq!(local1.columns.get("col_2").map(String::as_str), Some("pos_lon"));
+        assert_eq!(local1.columns.get("col_3").map(String::as_str), Some("pos_alt"));
+        assert_eq!(column_unit(&local1, "pos_lat"), "deg");
+        assert_eq!(column_unit(&local1, "pos_lon"), "deg");
+        assert_eq!(column_unit(&local1, "pos_alt"), "m");
+        assert!(angle_unit_warning(&format1, &local1).is_none(), "{local1:?}");
+        let track1 = crate::parse::parse_with_classification(&format1, &local1, None).unwrap();
+        assert!((track1.lla[0] as f64 + 86.59).abs() < 1e-3, "lon {}", track1.lla[0]);
+        assert!((track1.lla[1] as f64 - 30.33).abs() < 1e-3, "lat {}", track1.lla[1]);
+        assert!((track1.lla[2] as f64).abs() < 1e-3, "alt {}", track1.lla[2]);
+
+        let local2 = interpret_header(&format2);
+        assert_eq!(local2.header_lines, 3);
+        assert_eq!(local2.delimiter, "whitespace");
+        assert_eq!(local2.columns.get("col_1").map(String::as_str), Some("pos_lat"));
+        assert_eq!(local2.columns.get("col_2").map(String::as_str), Some("pos_alt"));
+        assert_eq!(local2.columns.get("col_3").map(String::as_str), Some("pos_lon"));
+        assert_eq!(column_unit(&local2, "pos_lat"), "rad");
+        assert_eq!(column_unit(&local2, "pos_lon"), "rad");
+        assert_eq!(column_unit(&local2, "pos_alt"), "m");
+        let warning = angle_unit_warning(&format2, &local2).unwrap();
+        assert!(warning.contains("look like degrees"), "{warning}");
+        assert!(warning.contains("Check the header"), "{warning}");
+        assert!(crate::parse::parse_with_classification(&format2, &local2, None).is_err());
+
+        let mut edited = local2.clone();
+        edited.column_units.insert("col_1".into(), "deg".into());
+        edited.column_units.insert("col_3".into(), "deg".into());
+        normalize_classification(&mut edited);
+        assert!(angle_unit_warning(&format2, &edited).is_none());
+        let track2 = crate::parse::parse_with_classification(&format2, &edited, None).unwrap();
+        assert!((track2.lla[0] as f64 - track1.lla[0] as f64).abs() < 1e-3);
+        assert!((track2.lla[1] as f64 - track1.lla[1] as f64).abs() < 1e-3);
+        assert!((track2.lla[2] as f64 - track1.lla[2] as f64).abs() < 1e-2);
+
+        let contradict = Scripted {
+            replies: Mutex::new(vec![
+                r#"{"header_lines":1,"delimiter":"\t","frames":{"position":"LLA"},"units":{"position":"m"},"columns":{"col_0":"time","col_1":"pos_alt","col_2":"pos_lat","col_3":"pos_lon"},"column_units":{"col_2":"deg","col_3":"deg","col_1":"m"},"confidence_score":0.4,"unsupported_flag":false,"reasoning":"numbers look like degrees"}"#.into(),
+                r#"{"header_lines":0,"delimiter":",","frames":{"position":"LLA"},"units":{"position":"m"},"columns":{"col_0":"time","col_1":"pos_lat","col_2":"pos_lon","col_3":"pos_alt"},"column_units":{"col_1":"rad","col_2":"rad","col_3":"m"},"confidence_score":0.4,"unsupported_flag":false,"reasoning":"called them radians"}"#.into(),
+                r#"{"header_lines":1,"delimiter":",","frames":{"position":"LLA"},"units":{"position":"m"},"columns":{"col_0":"time","col_1":"pos_lat","col_2":"pos_lon","col_3":"pos_alt"},"column_units":{"col_1":"rad","col_2":"rad","col_3":"m"},"confidence_score":0.9,"unsupported_flag":false,"reasoning":"called the csv radians"}"#.into(),
+            ]),
+            calls: Mutex::new(0),
+        };
+        let kept2 = read_trajectory_format(&format2, Some(&contradict)).unwrap();
+        assert_eq!(*contradict.calls.lock().unwrap(), 1);
+        assert_eq!(kept2.header_lines, 3);
+        assert_eq!(kept2.delimiter, "whitespace");
+        assert_eq!(column_unit(&kept2, "pos_lat"), "rad");
+        assert_eq!(column_unit(&kept2, "pos_lon"), "rad");
+        assert!(!kept2.reasoning.contains("The model did not run."));
+        let kept1 = read_trajectory_format(&format1, Some(&contradict)).unwrap();
+        assert_eq!(column_unit(&kept1, "pos_lat"), "deg");
+        assert_eq!(column_unit(&kept1, "pos_lon"), "deg");
+        assert_eq!(kept1.header_lines, 2);
+
+        let offline = Scripted {
+            replies: Mutex::new(Vec::new()),
+            calls: Mutex::new(0),
+        };
+        let fallback = read_trajectory_format(&format2, None).unwrap();
+        assert!(fallback.reasoning.contains("The model did not run."), "{}", fallback.reasoning);
+        assert_eq!(column_unit(&fallback, "pos_lat"), "rad");
+        let failed = read_trajectory_format(&format2, Some(&offline)).unwrap();
+        assert!(failed.reasoning.contains("The model did not run."));
+        assert_eq!(column_unit(&failed, "pos_lat"), "rad");
+        assert_eq!(*offline.calls.lock().unwrap(), 1);
+
+        let clean_class = read_trajectory_format(&clean, Some(&contradict)).unwrap();
+        assert_eq!(*contradict.calls.lock().unwrap(), 3);
+        assert_eq!(clean_class.header_lines, 1);
+        assert_eq!(clean_class.delimiter, ",");
+        assert_eq!(column_unit(&clean_class, "pos_lat"), "deg");
+        assert_eq!(column_unit(&clean_class, "pos_lon"), "deg");
+        assert_eq!(column_unit(&clean_class, "pos_alt"), "m");
+        assert!(angle_unit_warning(&clean, &clean_class).is_none());
+        assert!(!clean_class.reasoning.contains("The model did not run."));
+        let clean_offline = read_trajectory_format(&clean, None).unwrap();
+        assert!(clean_offline.reasoning.contains("The model did not run."), "{}", clean_offline.reasoning);
+        assert_eq!(column_unit(&clean_offline, "pos_lat"), "deg");
+        assert!(angle_unit_warning(&clean, &clean_offline).is_none());
+
+        let small = "time,lat,lon,alt\n0,0.50,-1.20,10\n1,0.40,-1.10,12\n";
+        let small_class = interpret_header(small);
+        let small_warning = angle_unit_warning(small, &small_class).unwrap();
+        assert!(small_warning.contains("look like radians"), "{small_warning}");
+        assert_eq!(column_unit(&small_class, "pos_lat"), "deg");
     }
 
     #[test]

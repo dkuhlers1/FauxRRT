@@ -852,6 +852,12 @@ input[type="number"], input[type="text"] {
 }
 .schema-kicker { color: var(--muted); font-size: 11px; letter-spacing: 0.04em; text-transform: uppercase; }
 .schema-share, .schema-note { color: var(--muted); font-size: 12px; }
+.schema-warn {
+  color: #e6c07b;
+  font-size: 12px;
+  margin: 8px 0;
+  font-family: "Segoe UI", "IBM Plex Sans", sans-serif;
+}
 .schema-raw, .schema-rawline {
   margin: 0;
   padding: 0;
