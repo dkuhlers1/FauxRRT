@@ -89,33 +89,44 @@ export function loadTargetFromDest(dest) {
   };
 }
 
+/**
+ * One field shows the current name. Editing it renames that item.
+ * Typing or picking another item's name selects that item instead.
+ */
+export function applyShownName(items, currentId, shown) {
+  const name = typeof shown === "string" ? shown.trim() : "";
+  if (!name) return { action: "ignore", id: currentId ?? null, name: "" };
+  const list = items || [];
+  const current = list.find((item) => String(item.id) === String(currentId)) || null;
+  if (current && current.name === name) return { action: "keep", id: current.id, name };
+  const match = list.find((item) => String(item.id) !== String(current?.id ?? currentId)
+    && String(item.name || "").trim().toLowerCase() === name.toLowerCase());
+  if (match) return { action: "select", id: match.id, name: match.name };
+  return { action: "rename", id: current?.id ?? currentId ?? null, name };
+}
+
+function nameChoices(items, current) {
+  return items
+    .filter((item) => String(item.id) !== String(current.id))
+    .map((item) => `<option value="${escapeHtml(item.name)}"></option>`)
+    .join("");
+}
+
 export function trajectoryDrawerDestHtml(input = {}) {
   const dest = resolveTrajectoryDest(input.objects, input);
-  const objectOptions = dest.objects
-    .map((obj) => {
-      const selected = String(obj.id) === String(dest.object.id) ? " selected" : "";
-      return `<option value="${escapeHtml(obj.id)}"${selected}>${escapeHtml(obj.name)}</option>`;
-    })
-    .join("");
-  const modeOptions = dest.object.modes
-    .map((mode) => {
-      const selected = String(mode.id) === String(dest.mode.id) ? " selected" : "";
-      return `<option value="${escapeHtml(mode.id)}"${selected}>${escapeHtml(mode.name)}</option>`;
-    })
-    .join("");
+  const objectChoices = nameChoices(dest.objects, dest.object);
+  const modeChoices = nameChoices(dest.object.modes, dest.mode);
   return `<div class="drawer-dest" data-role="traj-dest">
-    <div class="dest-actions">
+    <div class="dest-name-row">
       <button type="button" data-act="add-object" class="primary compact">+ Object</button>
-      <button type="button" data-act="add-mode" class="primary compact">+ Mode</button>
+      <input type="text" data-role="obj-name" aria-label="Object name" value="${escapeHtml(dest.object.name)}" list="traj-object-names" />
+      <datalist id="traj-object-names">${objectChoices}</datalist>
     </div>
-    <label class="dest-row">Object
-      <select data-role="traj-object" aria-label="Object that receives new trajectories">${objectOptions}</select>
-      <input type="text" data-role="obj-name" aria-label="Object name" value="${escapeHtml(dest.object.name)}" />
-    </label>
-    <label class="dest-row">Mode
-      <select data-role="traj-mode" aria-label="Mode that receives new trajectories">${modeOptions}</select>
-      <input type="text" data-role="load-mode-name" aria-label="Mode name" value="${escapeHtml(dest.mode.name)}" />
-    </label>
-    <p class="muted wind-hint">New trajectories load into the selected object and mode. + Mode adds a mode on that object. Editing a name updates it.</p>
+    <div class="dest-name-row">
+      <button type="button" data-act="add-mode" class="primary compact">+ Mode</button>
+      <input type="text" data-role="load-mode-name" aria-label="Mode name" value="${escapeHtml(dest.mode.name)}" list="traj-mode-names" />
+      <datalist id="traj-mode-names">${modeChoices}</datalist>
+    </div>
+    <p class="muted wind-hint">The name in each field is where the next trajectory loads. Edit it to rename. Choose another saved name in that same field to switch.</p>
   </div>`;
 }

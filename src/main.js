@@ -58,6 +58,7 @@ import {
 } from "./schema-review.js";
 import { propagateStage } from "./propagate-stage.js";
 import {
+  applyShownName,
   nextModeName,
   nextObjectName,
   resolveTrajectoryDest,
@@ -1284,29 +1285,41 @@ async function commitDestEdits(obj) {
   if (!obj) return obj;
   const host = trajHost();
   const objectName = fieldText(host?.querySelector("[data-role='obj-name']"));
-  if (objectName && objectName !== obj.name) {
+  const objectDecision = applyShownName(riskModel.objects || [], obj.id, objectName);
+  if (objectDecision.action === "select") {
+    objectNameDraft = null;
+    modeNameDraft = null;
+    trajObjectId = objectDecision.id;
+    expandedObjectId = objectDecision.id;
+    obj = riskModel.objects.find((item) => item.id === objectDecision.id) || obj;
+  } else if (objectDecision.action === "rename" && objectDecision.name !== obj.name) {
     try {
-      riskModel = await invoke("rename_object", ipcArgs({ id: obj.id, name: objectName }));
+      riskModel = await invoke("rename_object", ipcArgs({ id: obj.id, name: objectDecision.name }));
       applyRiskToTracks();
       syncTracksToModel();
     } catch (err) {
       if (!shellMissing(err)) throw err;
-      obj.name = objectName;
+      obj.name = objectDecision.name;
     }
   }
   const fresh = riskModel.objects.find((item) => item.id === obj.id) || obj;
   const mode = selectedMode(fresh);
   const modeName = fieldText(host?.querySelector("[data-role='load-mode-name']"));
-  if (mode && modeName && modeName !== mode.name) {
+  const modeDecision = applyShownName(fresh.modes || [], mode?.id, modeName);
+  if (modeDecision.action === "select") {
+    const picked = (fresh.modes || []).find((item) => item.id === modeDecision.id);
+    if (picked) rememberMode(fresh.id, picked);
+    modeNameDraft = null;
+  } else if (mode && modeDecision.action === "rename" && modeDecision.name !== mode.name) {
     try {
-      riskModel = await invoke("update_failure_mode", ipcArgs({ id: mode.id, name: modeName }));
+      riskModel = await invoke("update_failure_mode", ipcArgs({ id: mode.id, name: modeDecision.name }));
       applyRiskToTracks();
       syncTracksToModel();
       const renamed = (riskModel.objects.find((item) => item.id === obj.id)?.modes || []).find((item) => item.id === mode.id);
-      rememberMode(obj.id, renamed || { ...mode, name: modeName });
+      rememberMode(obj.id, renamed || { ...mode, name: modeDecision.name });
     } catch (err) {
       if (!shellMissing(err)) throw err;
-      mode.name = modeName;
+      mode.name = modeDecision.name;
       rememberMode(obj.id, mode);
     }
   }
@@ -2769,42 +2782,30 @@ function renderTrajectoryDrawer() {
   root.querySelector("[data-act='add-mode']")?.addEventListener("click", () => {
     addTrajectoryMode();
   });
-  root.querySelector("[data-role='traj-object']")?.addEventListener("change", (ev) => {
-    const id = Number(ev.target.value);
-    if (!Number.isFinite(id)) return;
-    objectNameDraft = null;
-    modeNameDraft = null;
-    trajObjectId = id;
-    expandedObjectId = id;
-    render();
-  });
-  root.querySelector("[data-role='traj-mode']")?.addEventListener("change", (ev) => {
-    const current = activeLoadObject();
-    if (!current) return;
-    const id = Number(ev.target.value);
-    const picked = (current.modes || []).find((item) => item.id === id || String(item.id) === ev.target.value);
-    if (!picked) return;
-    modeNameDraft = null;
-    rememberMode(current.id, picked);
-    render();
-  });
   const objectNameInput = root.querySelector("[data-role='obj-name']");
   objectNameInput?.addEventListener("input", () => {
     objectNameDraft = { id: activeLoadObject()?.id ?? null, value: objectNameInput.value };
   });
   objectNameInput?.addEventListener("change", (ev) => {
-    const name = ev.target.value.trim();
+    const shown = ev.target.value;
     objectNameDraft = null;
-    if (!name) return;
     const current = activeLoadObject();
+    const decision = applyShownName(riskModel.objects || [], current?.id, shown);
+    if (decision.action === "select") {
+      modeNameDraft = null;
+      trajObjectId = decision.id;
+      expandedObjectId = decision.id;
+      render();
+      return;
+    }
+    if (decision.action !== "rename") return;
     if (!current) {
       ensureTrajectoryDestination().then((created) => {
-        if (created && name !== created.name) renameTrajectoryObject(created, name);
+        if (created && decision.name !== created.name) renameTrajectoryObject(created, decision.name);
       });
       return;
     }
-    if (name === current.name) return;
-    renameTrajectoryObject(current, name);
+    renameTrajectoryObject(current, decision.name);
   });
   const modeNameInput = root.querySelector("[data-role='load-mode-name']");
   modeNameInput?.addEventListener("input", () => {
@@ -2812,13 +2813,20 @@ function renderTrajectoryDrawer() {
     modeNameDraft = { objectId: current?.id ?? null, modeId: selectedMode(current)?.id ?? null, value: modeNameInput.value };
   });
   modeNameInput?.addEventListener("change", (ev) => {
-    const name = ev.target.value.trim();
+    const shown = ev.target.value;
     modeNameDraft = null;
-    if (!name) return;
     const apply = (current) => {
+      if (!current) return;
       const picked = selectedMode(current);
-      if (!current || !picked || name === picked.name) return;
-      renameTrajectoryMode(current, picked, name);
+      const decision = applyShownName(current.modes || [], picked?.id, shown);
+      if (decision.action === "select") {
+        const next = (current.modes || []).find((item) => item.id === decision.id);
+        if (next) rememberMode(current.id, next);
+        render();
+        return;
+      }
+      if (decision.action !== "rename" || !picked) return;
+      renameTrajectoryMode(current, picked, decision.name);
     };
     const current = activeLoadObject();
     if (!current) {
