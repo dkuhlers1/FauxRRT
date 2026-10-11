@@ -520,10 +520,14 @@ pub fn canonical_frame(raw: &str) -> Option<&'static str> {
 }
 
 pub fn canonical_delimiter(raw: &str) -> String {
+    // trim() would erase a delimiter that is only a tab, and the next pass would store "".
+    if raw.chars().any(|ch| ch == '\t') && raw.chars().all(|ch| ch.is_whitespace()) {
+        return "\t".into();
+    }
     let t = raw.trim().to_ascii_lowercase();
     match t.as_str() {
         "," | "comma" | "csv" => ",".into(),
-        "\t" | "\\t" | "tab" | "tsv" => "\t".into(),
+        "\\t" | "tab" | "tsv" => "\t".into(),
         ";" | "semicolon" => ";".into(),
         "|" | "pipe" => "|".into(),
         "whitespace" | "space" | "spaces" | " " => "whitespace".into(),
@@ -4013,7 +4017,9 @@ s,rad,rad,m
         let warning = angle_unit_warning(&format2, &local2).unwrap();
         assert!(warning.contains("look like degrees"), "{warning}");
         assert!(warning.contains("Check the header"), "{warning}");
-        assert!(crate::parse::parse_with_classification(&format2, &local2, None).is_err());
+        let refused = crate::parse::parse_with_classification(&format2, &local2, None).unwrap_err();
+        assert_eq!(refused, crate::parse::RADIAN_LATITUDE_OUTSIDE);
+        assert!(!refused.contains("at least two valid"), "{refused}");
 
         let mut edited = local2.clone();
         edited.column_units.insert("col_1".into(), "deg".into());
@@ -4076,6 +4082,78 @@ s,rad,rad,m
         let small_warning = angle_unit_warning(small, &small_class).unwrap();
         assert!(small_warning.contains("look like radians"), "{small_warning}");
         assert_eq!(column_unit(&small_class, "pos_lat"), "deg");
+    }
+
+    #[test]
+    fn eglin_format_3_names_radian_latitude_and_loads_degrees() {
+        let format3 = sample_text("eglin_traj_format_3.traj");
+        let local = interpret_header(&format3);
+        assert_eq!(local.header_lines, 3);
+        assert_eq!(local.delimiter, "whitespace");
+        assert_eq!(local.columns.get("col_0").map(String::as_str), Some("time"));
+        assert_eq!(local.columns.get("col_1").map(String::as_str), Some("pos_lat"));
+        assert_eq!(local.columns.get("col_2").map(String::as_str), Some("pos_alt"));
+        assert_eq!(local.columns.get("col_3").map(String::as_str), Some("pos_lon"));
+        assert_eq!(column_unit(&local, "pos_lat"), "rad");
+        assert_eq!(column_unit(&local, "pos_lon"), "rad");
+        assert_eq!(column_unit(&local, "pos_alt"), "m");
+        let warning = angle_unit_warning(&format3, &local).unwrap();
+        assert!(warning.contains("look like degrees"), "{warning}");
+        let refused = crate::parse::parse_with_classification(&format3, &local, None).unwrap_err();
+        assert_eq!(refused, crate::parse::RADIAN_LATITUDE_OUTSIDE);
+        assert!(!refused.contains("at least two valid"), "{refused}");
+
+        let mut degrees = local.clone();
+        degrees.column_units.insert("col_1".into(), "deg".into());
+        degrees.column_units.insert("col_3".into(), "deg".into());
+        normalize_classification(&mut degrees);
+        assert_eq!(column_unit(&degrees, "pos_lat"), "deg");
+        assert_eq!(column_unit(&degrees, "pos_lon"), "deg");
+        assert!(angle_unit_warning(&format3, &degrees).is_none());
+        let track = crate::parse::parse_with_classification(&format3, &degrees, None).unwrap();
+        assert!(track.lla.len() / 3 >= 2, "points {}", track.lla.len() / 3);
+        assert!((track.lla[0] as f64 + 86.59).abs() < 1e-3, "lon {}", track.lla[0]);
+        assert!((track.lla[1] as f64 - 30.33).abs() < 1e-3, "lat {}", track.lla[1]);
+        assert!((track.lla[2] as f64).abs() < 1e-3, "alt {}", track.lla[2]);
+        assert!((track.lla[5] as f64 - 391.871457).abs() < 1e-2, "alt m {}", track.lla[5]);
+
+        let mut tabs = local.clone();
+        tabs.delimiter = "tab".into();
+        normalize_classification(&mut tabs);
+        assert_eq!(tabs.delimiter, "\t");
+        let split = crate::parse::parse_with_classification(&format3, &tabs, None).unwrap_err();
+        assert_eq!(split, crate::parse::DELIMITER_MISSED_COLUMNS);
+        assert!(!split.contains("at least two valid"), "{split}");
+        assert!(!split.contains("outside"), "{split}");
+
+        let mut commas = local.clone();
+        commas.delimiter = ",".into();
+        let comma_err = crate::parse::parse_with_classification(&format3, &commas, None).unwrap_err();
+        assert_eq!(comma_err, crate::parse::DELIMITER_MISSED_COLUMNS);
+
+        let junk = "time, lat(rad), alt_out, lon(rad)\nrandom not needed line\naother random linerandom not needed line\n";
+        let mut junk_class = local.clone();
+        junk_class.header_lines = 1;
+        let junk_err = crate::parse::parse_with_classification(junk, &junk_class, None).unwrap_err();
+        assert_eq!(junk_err, crate::parse::JUNK_WHERE_STATES);
+        assert!(!junk_err.contains("at least two valid"), "{junk_err}");
+
+        let one = "time,lat,lon,alt\n0,30.33,-86.59,0\n";
+        let one_class = interpret_header(one);
+        let one_err = crate::parse::parse_with_classification(one, &one_class, None).unwrap_err();
+        assert!(one_err.contains("at least two valid"), "{one_err}");
+
+        let mixed = "time,lat(rad),lon(rad),alt\n0,0.50,-1.20,10\n1,30.33,-1.51,0\n2,0.40,-1.10,12\n";
+        let mixed_class = interpret_header(mixed);
+        assert_eq!(column_unit(&mixed_class, "pos_lat"), "rad");
+        let kept = crate::parse::parse_with_classification(mixed, &mixed_class, None).unwrap();
+        assert_eq!(kept.lla.len() / 3, 2);
+        let lat = 0.50 * 180.0 / std::f64::consts::PI;
+        let lon = -1.20 * 180.0 / std::f64::consts::PI;
+        assert!((kept.lla[1] as f64 - lat).abs() < 1e-3, "lat {}", kept.lla[1]);
+        assert!((kept.lla[0] as f64 - lon).abs() < 1e-3, "lon {}", kept.lla[0]);
+        assert!((kept.lla[2] as f64 - 10.0).abs() < 1e-3, "alt {}", kept.lla[2]);
+        assert!(kept.lla.chunks(3).all(|point| (point[1] as f64 - 30.33).abs() > 1.0));
     }
 
     #[test]

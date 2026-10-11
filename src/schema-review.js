@@ -311,6 +311,8 @@ export const ANGLE_LOOKS_LIKE_DEGREES =
   "Latitude and longitude are marked as radians, but the values look like degrees. Check the header for an error.";
 export const ANGLE_LOOKS_LIKE_RADIANS =
   "Latitude and longitude are marked as degrees, but the values look like radians. Check the header for an error.";
+export const RADIAN_LATITUDE_OUTSIDE =
+  "Confirming radians would put latitude outside ±90. Those points were not loaded.";
 
 function columnIndex(columns, role) {
   const hit = Object.entries(columns || {}).find(([, value]) => value === role);
@@ -319,11 +321,10 @@ function columnIndex(columns, role) {
   return Number.isFinite(index) ? index : -1;
 }
 
-/** Warn when the numbers disagree with the header unit. Confirmation stays available. */
-export function angleUnitWarning(group) {
+function angleSample(group) {
   const classif = group?.classification || {};
   const excerpt = group?.files?.[0]?.excerpt || "";
-  return angleWarningText({
+  return sampledLatLon({
     lines: excerpt.split(/\r?\n/),
     delimiter: classif.delimiter,
     columns: classif.columns || {},
@@ -332,10 +333,10 @@ export function angleUnitWarning(group) {
   });
 }
 
-export function angleWarningText({ lines, delimiter, columns, columnUnits, headerLines = 0 }) {
+function sampledLatLon({ lines, delimiter, columns, columnUnits, headerLines = 0 }) {
   const latIndex = columnIndex(columns, "pos_lat");
   const lonIndex = columnIndex(columns, "pos_lon");
-  if (latIndex < 0 || lonIndex < 0) return "";
+  if (latIndex < 0 || lonIndex < 0) return null;
   const latUnit = columnUnits?.[`col_${latIndex}`] || "deg";
   const lonUnit = columnUnits?.[`col_${lonIndex}`] || "deg";
   const lats = [];
@@ -349,7 +350,18 @@ export function angleWarningText({ lines, delimiter, columns, columnUnits, heade
     lats.push(lat);
     lons.push(lon);
   });
-  if (!lats.length) return "";
+  if (!lats.length) return null;
+  return { latUnit, lonUnit, lats, lons };
+}
+
+/** Warn when the numbers disagree with the header unit. Confirmation stays available. */
+export function angleUnitWarning(group) {
+  return angleWarningText(angleSample(group));
+}
+
+export function angleWarningText(sample) {
+  if (!sample) return "";
+  const { latUnit, lonUnit, lats, lons } = sample;
   const halfPi = Math.PI / 2 + 1e-6;
   const pi = Math.PI + 1e-6;
   const latRad = latUnit === "rad";
@@ -361,6 +373,18 @@ export function angleWarningText({ lines, delimiter, columns, columnUnits, heade
   }
   const inside = lats.every((value) => Math.abs(value) <= halfPi) && lons.every((value) => Math.abs(value) <= pi);
   return inside ? ANGLE_LOOKS_LIKE_RADIANS : "";
+}
+
+/** Latitude marked as radians that would fall outside ±90 after conversion. */
+export function radianLatitudeWarning(group) {
+  const sample = angleSample(group);
+  if (!sample || sample.latUnit !== "rad") return "";
+  const toDeg = 180 / Math.PI;
+  const outside = sample.lats.some((value) => {
+    const lat = value * toDeg;
+    return lat < -90 || lat > 90;
+  });
+  return outside ? RADIAN_LATITUDE_OUTSIDE : "";
 }
 
 function headerCells(line, delimiter, count) {
@@ -408,6 +432,7 @@ function annotatedFileHtml(group) {
       ${body}
     </div>
     ${angleUnitWarning(group) ? `<p class="schema-warn" data-role="unit-warning">${escapeHtml(angleUnitWarning(group))}</p>` : ""}
+    ${radianLatitudeWarning(group) ? `<p class="schema-warn" data-role="radian-latitude">${escapeHtml(radianLatitudeWarning(group))}</p>` : ""}
     ${originFieldsHtml(group)}
   </div>`;
 }
