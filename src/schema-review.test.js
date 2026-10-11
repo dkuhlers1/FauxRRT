@@ -13,8 +13,10 @@ import {
   markCorrection,
   nextPendingIndex,
   angleUnitWarning,
+  radianLatitudeWarning,
   ANGLE_LOOKS_LIKE_DEGREES,
   ANGLE_LOOKS_LIKE_RADIANS,
+  RADIAN_LATITUDE_OUTSIDE,
   detectionProgressHtml,
   reviewCardHtml,
   reviewHtmlAfterRead,
@@ -439,10 +441,18 @@ test("radian header values that look like degrees warn without blocking confirm"
     reasoning: "Read from the header.",
   });
   assert.equal(angleUnitWarning(format2), ANGLE_LOOKS_LIKE_DEGREES);
+  assert.equal(radianLatitudeWarning(format2), RADIAN_LATITUDE_OUTSIDE);
   const html = reviewCardHtml(format2, 0, 1);
   assert.match(html, /data-role="unit-warning"/);
   assert.match(html, /values look like degrees/);
   assert.match(html, /Check the header/);
+  assert.match(html, /data-role="radian-latitude"/);
+  assert.match(html, /outside ±90/);
+  assert.match(html, /Those points were not loaded/);
+  const format3 = trajGroup("eglin_traj_format_3.traj", format2.classification);
+  assert.equal(angleUnitWarning(format3), ANGLE_LOOKS_LIKE_DEGREES);
+  assert.equal(radianLatitudeWarning(format3), RADIAN_LATITUDE_OUTSIDE);
+  assert.match(reviewCardHtml(format3, 0, 1), /data-role="radian-latitude"/);
   assert.match(html, /schema-cell-text">lat\(rad\)/);
   assert.match(html, /data-col="1" data-field="unit"[\s\S]*value="rad" selected/);
   assert.match(html, /data-col="3" data-field="unit"[\s\S]*value="rad" selected/);
@@ -460,6 +470,8 @@ test("radian header values that look like degrees warn without blocking confirm"
   const switched = structuredClone(format2);
   switched.classification.column_units = { col_1: "deg", col_2: "m", col_3: "deg" };
   assert.equal(angleUnitWarning(switched), "");
+  assert.equal(radianLatitudeWarning(switched), "");
+  assert.doesNotMatch(reviewCardHtml(switched, 0, 1), /data-role="radian-latitude"/);
 
   const format1 = trajGroup("eglin_traj_format_1.traj", {
     header_lines: 2,
@@ -473,8 +485,10 @@ test("radian header values that look like degrees warn without blocking confirm"
     reasoning: "Read from the header.",
   });
   assert.equal(angleUnitWarning(format1), "");
+  assert.equal(radianLatitudeWarning(format1), "");
   const plain = reviewCardHtml(format1, 0, 1);
   assert.doesNotMatch(plain, /data-role="unit-warning"/);
+  assert.doesNotMatch(plain, /data-role="radian-latitude"/);
   assert.match(plain, /schema-cell-text">lat</);
   assert.match(plain, /data-col="1" data-field="unit"[\s\S]*value="deg" selected/);
 
@@ -500,5 +514,31 @@ test("radian header values that look like degrees warn without blocking confirm"
     },
   });
   assert.equal(angleUnitWarning(small), ANGLE_LOOKS_LIKE_RADIANS);
+  assert.equal(radianLatitudeWarning(small), "");
   assert.match(reviewCardHtml(small, 0, 1), /values look like radians/);
+  assert.doesNotMatch(reviewCardHtml(small, 0, 1), /data-role="radian-latitude"/);
+
+  const realRadians = group("radians", {
+    files: [{
+      path: "/data/radians.csv",
+      name: "radians.csv",
+      excerpt: "time,lat(rad),lon(rad),alt\n0,0.50,-1.20,10\n1,0.40,-1.10,12\n",
+      origin_lat: null,
+      origin_lon: null,
+      origin_alt_m: null,
+    }],
+    classification: {
+      header_lines: 1,
+      delimiter: ",",
+      frames: { position: "LLA" },
+      units: { position: "m" },
+      columns: { col_0: "time", col_1: "pos_lat", col_2: "pos_lon", col_3: "pos_alt" },
+      column_units: { col_1: "rad", col_2: "rad", col_3: "m" },
+      confidence_score: 0.95,
+      unsupported_flag: false,
+      reasoning: "Read from the header.",
+    },
+  });
+  assert.equal(radianLatitudeWarning(realRadians), "");
+  assert.equal(angleUnitWarning(realRadians), "");
 });

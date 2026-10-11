@@ -175,6 +175,16 @@ pub struct InternalTrack {
     pub mass_kg: Option<Vec<f32>>,
 }
 
+/// Confirming a radian latitude that lands outside ±90. Those points are not stored.
+pub const RADIAN_LATITUDE_OUTSIDE: &str =
+    "Confirming radians would put latitude outside ±90. Those points were not loaded.";
+/// The chosen delimiter never put a number in each marked position column.
+pub const DELIMITER_MISSED_COLUMNS: &str =
+    "The delimiter did not split the data into the marked columns.";
+/// Lines after the header are text, not trajectory states.
+pub const JUNK_WHERE_STATES: &str = "Junk lines were read where the trajectory states should be.";
+const NOT_ENOUGH_STATES: &str = "file did not contain at least two valid trajectory states";
+
 /// Read one classified file into [`InternalTrack`]. The model does not convert.
 pub fn to_internal_track(
     text: &str,
@@ -224,13 +234,35 @@ pub fn to_internal_track(
     }
 
     let mut rows = Vec::new();
+    let mut lat_outside = 0u32;
+    let mut delimiter_miss = 0u32;
+    let mut junk_lines = 0u32;
+    let mut needed = vec![a_col, b_col];
+    if position_frame != "LLA" && c_col != usize::MAX {
+        needed.push(c_col);
+    }
+    let lat_is_rad = column_unit(classification, "pos_lat") == "rad";
     for (line_index, line) in text.lines().enumerate() {
         if line_index < classification.header_lines as usize || line.trim().is_empty() {
             continue;
         }
         let fields = delim.split(line.trim_end());
-        if fields.len() < 2 {
+        if !marked_numbers(&fields, &needed) {
+            if line_has_numeric_row(line) {
+                delimiter_miss += 1;
+            } else {
+                junk_lines += 1;
+            }
             continue;
+        }
+        if position_frame == "LLA" && lat_is_rad {
+            if let Some(raw) = number_at(&fields, a_col) {
+                let lat = raw * lat_to_deg;
+                if !(-90.0..=90.0).contains(&lat) {
+                    lat_outside += 1;
+                    continue;
+                }
+            }
         }
         let time = roles
             .iter()
@@ -274,7 +306,16 @@ pub fn to_internal_track(
     }
 
     if rows.len() < 2 {
-        return Err("file did not contain at least two valid trajectory states".into());
+        if lat_outside > 0 {
+            return Err(RADIAN_LATITUDE_OUTSIDE.into());
+        }
+        if delimiter_miss > 0 {
+            return Err(DELIMITER_MISSED_COLUMNS.into());
+        }
+        if junk_lines > 0 {
+            return Err(JUNK_WHERE_STATES.into());
+        }
+        return Err(NOT_ENOUGH_STATES.into());
     }
 
     if position_frame == "ECI" {
@@ -423,6 +464,25 @@ pub(crate) fn to_internal_frame(
 
 fn number_at(fields: &[String], index: usize) -> Option<f64> {
     fields.get(index).and_then(|value| parse_number(value))
+}
+
+fn marked_numbers(fields: &[String], indexes: &[usize]) -> bool {
+    indexes.iter().all(|index| number_at(fields, *index).is_some())
+}
+
+/// True when some delimiter, not necessarily the selected one, finds two numbers.
+fn line_has_numeric_row(line: &str) -> bool {
+    use crate::schema::Delimiter;
+    const DELIMS: [Delimiter; 5] = [
+        Delimiter::Comma,
+        Delimiter::Tab,
+        Delimiter::Semicolon,
+        Delimiter::Pipe,
+        Delimiter::Whitespace,
+    ];
+    DELIMS.iter().any(|delim| {
+        delim.split(line).iter().filter(|cell| parse_number(cell).is_some()).count() >= 2
+    })
 }
 
 fn scaled_xyz(fields: &[String], x: usize, y: usize, z: usize, scale: f64) -> Option<(f64, f64, f64)> {
