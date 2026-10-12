@@ -435,18 +435,20 @@ function annotatedFileHtml(group) {
     .map((line, i) => {
       const header = i < headerCount;
       const kind = header ? "header" : "data";
+      const region = header ? " schema-header" : "";
       if (i === markIndex) {
-        const tag = header ? `<span class="schema-tag">header</span>` : "";
-        return `<div class="schema-line${header ? " schema-header" : ""}" data-line-kind="${kind}">${tag}<div class="schema-columns" data-role="column-marks">${marks.join("")}</div></div>`;
+        return `<div class="schema-line${region}" data-line-kind="${kind}"><div class="schema-columns" data-role="column-marks">${marks.join("")}</div></div>`;
       }
-      return `<div class="schema-line${header ? " schema-header" : ""}" data-line-kind="${kind}">${header ? `<span class="schema-tag">header</span>` : ""}<pre class="schema-rawline">${escapeHtml(line)}</pre></div>`;
+      return `<div class="schema-line${region}" data-line-kind="${kind}"><pre class="schema-rawline">${escapeHtml(line)}</pre></div>`;
     })
     .join("");
+  const headerLabel = headerCount > 0 ? `<p class="schema-tag" data-role="header-label">header</p>` : "";
   const delimiter = delimiterChoice(classif.delimiter);
   return `<div data-role="file-text">
     <input type="hidden" data-field="header" value="${Number(classif.header_lines) || 0}" />
     <input type="hidden" data-field="delimiter" value="${escapeHtml(delimiter)}" />
     <div class="schema-file-scroll">
+      ${headerLabel}
       ${body}
     </div>
     ${angleUnitWarning(group) ? `<p class="schema-warn" data-role="unit-warning">${escapeHtml(angleUnitWarning(group))}</p>` : ""}
