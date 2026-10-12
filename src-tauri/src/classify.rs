@@ -1169,31 +1169,41 @@ pub fn angle_unit_warning(text: &str, class: &TrajectoryClassification) -> Optio
 /// A unit written in the header is kept. If the model is missing or fails, the local guess is returned.
 pub fn read_trajectory_format(text: &str, model: Option<&dyn TextCompleter>) -> Result<TrajectoryClassification, String> {
     let local = interpret_header(text);
-    finish_with_model(local, text, model)
+    finish_with_model(local, text, model, None)
 }
 
 pub fn finish_with_model(
     local: TrajectoryClassification,
     text: &str,
     model: Option<&dyn TextCompleter>,
+    unavailable: Option<&str>,
 ) -> Result<TrajectoryClassification, String> {
     let Some(model) = model else {
         let mut local = local;
-        note_model_did_not_run(&mut local);
+        note_model_did_not_run(&mut local, unavailable);
         return Ok(local);
     };
     match classify_with(model, &excerpt_of(text)) {
         Ok(model_class) => Ok(classification_from_scan(&scan_header(text), Some(&model_class))),
         Err(err) if err == CANCELLED || err.contains(CANCELLED) => Err(err),
-        Err(_) => {
+        Err(err) => {
             let mut local = local;
-            note_model_did_not_run(&mut local);
+            note_model_did_not_run(&mut local, Some(err.as_str()));
             Ok(local)
         }
     }
 }
 
-fn note_model_did_not_run(class: &mut TrajectoryClassification) {
+fn note_model_did_not_run(class: &mut TrajectoryClassification, detail: Option<&str>) {
+    if let Some(detail) = detail.map(str::trim).filter(|text| !text.is_empty()) {
+        if !class.reasoning.contains(detail) {
+            if class.reasoning.trim().is_empty() {
+                class.reasoning = detail.to_string();
+            } else {
+                class.reasoning = format!("{} {detail}", class.reasoning.trim());
+            }
+        }
+    }
     if class.reasoning.contains(MODEL_DID_NOT_RUN) {
         return;
     }
@@ -1988,6 +1998,12 @@ impl RunningServer {
     }
 }
 
+enum ExistingWait {
+    Ready(ServerInfo),
+    Exited,
+    Failed(String),
+}
+
 /// One llama-server process for the whole app session. A second classification reuses it.
 pub struct LlamaServerPool {
     gate: Mutex<()>,
@@ -2062,6 +2078,63 @@ impl LlamaServerPool {
             Ok(text) => Ok(text),
             Err(err) if err == CANCELLED || cancel.load(Ordering::SeqCst) => Err(CANCELLED.into()),
             Err(err) => Err(err),
+        }
+    }
+
+    /// A child that has not exited. `/health` may still be pending while the model opens.
+    fn live_port(&self) -> Option<u16> {
+        let mut slot = self.slot.lock().unwrap_or_else(|err| err.into_inner());
+        let running = slot.as_mut()?;
+        match running.child.try_wait() {
+            Ok(None) => Some(running.port),
+            _ => None,
+        }
+    }
+
+    /// Wait until the process already in the slot answers `/health`.
+    /// A process that exits lets the caller start another server. A process that stays
+    /// up is left running: this does not shut it down or read the GPU offload log again.
+    fn wait_for_existing(&self, cancel: &AtomicBool) -> ExistingWait {
+        self.poll_existing(cancel, SERVER_START_TIMEOUT)
+    }
+
+    fn poll_existing(&self, cancel: &AtomicBool, timeout: Duration) -> ExistingWait {
+        if self.live_port().is_none() {
+            return ExistingWait::Exited;
+        }
+        let started = Instant::now();
+        loop {
+            if cancel.load(Ordering::SeqCst) {
+                return ExistingWait::Failed(CANCELLED.into());
+            }
+            let port = {
+                let mut slot = self.slot.lock().unwrap_or_else(|err| err.into_inner());
+                let Some(running) = slot.as_mut() else {
+                    return ExistingWait::Exited;
+                };
+                match running.child.try_wait() {
+                    Ok(None) => running.port,
+                    Ok(Some(_)) => return ExistingWait::Exited,
+                    Err(err) => return ExistingWait::Failed(format!("llama-server failed: {err}")),
+                }
+            };
+            if health_ok(port) {
+                let slot = self.slot.lock().unwrap_or_else(|err| err.into_inner());
+                if let Some(running) = slot.as_ref() {
+                    if running.port == port {
+                        return ExistingWait::Ready(running.info());
+                    }
+                }
+                continue;
+            }
+            if started.elapsed() >= timeout {
+                if self.live_port().is_some() {
+                    let tail = self.copy_logs();
+                    return ExistingWait::Failed(format!("llama-server did not become ready: {tail}"));
+                }
+                return ExistingWait::Exited;
+            }
+            thread::sleep(Duration::from_millis(50));
         }
     }
 
@@ -2442,9 +2515,25 @@ impl LlamaRuntime {
         }
     }
 
+    /// Use a llama-server process that is already running. Nothing is downloaded and the
+    /// process is not replaced. `Ok(None)` means no process is running.
+    pub fn attach_running(pool: &Arc<LlamaServerPool>, cancel: &Arc<AtomicBool>) -> Result<Option<Self>, String> {
+        if cancel.load(Ordering::SeqCst) {
+            return Err(CANCELLED.into());
+        }
+        if let Some(info) = pool.current() {
+            return Ok(Some(Self::from_info(Arc::clone(pool), info, Arc::clone(cancel))));
+        }
+        match pool.wait_for_existing(cancel) {
+            ExistingWait::Ready(info) => Ok(Some(Self::from_info(Arc::clone(pool), info, Arc::clone(cancel)))),
+            ExistingWait::Exited => Ok(None),
+            ExistingWait::Failed(err) => Err(err),
+        }
+    }
+
     /// Download the GGUF if needed and make sure one llama-server is serving it.
-    /// A server that is already healthy is reused, including across later file picks.
-    /// Call this only from a background task.
+    /// A process that is already running is waited on and reused, including while `/health`
+    /// is still loading. Call this only from a background task.
     pub fn ensure(
         data_dir: &Path,
         cancel: &Arc<AtomicBool>,
@@ -2454,10 +2543,16 @@ impl LlamaRuntime {
         if cancel.load(Ordering::SeqCst) {
             return Err(CANCELLED.into());
         }
-        if let Some(info) = pool.current() {
-            let label = device_label(info.backend, info.layers);
-            note(progress, &device_message(info.backend, info.layers, info.fell_back), 0, 0, &label);
-            return Ok(Self::from_info(Arc::clone(pool), info, Arc::clone(cancel)));
+        if let Some(runtime) = Self::attach_running(pool, cancel)? {
+            let label = device_label(runtime.backend, runtime.layers);
+            note(
+                progress,
+                &device_message(runtime.backend, runtime.layers, runtime.spec.fell_back),
+                0,
+                0,
+                &label,
+            );
+            return Ok(runtime);
         }
         let probed = probe_backend();
         note(progress, &format!("Preparing {} llama-server", device_name(probed)), 0, 0, device_name(probed));
@@ -2512,7 +2607,20 @@ impl TextCompleter for LlamaRuntime {
         if self.cancel.load(Ordering::SeqCst) {
             return Err(CANCELLED.into());
         }
-        self.pool.infer(&self.spec, system, user, &self.cancel)
+        let info = if let Some(info) = self.pool.current() {
+            info
+        } else {
+            match self.pool.wait_for_existing(&self.cancel) {
+                ExistingWait::Ready(info) => info,
+                ExistingWait::Exited => return self.pool.infer(&self.spec, system, user, &self.cancel),
+                ExistingWait::Failed(err) => return Err(err),
+            }
+        };
+        match post_completion(info.port, &completion_request(system, user), &self.cancel) {
+            Ok(text) => Ok(text),
+            Err(err) if err == CANCELLED || self.cancel.load(Ordering::SeqCst) => Err(CANCELLED.into()),
+            Err(err) => Err(err),
+        }
     }
 }
 
@@ -4059,8 +4167,19 @@ s,rad,rad,m
         assert!(fallback.reasoning.contains("The model did not run."), "{}", fallback.reasoning);
         assert_eq!(column_unit(&fallback, "pos_lat"), "rad");
         let failed = read_trajectory_format(&format2, Some(&offline)).unwrap();
+        assert!(failed.reasoning.contains("no scripted reply"), "{}", failed.reasoning);
         assert!(failed.reasoning.contains("The model did not run."));
         assert_eq!(column_unit(&failed, "pos_lat"), "rad");
+        let detail = finish_with_model(
+            interpret_header(&format2),
+            &format2,
+            None,
+            Some("llama-server did not become ready: loading model"),
+        )
+        .unwrap();
+        assert!(detail.reasoning.contains("did not become ready"), "{}", detail.reasoning);
+        assert!(detail.reasoning.contains("loading model"), "{}", detail.reasoning);
+        assert!(detail.reasoning.contains("The model did not run."), "{}", detail.reasoning);
         assert_eq!(*offline.calls.lock().unwrap(), 1);
 
         let clean_class = read_trajectory_format(&clean, Some(&contradict)).unwrap();
@@ -4550,10 +4669,43 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def do_POST(self):
+        size = int(self.headers.get("Content-Length", "0"))
+        raw = self.rfile.read(size)
+        req_log = os.environ.get("FAUXRRT_REQUEST_LOG")
+        if req_log:
+            with open(req_log, "ab") as fh:
+                fh.write(raw + b"\n")
+        content = {
+            "header_lines": 1,
+            "delimiter": ",",
+            "frames": {"position": "LLA"},
+            "units": {"position": "m"},
+            "columns": {"col_0": "time", "col_1": "pos_lat", "col_2": "pos_lon", "col_3": "pos_alt"},
+            "confidence_score": 0.9,
+            "unsupported_flag": False,
+            "reasoning": "from the running server",
+        }
+        body = json.dumps({"content": json.dumps(content)}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def log_message(self, fmt, *args):
         return
 
 ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()
+"#;
+
+    const HANG_LLAMA_SERVER: &str = r#"#!/usr/bin/env python3
+import json, os, sys, time
+log = os.environ.get("FAUXRRT_LAUNCH_LOG")
+if log:
+    with open(log, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(sys.argv[1:]) + "\n")
+time.sleep(60)
 "#;
 
     #[cfg(unix)]
@@ -4631,6 +4783,83 @@ ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()
         assert_eq!(right.layers, 33);
         assert_eq!(pool.launch_count(), 1, "the opening server was relaunched");
         assert_eq!(fs::read_to_string(&log).unwrap().lines().count(), 1);
+        pool.shutdown();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_loading_server_receives_the_file_without_a_second_launch() {
+        let dir = std::env::temp_dir().join(format!("fauxrrt-attach-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let program = write_exe(&dir, "llama-server", SLOW_LLAMA_SERVER);
+        let log = dir.join("launches.jsonl");
+        let requests = dir.join("requests.jsonl");
+        let model = dir.join("model.gguf");
+        let mut spec = server_spec(program, model, GpuBackend::Cuda, &log);
+        spec.extra_env.push(("FAUXRRT_REQUEST_LOG".into(), requests.display().to_string()));
+        let pool = Arc::new(LlamaServerPool::new());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let starter = {
+            let pool = Arc::clone(&pool);
+            let spec = spec.clone();
+            let cancel = Arc::clone(&cancel);
+            thread::spawn(move || pool.start_or_fallback(&spec, || Ok(spec.clone()), &cancel))
+        };
+        thread::sleep(Duration::from_millis(300));
+        assert!(pool.current().is_none(), "health is not ready while the server is opening");
+        assert_eq!(pool.launch_count(), 1);
+        let runtime = loop {
+            match LlamaRuntime::attach_running(&pool, &cancel) {
+                Ok(Some(runtime)) => break runtime,
+                Ok(None) if starter.is_finished() => panic!("the opening server was not reused"),
+                Ok(None) => thread::sleep(Duration::from_millis(50)),
+                Err(err) => panic!("{err}"),
+            }
+        };
+        let started = starter.join().unwrap().unwrap();
+        assert_eq!(started.layers, 33);
+        assert_eq!(pool.launch_count(), 1, "waiting on the loading server launched another");
+        assert_eq!(runtime.backend, GpuBackend::Cuda);
+        assert_eq!(runtime.layers, 33);
+        let class = classify_with(&runtime, "time,lat,lon,alt\n0,30.33,-86.59,0\n").unwrap();
+        assert_eq!(class.frames.position, "LLA");
+        let posted = fs::read_to_string(&requests).unwrap();
+        assert!(posted.contains("time,lat,lon,alt"), "{posted}");
+        assert_eq!(fs::read_to_string(&log).unwrap().lines().count(), 1);
+        pool.shutdown();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_server_that_is_not_ready_is_left_running() {
+        let dir = std::env::temp_dir().join(format!("fauxrrt-hang-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let program = write_exe(&dir, "llama-server", HANG_LLAMA_SERVER);
+        let log = dir.join("launches.jsonl");
+        let model = dir.join("model.gguf");
+        let spec = server_spec(program, model, GpuBackend::Cuda, &log);
+        let pool = Arc::new(LlamaServerPool::new());
+        let port = free_local_port().unwrap();
+        let running = spawn_server(&spec, port).unwrap();
+        {
+            let mut slot = pool.slot.lock().unwrap_or_else(|err| err.into_inner());
+            *slot = Some(running);
+        }
+        let cancel = AtomicBool::new(false);
+        let wait = pool.poll_existing(&cancel, Duration::from_millis(200));
+        match wait {
+            ExistingWait::Failed(err) => {
+                assert!(err.contains("did not become ready"), "{err}");
+                assert!(!err.contains("offload"), "{err}");
+            }
+            ExistingWait::Exited => panic!("the live server was treated as exited"),
+            ExistingWait::Ready(_) => panic!("a silent server was treated as ready"),
+        }
+        assert!(pool.live_port().is_some(), "the loading server was stopped");
         pool.shutdown();
         let _ = fs::remove_dir_all(&dir);
     }
