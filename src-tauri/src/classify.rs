@@ -1108,10 +1108,130 @@ pub fn partial_schema_guess(text: &str) -> TrajectoryClassification {
     class
 }
 
+const HEADER_CELLS_FILE: &str = "header-cells.json";
+
+/// Column corrections confirmed in the review. Stored in app data, not in source.
+/// The key is the whole normalized header cell. A bare fragment such as `ecf` is not a key.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub(crate) struct HeaderMemory {
+    #[serde(default)]
+    cells: BTreeMap<String, RememberedCell>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct RememberedCell {
+    role: String,
+    #[serde(default)]
+    unit: String,
+    #[serde(default)]
+    frame: String,
+}
+
+impl HeaderMemory {
+    fn lookup(&self, raw: &str) -> Option<&RememberedCell> {
+        let key = normalize_header_token(raw);
+        if key.is_empty() {
+            return None;
+        }
+        self.cells.get(&key)
+    }
+}
+
+pub(crate) fn load_header_memory(data_dir: &Path) -> HeaderMemory {
+    let path = data_dir.join(HEADER_CELLS_FILE);
+    let Ok(text) = fs::read_to_string(path) else {
+        return HeaderMemory::default();
+    };
+    serde_json::from_str(&text).unwrap_or_default()
+}
+
+fn save_header_memory(data_dir: &Path, memory: &HeaderMemory) -> Result<(), String> {
+    fs::create_dir_all(data_dir).map_err(|err| err.to_string())?;
+    let text = serde_json::to_string_pretty(memory).map_err(|err| err.to_string())?;
+    fs::write(data_dir.join(HEADER_CELLS_FILE), text).map_err(|err| err.to_string())
+}
+
+fn memory_hit(raw: &str, memory: &HeaderMemory) -> Option<(String, Option<String>, String)> {
+    let cell = memory.lookup(raw)?;
+    let frame = canonical_frame(&cell.frame).map(str::to_string);
+    Some((cell.role.clone(), frame, cell.unit.clone()))
+}
+
+fn role_frame(class: &TrajectoryClassification, role: &str) -> String {
+    let raw = if role.starts_with("vel_") {
+        class.frames.velocity.as_deref().unwrap_or("")
+    } else if role.starts_with("acc_") {
+        class.frames.acceleration.as_deref().unwrap_or("")
+    } else if role.starts_with("pos_") {
+        class.frames.position.as_str()
+    } else {
+        ""
+    };
+    canonical_frame(raw).unwrap_or("").to_string()
+}
+
+fn column_mark(class: &TrajectoryClassification, index: usize) -> (String, String, String) {
+    let key = format!("col_{index}");
+    let role = class.columns.get(&key).map(|role| role.trim().to_string()).unwrap_or_default();
+    if role.is_empty() || role == "ignore" {
+        return (role, String::new(), String::new());
+    }
+    let unit = class
+        .column_units
+        .get(&key)
+        .cloned()
+        .filter(|unit| !unit.trim().is_empty())
+        .unwrap_or_else(|| column_unit(class, &role));
+    (role.clone(), unit, role_frame(class, &role))
+}
+
+/// Remember header cells whose confirmed role, unit, or frame differs from the scan.
+/// A confirm that matches the scan is not stored. The last confirmation for a cell wins.
+pub(crate) fn remember_confirmed_columns(
+    data_dir: &Path,
+    text: &str,
+    confirmed: &TrajectoryClassification,
+) -> Result<(), String> {
+    let mut memory = load_header_memory(data_dir);
+    let scan = scan_header_with(text, &memory);
+    let before = classification_from_scan(&scan, None, &memory);
+    let mut confirmed = confirmed.clone();
+    normalize_classification(&mut confirmed);
+    let mut changed = false;
+    for (index, raw) in scan.names.iter().enumerate() {
+        let key = normalize_header_token(raw);
+        if key.is_empty() {
+            continue;
+        }
+        let (role, unit, frame) = column_mark(&confirmed, index);
+        let (before_role, before_unit, before_frame) = column_mark(&before, index);
+        if role == before_role && unit == before_unit && frame == before_frame {
+            continue;
+        }
+        memory.cells.insert(
+            key,
+            RememberedCell {
+                role,
+                unit,
+                frame,
+            },
+        );
+        changed = true;
+    }
+    if changed {
+        save_header_memory(data_dir, &memory)?;
+    }
+    Ok(())
+}
+
 /// Read column names and an optional unit row. This does not start a model.
 /// Unrecognized columns stay unset for the review window.
 pub fn interpret_header(text: &str) -> TrajectoryClassification {
-    classification_from_scan(&scan_header(text), None)
+    interpret_header_with(text, &HeaderMemory::default())
+}
+
+pub(crate) fn interpret_header_with(text: &str, memory: &HeaderMemory) -> TrajectoryClassification {
+    classification_from_scan(&scan_header_with(text, memory), None, memory)
 }
 
 pub const ANGLE_LOOKS_LIKE_DEGREES: &str =
@@ -1184,7 +1304,7 @@ pub fn finish_with_model(
         return Ok(local);
     };
     match classify_with(model, &excerpt_of(text)) {
-        Ok(model_class) => Ok(classification_from_scan(&scan_header(text), Some(&model_class))),
+        Ok(model_class) => Ok(classification_from_scan(&scan_header(text), Some(&model_class), &HeaderMemory::default())),
         Err(err) if err == CANCELLED || err.contains(CANCELLED) => Err(err),
         Err(err) => {
             let mut local = local;
@@ -1223,6 +1343,10 @@ struct HeaderScan {
 }
 
 fn scan_header(text: &str) -> HeaderScan {
+    scan_header_with(text, &HeaderMemory::default())
+}
+
+fn scan_header_with(text: &str, memory: &HeaderMemory) -> HeaderScan {
     let lines: Vec<&str> = text.lines().map(|line| line.trim_end()).take(EXCERPT_LINES).collect();
     let candidates: Vec<&str> = lines
         .iter()
@@ -1244,7 +1368,10 @@ fn scan_header(text: &str) -> HeaderScan {
             if cells.len() < 2 || !row_is_header(&cells) || row_is_units(&cells) {
                 continue;
             }
-            let named = cells.iter().filter(|cell| identify_header_name(cell).is_some()).count();
+            let named = cells
+                .iter()
+                .filter(|cell| memory.lookup(cell).is_some() || identify_header_name(cell).is_some())
+                .count();
             if named == 0 {
                 continue;
             }
@@ -1330,13 +1457,20 @@ fn is_data_line(line: &str, delim: Delimiter) -> bool {
     cells.len() >= 2 && numbers >= 2 && numbers * 2 >= cells.len()
 }
 
-fn classification_from_scan(scan: &HeaderScan, model: Option<&TrajectoryClassification>) -> TrajectoryClassification {
+fn classification_from_scan(
+    scan: &HeaderScan,
+    model: Option<&TrajectoryClassification>,
+    memory: &HeaderMemory,
+) -> TrajectoryClassification {
     let width = if !scan.names.is_empty() { scan.names.len() } else { scan.data_width };
-    let mut identified: Vec<(String, Option<&'static str>, String)> = Vec::new();
+    let mut identified: Vec<(String, Option<String>, String)> = Vec::new();
     for index in 0..width {
         let raw_name = scan.names.get(index).map(String::as_str).unwrap_or("");
         let key = format!("col_{index}");
-        let mut hit = identify_header_name(raw_name);
+        // A stored cell name wins over the built-in list. The model is not used on Choose files.
+        let mut hit = memory_hit(raw_name, memory).or_else(|| {
+            identify_header_name(raw_name).map(|(role, frame, unit)| (role, frame.map(str::to_string), unit))
+        });
         if hit.is_none() {
             if let Some(role) = model.and_then(|class| class.columns.get(&key)) {
                 if !role.trim().is_empty() {
@@ -1357,7 +1491,7 @@ fn classification_from_scan(scan: &HeaderScan, model: Option<&TrajectoryClassifi
         }
         // A recognized angle name with no stated unit stays degrees, even if a model said radians.
         if let Some((role, _, unit)) = hit.as_mut() {
-            let named = scan.names.get(index).is_some_and(|name| identify_header_name(name).is_some());
+            let named = memory.lookup(raw_name).is_some() || identify_header_name(raw_name).is_some();
             if named && unit.is_empty() && (*role == "pos_lat" || *role == "pos_lon") {
                 *unit = "deg".to_string();
             }
@@ -1375,16 +1509,19 @@ fn classification_from_scan(scan: &HeaderScan, model: Option<&TrajectoryClassifi
         }
     }
 
-    let position = frame_for(identified.iter().map(|(role, frame, _)| (role.as_str(), *frame)), "pos_").unwrap_or_default();
-    let velocity = frame_for(identified.iter().map(|(role, frame, _)| (role.as_str(), *frame)), "vel_");
-    let acceleration = frame_for(identified.iter().map(|(role, frame, _)| (role.as_str(), *frame)), "acc_");
+    let position = frame_for(identified.iter().map(|(role, frame, _)| (role.as_str(), frame.as_deref())), "pos_").unwrap_or_default();
+    let velocity = frame_for(identified.iter().map(|(role, frame, _)| (role.as_str(), frame.as_deref())), "vel_");
+    let acceleration = frame_for(identified.iter().map(|(role, frame, _)| (role.as_str(), frame.as_deref())), "acc_");
     let velocity_unit = velocity.as_ref().map(|_| "m/s".to_string());
     let acceleration_unit = acceleration.as_ref().map(|_| "m/s^2".to_string());
     let has_orientation = identified.iter().any(|(role, _, _)| role.starts_with("orientation_"));
     let has_mass = identified.iter().any(|(role, _, _)| role == "mass");
     let complete = position_complete(&position, &columns);
     let unknown = !scan.names.is_empty()
-        && scan.names.iter().any(|cell| !cell.trim().is_empty() && identify_header_name(cell).is_none());
+        && scan
+            .names
+            .iter()
+            .any(|cell| !cell.trim().is_empty() && memory.lookup(cell).is_none() && identify_header_name(cell).is_none());
     let confidence = if complete && !unknown { 0.95 } else { 0.2 };
     let reasoning = if scan.names.is_empty() {
         "No header row. Mark each column on the trajectory file format.".to_string()
@@ -1616,9 +1753,9 @@ fn axis_component(token: &str) -> Option<(&'static str, Option<&'static str>)> {
         "lat" | "latitude" | "geodetic_lat" | "geodetic_latitude" | "latd" => Some(("lat", Some("LLA"))),
         "lon" | "long" | "lng" | "longitude" | "geodetic_lon" | "geodetic_longitude" | "lond" => Some(("lon", Some("LLA"))),
         "alt" | "altitude" | "height" | "hae" | "msl" | "elev" | "elevation" | "ht" => Some(("alt", Some("LLA"))),
-        "x" | "x_ecr" | "ecr_x" | "x_ecef" | "ecef_x" => Some(("x", Some("ECEF"))),
-        "y" | "y_ecr" | "ecr_y" | "y_ecef" | "ecef_y" => Some(("y", Some("ECEF"))),
-        "z" | "z_ecr" | "ecr_z" | "z_ecef" | "ecef_z" => Some(("z", Some("ECEF"))),
+        "x" | "x_ecr" | "ecr_x" | "x_ecef" | "ecef_x" | "x_ecf" | "ecf_x" => Some(("x", Some("ECEF"))),
+        "y" | "y_ecr" | "ecr_y" | "y_ecef" | "ecef_y" | "y_ecf" | "ecf_y" => Some(("y", Some("ECEF"))),
+        "z" | "z_ecr" | "ecr_z" | "z_ecef" | "ecef_z" | "z_ecf" | "ecf_z" => Some(("z", Some("ECEF"))),
         "x_eci" | "eci_x" => Some(("x", Some("ECI"))),
         "y_eci" | "eci_y" => Some(("y", Some("ECI"))),
         "z_eci" | "eci_z" => Some(("z", Some("ECI"))),
@@ -1630,7 +1767,7 @@ fn axis_component(token: &str) -> Option<(&'static str, Option<&'static str>)> {
     }
 }
 
-fn frame_for<'a>(items: impl Iterator<Item = (&'a str, Option<&'static str>)>, prefix: &'a str) -> Option<String> {
+fn frame_for<'a>(items: impl Iterator<Item = (&'a str, Option<&'a str>)>, prefix: &'a str) -> Option<String> {
     let rows: Vec<_> = items.filter(|(role, _)| role.starts_with(prefix)).collect();
     if rows.is_empty() {
         return None;
@@ -4285,6 +4422,142 @@ s,rad,rad,m
         assert!((kept.lla[0] as f64 - lon).abs() < 1e-3, "lon {}", kept.lla[0]);
         assert!((kept.lla[2] as f64 - 10.0).abs() < 1e-3, "alt {}", kept.lla[2]);
         assert!(kept.lla.chunks(3).all(|point| (point[1] as f64 - 30.33).abs() > 1.0));
+    }
+
+    #[test]
+    fn eglin_format_3_ecf_assigns_ecef_velocity_and_acceleration_without_a_model() {
+        assert_eq!(normalize_header_token("ax(ecf)"), "ax_ecf");
+        assert_eq!(normalize_header_token("vx ecf"), "vx_ecf");
+        assert!(identify_header_name("ecf").is_none());
+        let (vx_role, vx_frame, _) = identify_header_name("vx ecf").unwrap();
+        assert_eq!(vx_role, "vel_x");
+        assert_eq!(vx_frame, Some("ECEF"));
+        let (ax_role, ax_frame, _) = identify_header_name("ax(ecf)").unwrap();
+        assert_eq!(ax_role, "acc_x");
+        assert_eq!(ax_frame, Some("ECEF"));
+
+        let text = sample_text("eglin_traj_format_3_ecf.traj");
+        let local = interpret_header(&text);
+        assert_eq!(local.header_lines, 4);
+        assert_eq!(local.delimiter, "whitespace");
+        let roles = [
+            "time", "pos_lat", "pos_alt", "pos_lon", "vel_x", "vel_y", "vel_z", "acc_x", "acc_y", "acc_z",
+        ];
+        for (index, role) in roles.iter().enumerate() {
+            assert_eq!(
+                local.columns.get(&format!("col_{index}")).map(String::as_str),
+                Some(*role),
+                "{local:?}"
+            );
+        }
+        assert_eq!(local.frames.position, "LLA");
+        assert_eq!(local.frames.velocity.as_deref(), Some("ECEF"));
+        assert_eq!(local.frames.acceleration.as_deref(), Some("ECEF"));
+        assert_eq!(column_unit(&local, "pos_lat"), "deg");
+        assert_eq!(column_unit(&local, "pos_lon"), "deg");
+        assert_eq!(column_unit(&local, "pos_alt"), "m");
+        assert_eq!(column_unit(&local, "vel_x"), "m/s");
+        assert_eq!(column_unit(&local, "vel_y"), "m/s");
+        assert_eq!(column_unit(&local, "vel_z"), "m/s");
+        assert_eq!(column_unit(&local, "acc_x"), "m/s^2");
+        assert_eq!(column_unit(&local, "acc_y"), "m/s^2");
+        assert_eq!(column_unit(&local, "acc_z"), "m/s^2");
+        assert!(local.confidence_score > 0.9, "{}", local.confidence_score);
+        assert_eq!(local.reasoning, "Read from the header.");
+        assert!(!local.reasoning.contains("The model did not run."));
+    }
+
+    #[test]
+    fn a_changed_confirm_is_remembered_by_the_whole_cell_name() {
+        let dir = std::env::temp_dir().join(format!(
+            "fauxrrt-header-cells-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let text = "time,vx_ecf,vy_ecf,body_rate,ecf\n0,1,2,3,4\n1,5,6,7,8\n";
+        let scan = interpret_header(text);
+        assert_eq!(scan.columns.get("col_1").map(String::as_str), Some("vel_x"));
+        assert_eq!(column_unit(&scan, "vel_x"), "m/s");
+        assert_eq!(scan.columns.get("col_2").map(String::as_str), Some("vel_y"));
+        assert_eq!(scan.columns.get("col_3").map(String::as_str), Some(""));
+        assert_eq!(scan.columns.get("col_4").map(String::as_str), Some(""));
+        assert!(scan.confidence_score < 0.6, "an unknown cell stays low confidence");
+
+        remember_confirmed_columns(&dir, text, &scan).unwrap();
+        assert!(
+            !dir.join("header-cells.json").exists(),
+            "a confirm that matches the scan is not stored"
+        );
+
+        let mut changed = scan.clone();
+        changed.columns.insert("col_1".into(), "vel_z".into());
+        changed.columns.insert("col_2".into(), String::new());
+        changed.columns.insert("col_3".into(), "mass".into());
+        remember_confirmed_columns(&dir, text, &changed).unwrap();
+        let stored = load_header_memory(&dir);
+        let keys: Vec<_> = stored.cells.keys().cloned().collect();
+        assert_eq!(keys, vec!["body_rate".to_string(), "vx_ecf".to_string(), "vy_ecf".to_string()]);
+        assert!(!stored.cells.contains_key("ecf"));
+        assert!(!stored.cells.contains_key("vx"));
+        assert!(!stored.cells.contains_key("vy"));
+        assert_eq!(stored.cells["vx_ecf"].role, "vel_z");
+        assert_eq!(stored.cells["vx_ecf"].unit, "m/s");
+        assert_eq!(stored.cells["vx_ecf"].frame, "ECEF");
+        assert_eq!(stored.cells["vy_ecf"].role, "");
+        assert_eq!(stored.cells["body_rate"].role, "mass");
+
+        let overridden = interpret_header_with(text, &stored);
+        assert_eq!(overridden.columns.get("col_1").map(String::as_str), Some("vel_z"));
+        assert_eq!(column_unit(&overridden, "vel_z"), "m/s");
+        assert_eq!(overridden.columns.get("col_2").map(String::as_str), Some(""));
+        assert_eq!(overridden.columns.get("col_3").map(String::as_str), Some("mass"));
+        assert_eq!(overridden.columns.get("col_4").map(String::as_str), Some(""));
+        assert_eq!(overridden.frames.velocity.as_deref(), Some("ECEF"));
+
+        let mut confirmed = overridden.clone();
+        confirmed.columns.insert("col_1".into(), "vel_x".into());
+        confirmed.column_units.insert("col_1".into(), "m/s".into());
+        confirmed.frames.velocity = Some("ECEF".into());
+        remember_confirmed_columns(&dir, text, &confirmed).unwrap();
+        let memory = load_header_memory(&dir);
+        assert_eq!(memory.cells["vx_ecf"].role, "vel_x");
+        assert_eq!(memory.cells["vx_ecf"].unit, "m/s");
+        assert_eq!(memory.cells["vx_ecf"].frame, "ECEF");
+        assert_eq!(memory.cells["vy_ecf"].role, "");
+        assert!(!memory.cells.contains_key("ecf"));
+
+        let next = interpret_header_with(text, &memory);
+        assert_eq!(next.columns.get("col_1").map(String::as_str), Some("vel_x"));
+        assert_eq!(column_unit(&next, "vel_x"), "m/s");
+        assert_eq!(next.frames.velocity.as_deref(), Some("ECEF"));
+        assert_eq!(next.columns.get("col_2").map(String::as_str), Some(""));
+        assert_eq!(next.columns.get("col_3").map(String::as_str), Some("mass"));
+        assert_eq!(next.columns.get("col_4").map(String::as_str), Some(""));
+
+        let before = fs::read_to_string(dir.join("header-cells.json")).unwrap();
+        remember_confirmed_columns(&dir, text, &next).unwrap();
+        assert_eq!(fs::read_to_string(dir.join("header-cells.json")).unwrap(), before);
+
+        let known = "time,lat,lon,alt,body_rate\n0,30.33,-86.59,10,1\n1,30.34,-86.58,11,2\n";
+        let without = interpret_header(known);
+        assert_eq!(without.columns.get("col_4").map(String::as_str), Some(""));
+        assert!(without.confidence_score < 0.6);
+        let with_memory = interpret_header_with(known, &load_header_memory(&dir));
+        assert_eq!(with_memory.columns.get("col_4").map(String::as_str), Some("mass"));
+        assert_eq!(with_memory.frames.position, "LLA");
+        assert!(with_memory.confidence_score > 0.9, "{}", with_memory.confidence_score);
+        assert!(!with_memory.reasoning.contains("The model did not run."));
+
+        let bare = interpret_header_with("time,ecf,lat,lon,alt\n0,1,30,-86,10\n1,2,31,-85,11\n", &memory);
+        assert_eq!(bare.columns.get("col_1").map(String::as_str), Some(""));
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

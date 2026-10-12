@@ -39,9 +39,9 @@ use mission::{
     UNTITLED,
 };
 use classify::{
-    excerpt_of, file_origin, group_files, may_load, manual_reason, normalize_classification, origin_from_text,
-    finish_with_model, interpret_header, warm_installed_model, GroupedFile, LlamaRuntime, LlamaServerPool, SchemaAssignment, SchemaGroup,
-    TrajectoryClassification, CANCELLED,
+    excerpt_of, file_origin, group_files, interpret_header_with, load_header_memory, may_load, manual_reason,
+    normalize_classification, origin_from_text, remember_confirmed_columns, warm_installed_model, GroupedFile,
+    LlamaServerPool, SchemaAssignment, SchemaGroup, TrajectoryClassification, CANCELLED,
 };
 use parse::{parse_path_with, parse_text, parse_with_classification, read_trajectory_text, ParsedTrack};
 use pick::{pick_kml_sources, pick_trajectory_folder, pick_trajectory_sources};
@@ -62,8 +62,8 @@ pub struct AppState {
     store: Mutex<Store>,
     mission: Mutex<MissionSession>,
     classify_cancel: Arc<AtomicBool>,
-    /// Resident llama-server. If the GGUF is already on disk it starts when the app
-    /// opens. Choose files reuses it. Cancel and app exit shut it down.
+    /// Resident llama-server. Choose files does not start it. The code stays so detection
+    /// can call it again later. Cancel and app exit shut it down.
     llama: Arc<LlamaServerPool>,
     /// Last globe animation field. Historical profiles stay out of the mission file.
     wind_anim: Mutex<Option<WindAnimCache>>,
@@ -182,14 +182,13 @@ fn picked_paths(files: Vec<PathBuf>) -> PickedPaths {
 }
 
 /// Read headers after the file dialog has returned. The dialog itself is the command
-/// that opens it. The excerpt scan and the model run off the UI thread.
+/// that opens it. The local scan runs off the UI thread and does not start a model.
 #[tauri::command]
 async fn classify_picked(app: AppHandle, state: State<'_, AppState>, paths: Vec<String>) -> Result<ClassifyResult, String> {
     let cancel = Arc::clone(&state.classify_cancel);
     cancel.store(false, Ordering::SeqCst);
-    let pool = Arc::clone(&state.llama);
     let files: Vec<PathBuf> = paths.into_iter().map(PathBuf::from).collect();
-    tauri::async_runtime::spawn_blocking(move || classify_paths(&app, files, &cancel, &pool))
+    tauri::async_runtime::spawn_blocking(move || classify_paths(&app, files, &cancel))
         .await
         .map_err(|err| format!("classification task failed: {err}"))?
 }
@@ -1388,12 +1387,7 @@ fn resolve_load_mode(
     Ok(Some(store.ensure_named_mode(object_id, name)?))
 }
 
-fn classify_paths(
-    app: &AppHandle,
-    files: Vec<PathBuf>,
-    cancel: &Arc<AtomicBool>,
-    pool: &Arc<LlamaServerPool>,
-) -> Result<ClassifyResult, String> {
+fn classify_paths(app: &AppHandle, files: Vec<PathBuf>, cancel: &Arc<AtomicBool>) -> Result<ClassifyResult, String> {
     let started = Instant::now();
     let total = files.len();
     if total == 0 {
@@ -1404,8 +1398,13 @@ fn classify_paths(
             file_count: 0,
         });
     }
+    let memory = app
+        .path()
+        .app_data_dir()
+        .map(|dir| load_header_memory(&dir))
+        .unwrap_or_default();
     let mut errors = Vec::new();
-    let mut loaded = Vec::new();
+    let mut ready = Vec::new();
     for (index, path) in files.iter().enumerate() {
         if cancel.load(Ordering::SeqCst) {
             return Err(CANCELLED.into());
@@ -1424,72 +1423,11 @@ fn classify_paths(
         );
         match read_trajectory_text(path) {
             Ok(text) => {
-                let local = interpret_header(&text);
-                loaded.push((index, path.clone(), text, local));
+                let local = interpret_header_with(&text, &memory);
+                ready.push(grouped_classification(path, &text, local));
             }
             Err(err) => errors.push(err),
         }
-    }
-    let progress_name = loaded.first().map(|(_, path, _, _)| file_name(path)).unwrap_or_default();
-    let (runtime, unavailable) = if loaded.is_empty() {
-        (None, None)
-    } else {
-        let ensured = match app.path().app_data_dir() {
-            Ok(dir) => LlamaRuntime::ensure(
-                &dir,
-                cancel,
-                &|note| {
-                    emit_progress(
-                        app,
-                        ProgressEvent {
-                            done: 0,
-                            total,
-                            file: format!("{}: {}", format_detection_label(&progress_name), note.label),
-                            bytes: note.bytes,
-                            bytes_total: note.bytes_total,
-                            device: note.device,
-                        },
-                    );
-                },
-                pool,
-            ),
-            Err(dir_err) => match LlamaRuntime::attach_running(pool, cancel) {
-                Ok(Some(runtime)) => Ok(runtime),
-                Ok(None) => Err(format!("could not open the model folder: {dir_err}")),
-                Err(err) => Err(err),
-            },
-        };
-        match ensured {
-            Ok(runtime) => (Some(runtime), None),
-            Err(err) if err == CANCELLED || err.contains(CANCELLED) => return Err(CANCELLED.into()),
-            Err(err) => (None, Some(err)),
-        }
-    };
-    let mut ready = Vec::new();
-    for (index, path, text, local) in loaded {
-        if cancel.load(Ordering::SeqCst) {
-            return Err(CANCELLED.into());
-        }
-        let name = file_name(&path);
-        let device = runtime.as_ref().map(|item| item.status_device()).unwrap_or_default();
-        emit_progress(
-            app,
-            ProgressEvent {
-                done: index + 1,
-                total,
-                file: format_detection_label(&name),
-                bytes: 0,
-                bytes_total: 0,
-                device,
-            },
-        );
-        let class = finish_with_model(
-            local,
-            &text,
-            runtime.as_ref().map(|item| item as &dyn classify::TextCompleter),
-            unavailable.as_deref(),
-        )?;
-        ready.push(grouped_classification(&path, &text, class));
     }
     Ok(ClassifyResult {
         groups: group_files(ready),
@@ -1564,6 +1502,11 @@ fn commit_schema_assignments(
             let path = PathBuf::from(path_str);
             match read_trajectory_text(&path) {
                 Ok(text) => {
+                    if let Ok(dir) = app.path().app_data_dir() {
+                        if let Err(err) = remember_confirmed_columns(&dir, &text, &class) {
+                            errors.push(format!("{}: could not store the column correction: {err}", path.display()));
+                        }
+                    }
                     let origin = file_origin(origin_from_text(&text, class.header_lines), assigned);
                     match parse_with_classification(&text, &class, origin) {
                         Ok(track) => items.push((file_name(&path), Some(path), track)),
@@ -2481,6 +2424,8 @@ fn mission_info(app: &AppHandle, state: &AppState) -> Result<MissionInfo, String
     })
 }
 
+/// Start the resident server when a GGUF is already installed. Choose files does not call this.
+#[allow(dead_code)]
 fn warm_llama_in_background(app: AppHandle) {
     let Some(state) = app.try_state::<AppState>() else {
         return;
@@ -2554,8 +2499,7 @@ fn sanitize_filename(name: &str) -> String {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    // If the GGUF is already on disk, the resident server starts in the background.
-    // A missing weight is not downloaded until Choose files needs it.
+    // Choose files uses the local scanner. The llama-server code stays in the tree.
     tauri::Builder::default()
         .manage(AppState {
             store: Mutex::new(Store::new()),
@@ -2565,10 +2509,7 @@ pub fn run() {
             wind_anim: Mutex::new(None),
             resolved_wind: Mutex::new(HashMap::new()),
         })
-        .setup(|app| {
-            warm_llama_in_background(app.handle().clone());
-            Ok(())
-        })
+        .setup(|_app| Ok(()))
         .invoke_handler(tauri::generate_handler![
             load_files,
             load_folder,
@@ -2721,19 +2662,29 @@ mod classify_command_tests {
     fn choose_files_reads_headers_without_starting_a_model() {
         let src = include_str!("lib.rs");
         let classify = function_source(src, "fn classify_paths(");
-        assert!(classify.contains("interpret_header"), "{classify}");
-        assert!(classify.contains("finish_with_model"), "{classify}");
+        assert!(classify.contains("load_header_memory"), "{classify}");
+        assert!(classify.contains("interpret_header_with"), "{classify}");
+        let memory_at = classify.find("load_header_memory").expect("stored cells");
+        let scan_at = classify.find("interpret_header_with").expect("local scan");
+        assert!(memory_at < scan_at, "a stored cell is applied before the built-in list");
         assert!(classify.contains("format_detection_label"));
-        let scan = classify.find("interpret_header").expect("local scan");
-        let ensure = classify.find("LlamaRuntime::ensure").expect("resident model");
-        assert!(scan < ensure, "the excerpt scan finishes before the model starts");
-        assert!(classify.contains("attach_running"), "{classify}");
-        assert!(!classify.contains("Err(_) => None"), "a model failure must stay in the review");
-        let ensure_body = function_source(include_str!("classify.rs"), "pub fn ensure(");
+        for absent in [
+            "LlamaRuntime::ensure",
+            "finish_with_model",
+            "ensure_model",
+            "attach_running",
+            "download_to",
+            "reader_needs_model",
+        ] {
+            assert!(!classify.contains(absent), "{absent} must stay off Choose files:\n{classify}");
+        }
+        let classify_src = include_str!("classify.rs");
+        assert!(classify_src.contains("pub fn finish_with_model("), "the model path stays in the tree");
+        assert!(classify_src.contains("pub fn ensure("), "llama-server startup stays in the tree");
+        let ensure_body = function_source(classify_src, "pub fn ensure(");
         let reuse = ensure_body.find("attach_running").expect("reuse a running server");
         let prepare = ensure_body.find("ensure_model").expect("prepare a model");
         assert!(reuse < prepare, "a running server is used before another one is prepared");
-        let classify_src = include_str!("classify.rs");
         let wait_sig = "fn poll_existing(";
         let wait_at = classify_src.find(wait_sig).expect("poll");
         let wait_rest = &classify_src[wait_at..];
@@ -2745,7 +2696,8 @@ mod classify_command_tests {
         assert!(wait.contains("health_ok"), "{wait}");
         assert!(!wait.contains("shutdown"), "{wait}");
         assert!(!wait.contains("gpu_offload_failed"), "{wait}");
-        assert!(!classify.contains("reader_needs_model"));
+        let completion = function_source(classify_src, "pub fn completion_request(");
+        assert!(!completion.contains("\"grammar\""), "{completion}");
         assert_eq!(
             super::format_detection_label("eglin_traj_format_2.traj"),
             "Detecting trajectory file format for eglin_traj_format_2.traj"
@@ -2753,16 +2705,21 @@ mod classify_command_tests {
         let picked = function_source(src, "async fn classify_picked(");
         assert!(picked.contains("spawn_blocking"));
         assert!(!picked.contains("LlamaRuntime::ensure"));
+        assert!(!picked.contains("finish_with_model"));
+        assert!(!picked.contains("download_to"));
         let dialog = function_source(src, "fn load_files(");
         assert!(dialog.contains("pick_trajectory_sources"));
         assert!(!dialog.to_ascii_lowercase().contains("llama"), "{dialog}");
         assert!(!dialog.contains("interpret_header"));
         assert!(!dialog.contains("classify_paths"));
-        let setup = function_source(src, ".setup(|app|");
-        assert!(setup.contains("warm_llama_in_background"), "{setup}");
+        let commit = function_source(src, "fn commit_schema_assignments(");
+        assert!(commit.contains("remember_confirmed_columns"), "{commit}");
+        let setup = function_source(src, ".setup(|");
+        assert!(!setup.contains("warm_llama_in_background"), "{setup}");
         assert!(!setup.contains("download_to"));
         assert!(!setup.contains("GGUF_URL"));
-        let warm = function_source(include_str!("classify.rs"), "pub fn warm_installed_model(");
+        assert!(src.contains("fn warm_llama_in_background("), "startup warmup stays in the tree");
+        let warm = function_source(classify_src, "pub fn warm_installed_model(");
         let guard = warm.find("installed_model").expect("disk check");
         let ensure = warm.find("LlamaRuntime::ensure").expect("start installed server");
         assert!(guard < ensure, "a missing GGUF must return before any download");
