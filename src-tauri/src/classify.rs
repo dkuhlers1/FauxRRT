@@ -1932,14 +1932,14 @@ fn push_flag(args: &mut Vec<String>, flag: &str, value: &str) {
     args.push(value.into());
 }
 
-/// JSON body for one classification. The prompt is the header sample; the grammar stops the
-/// completion at the closing brace so `n_predict` is only a ceiling.
+/// JSON body for one classification. The prompt is the header sample. `n_predict` is only a
+/// ceiling. No GBNF grammar is sent; a reply that is not a JSON object is parsed and rejected
+/// by [`accept_output`], and the local header scan stays in the review.
 pub fn completion_request(system: &str, user: &str) -> Value {
     serde_json::json!({
         "prompt": llama_prompt(system, user),
         "n_predict": CLASSIFY_PREDICT.parse::<u64>().unwrap_or(384),
         "temperature": 0,
-        "grammar": classification_grammar(),
         "cache_prompt": true,
         "stop": ["<|eot_id|>"],
     })
@@ -2663,9 +2663,8 @@ fn session_args(help: &str) -> Vec<String> {
     args
 }
 
-/// The HTTP completion sends [`classification_grammar`] on every request. The JSON schema
-/// converter in llama.cpp can reject this schema and exit with an error string, so it is not
-/// sent. The text stays here as the shape the grammar is enforcing.
+/// Shape of the classification object. It is not sent: llama.cpp can reject this schema and
+/// exit with an error string. [`accept_output`] still accepts only this object.
 #[allow(dead_code)]
 fn classification_schema() -> &'static str {
     JSON_SCHEMA
@@ -2741,19 +2740,6 @@ pub fn run_bounded(mut cmd: Command, timeout: Duration, cancel: &AtomicBool) -> 
     let stdout = stdout_task.join().unwrap_or_default();
     let stderr = stderr_task.join().unwrap_or_default();
     Ok(std::process::Output { status, stdout, stderr })
-}
-
-fn classification_grammar() -> &'static str {
-    r#"root ::= "{" ws "\"header_lines\":" ws number ws "," ws "\"delimiter\":" ws string ws "," ws "\"frames\":" ws frames ws "," ws "\"units\":" ws units ws "," ws "\"columns\":" ws columns ws ("," ws "\"column_units\":" ws columns)? ws "," ws "\"confidence_score\":" ws number ws "," ws "\"unsupported_flag\":" ws boolean ws "," ws "\"reasoning\":" ws string ws "}"
-ws ::= [ \t\n]*
-number ::= "-"? [0-9]+ ("." [0-9]+)?
-boolean ::= "true" | "false"
-string ::= "\"" ([^"\\] | "\\" .)* "\""
-frames ::= "{" ws "\"position\":" ws string (ws "," ws "\"velocity\":" ws string)? (ws "," ws "\"acceleration\":" ws string)? ws "}"
-units ::= "{" ws "\"position\":" ws string (ws "," ws "\"velocity\":" ws string)? (ws "," ws "\"acceleration\":" ws string)? (ws "," ws "\"orientation\":" ws string)? (ws "," ws "\"mass\":" ws string)? ws "}"
-columns ::= "{" ws pair (ws "," ws pair)* ws "}"
-pair ::= string ws ":" ws string
-"#
 }
 
 /// The GGUF already on disk, if any. A missing or partial file is not a download.
@@ -3579,6 +3565,24 @@ mod tests {
     }
 
     #[test]
+    fn a_non_json_reply_keeps_the_local_header_scan() {
+        let text = "time,lat,lon,alt\n0,30.33,-86.59,0\n1,30.34,-86.58,10\n";
+        let local = interpret_header(text);
+        let scripted = Scripted {
+            replies: Mutex::new(vec!["not json".into(), "still not json".into()]),
+            calls: Mutex::new(0),
+        };
+        let class = read_trajectory_format(text, Some(&scripted)).unwrap();
+        assert_eq!(class.header_lines, local.header_lines);
+        assert_eq!(class.delimiter, local.delimiter);
+        assert_eq!(class.columns, local.columns);
+        assert_eq!(column_unit(&class, "pos_lat"), column_unit(&local, "pos_lat"));
+        assert!(class.reasoning.contains("model output was not a JSON object"), "{}", class.reasoning);
+        assert!(class.reasoning.contains("The model did not run."), "{}", class.reasoning);
+        assert_eq!(*scripted.calls.lock().unwrap(), 2);
+    }
+
+    #[test]
     fn accepts_only_the_classification_object() {
         let raw = serde_json::to_string(&sample_ecef()).unwrap();
         let class = accept_output(&raw).unwrap();
@@ -3887,18 +3891,17 @@ mod tests {
     }
 
     #[test]
-    fn completion_request_sends_the_header_sample_and_grammar() {
+    fn completion_request_sends_the_header_sample_without_a_grammar() {
         let excerpt = "time,lat,lon,alt\n0,32.4,-106.4,1000\n";
         let body = completion_request(SYSTEM_PROMPT, &user_message(excerpt));
         assert_eq!(body["n_predict"], 384);
         assert_eq!(body["temperature"], 0);
         assert_eq!(body["cache_prompt"], true);
+        assert!(body.get("grammar").is_none(), "{body}");
         let prompt = body["prompt"].as_str().unwrap();
         assert!(prompt.contains("time,lat,lon,alt"));
         assert!(prompt.contains(excerpt.trim()));
-        let grammar = body["grammar"].as_str().unwrap();
-        assert!(grammar.contains("header_lines"));
-        assert!(grammar.contains("frames"));
+        assert!(!prompt.contains("root ::="));
         assert!(classification_schema().contains("header_lines"));
         assert!(!prompt.contains("131072"));
     }
@@ -4749,7 +4752,8 @@ time.sleep(60)
         let posted = fs::read_to_string(&requests).unwrap();
         assert_eq!(posted.lines().count(), 2, "{posted}");
         assert!(posted.contains("time,lat,lon,alt"));
-        assert!(posted.contains("root ::="), "grammar was not sent: {posted}");
+        assert!(!posted.contains("root ::="), "grammar was sent: {posted}");
+        assert!(!posted.contains("\"grammar\""), "{posted}");
         assert!(posted.contains("\"n_predict\":384") || posted.contains("\"n_predict\": 384"), "{posted}");
         pool.shutdown();
         assert!(pool.current().is_none());
