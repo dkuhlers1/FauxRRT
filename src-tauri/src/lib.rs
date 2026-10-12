@@ -1431,11 +1431,11 @@ fn classify_paths(
         }
     }
     let progress_name = loaded.first().map(|(_, path, _, _)| file_name(path)).unwrap_or_default();
-    let runtime = if loaded.is_empty() {
-        None
+    let (runtime, unavailable) = if loaded.is_empty() {
+        (None, None)
     } else {
-        match app.path().app_data_dir() {
-            Ok(dir) => match LlamaRuntime::ensure(
+        let ensured = match app.path().app_data_dir() {
+            Ok(dir) => LlamaRuntime::ensure(
                 &dir,
                 cancel,
                 &|note| {
@@ -1452,12 +1452,17 @@ fn classify_paths(
                     );
                 },
                 pool,
-            ) {
-                Ok(runtime) => Some(runtime),
-                Err(err) if err == CANCELLED || err.contains(CANCELLED) => return Err(CANCELLED.into()),
-                Err(_) => None,
+            ),
+            Err(dir_err) => match LlamaRuntime::attach_running(pool, cancel) {
+                Ok(Some(runtime)) => Ok(runtime),
+                Ok(None) => Err(format!("could not open the model folder: {dir_err}")),
+                Err(err) => Err(err),
             },
-            Err(_) => None,
+        };
+        match ensured {
+            Ok(runtime) => (Some(runtime), None),
+            Err(err) if err == CANCELLED || err.contains(CANCELLED) => return Err(CANCELLED.into()),
+            Err(err) => (None, Some(err)),
         }
     };
     let mut ready = Vec::new();
@@ -1478,7 +1483,12 @@ fn classify_paths(
                 device,
             },
         );
-        let class = finish_with_model(local, &text, runtime.as_ref().map(|item| item as &dyn classify::TextCompleter))?;
+        let class = finish_with_model(
+            local,
+            &text,
+            runtime.as_ref().map(|item| item as &dyn classify::TextCompleter),
+            unavailable.as_deref(),
+        )?;
         ready.push(grouped_classification(&path, &text, class));
     }
     Ok(ClassifyResult {
@@ -2717,6 +2727,24 @@ mod classify_command_tests {
         let scan = classify.find("interpret_header").expect("local scan");
         let ensure = classify.find("LlamaRuntime::ensure").expect("resident model");
         assert!(scan < ensure, "the excerpt scan finishes before the model starts");
+        assert!(classify.contains("attach_running"), "{classify}");
+        assert!(!classify.contains("Err(_) => None"), "a model failure must stay in the review");
+        let ensure_body = function_source(include_str!("classify.rs"), "pub fn ensure(");
+        let reuse = ensure_body.find("attach_running").expect("reuse a running server");
+        let prepare = ensure_body.find("ensure_model").expect("prepare a model");
+        assert!(reuse < prepare, "a running server is used before another one is prepared");
+        let classify_src = include_str!("classify.rs");
+        let wait_sig = "fn poll_existing(";
+        let wait_at = classify_src.find(wait_sig).expect("poll");
+        let wait_rest = &classify_src[wait_at..];
+        let wait_end = wait_rest[wait_sig.len()..]
+            .find("\n    fn ")
+            .map(|at| wait_sig.len() + at)
+            .expect("poll end");
+        let wait = &wait_rest[..wait_end];
+        assert!(wait.contains("health_ok"), "{wait}");
+        assert!(!wait.contains("shutdown"), "{wait}");
+        assert!(!wait.contains("gpu_offload_failed"), "{wait}");
         assert!(!classify.contains("reader_needs_model"));
         assert_eq!(
             super::format_detection_label("eglin_traj_format_2.traj"),
