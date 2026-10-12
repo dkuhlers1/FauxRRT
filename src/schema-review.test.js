@@ -148,6 +148,10 @@ test("review markup marks header lines and column roles on the file text", () =>
   assert.doesNotMatch(html, /<pre class="schema-rawline">0,1,2,3<\/pre>/);
   assert.match(html, /<pre class="schema-rawline">1,4,5,6<\/pre>/);
   assert.match(html, /data-line-kind="header"/);
+  assert.match(html, /class="schema-line schema-header" data-line-kind="header"/);
+  assert.equal((html.match(/class="schema-tag"/g) || []).length, 1);
+  assert.match(html, /data-role="header-label">header</);
+  assert.doesNotMatch(html, /data-line-kind="(?:header|data)"[^>]*>[\s\S]*?schema-tag/);
   assert.match(html, /data-role="column-marks"/);
   assert.match(html, /data-field="role"/);
   assert.match(html, /data-field="frame"/);
@@ -165,6 +169,21 @@ test("review markup marks header lines and column roles on the file text", () =>
   assert.match(manual, /confidence 0.20 is low/);
   assert.match(manual, /data-act="schema-save"/);
   assert.doesNotMatch(manual, /data-field="position-frame"/);
+  const many = reviewCardHtml(group("many", {
+    classification: { ...group("many").classification, header_lines: 3 },
+    files: [{
+      path: "/data/many.csv",
+      name: "many.csv",
+      excerpt: "# flight\n# units\ntime,lat,lon,alt\n0,1,2,3\n1,4,5,6\n",
+    }],
+  }), 0, 1);
+  assert.equal((many.match(/data-line-kind="header"/g) || []).length, 3);
+  assert.equal((many.match(/class="schema-tag"/g) || []).length, 1);
+  assert.match(many, /data-role="header-label">header</);
+  assert.match(many, /class="schema-line schema-header" data-line-kind="header"/);
+  assert.match(many, /class="schema-line" data-line-kind="data"/);
+  assert.doesNotMatch(many, /data-line-kind="(?:header|data)"[^>]*>[\s\S]*?schema-tag/);
+  assert.match(many, /schema-cell-text">time</);
 });
 
 test("editor requires an origin for a local frame that has none", () => {
@@ -189,6 +208,8 @@ test("editor requires an origin for a local frame that has none", () => {
   assert.match(html, /<pre class="schema-rawline">0,1,2,3<\/pre>/);
   assert.match(html, /Origin latitude/);
   assert.doesNotMatch(html, /Correct this schema/);
+  assert.doesNotMatch(html, /schema-tag/);
+  assert.doesNotMatch(html, /data-role="header-label"/);
   const draft = {
     headerLines: 0,
     delimiter: ",",

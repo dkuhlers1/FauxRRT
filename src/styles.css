@@ -963,6 +963,10 @@ input[type="number"], input[type="text"] {
   margin-right: 8px;
   font-family: "Segoe UI", "IBM Plex Sans", sans-serif;
 }
+.schema-file-scroll > .schema-tag {
+  display: block;
+  margin: 0 0 4px;
+}
 .schema-file-scroll {
   overflow-x: auto;
   max-width: 100%;
