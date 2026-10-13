@@ -162,7 +162,8 @@ function startLayer(viewer) {
   const fieldToken = (field) => {
     if (!field) return "off";
     if (field.kind === "historical") {
-      return `h:${field.date}:${field.hour_utc}:${field.regions.length}:${field.loading ? 1 : 0}:${field.error || ""}`;
+      const station = field.regions?.[0]?.stations?.[0];
+      return `h:${field.date}:${field.hour_utc}:${field.regions.length}:${station?.lat ?? ""}:${station?.lon ?? ""}:${field.loading ? 1 : 0}:${field.error || ""}`;
     }
     if (field.kind === "constant") return `c:${field.u}:${field.v}`;
     return `g:${field.time || ""}:${field.nx || 0}:${field.ny || 0}`;

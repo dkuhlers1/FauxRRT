@@ -11,6 +11,8 @@ import {
   gfsSurfaceBatchUrl,
   gridPointCount,
   gridSpec,
+  historicalBrief,
+  historicalStreaksVisible,
   historicalWindField,
   meteoToUv,
   resolveAnimationField,
@@ -193,6 +195,114 @@ test("a historical profile stays local instead of covering the globe", () => {
   const bounds = field.regions[0].bounds;
   assert.equal(boundsContain(bounds, 28.5, -80.6), true);
   assert.equal(boundsContain(bounds, 50, 10), false);
+});
+
+test("a single historical profile is summarized and still drawn locally", () => {
+  const field = historicalWindField({
+    date: "2024-06-01",
+    hour_utc: 12,
+    source: "GFS 2024-06-01 12Z",
+    regions: [{
+      stations: [{ lat: 32.99, lon: -106.97, east_mps: 5, north_mps: 0 }],
+      profiles: [{
+        lat: 32.99,
+        lon: -106.97,
+        levels: [
+          { alt_m: 10, east_mps: 5, north_mps: 0 },
+          { alt_m: 1500, east_mps: 0, north_mps: -12 },
+          { alt_m: 10000, east_mps: 30, north_mps: 0 },
+        ],
+      }],
+    }],
+  });
+  assert.equal(field.global, false);
+  assert.equal(historicalStreaksVisible(field), true);
+  const out = { u: 0, v: 0, speed: 0, miss: false };
+  sampleWindInto(field, 32.99, -106.97, out);
+  assert.equal(out.miss, false);
+  sampleWindInto(field, 50, 10, out);
+  assert.equal(out.miss, true);
+  const brief = historicalBrief(field);
+  assert.equal(brief.kind, "sounding");
+  assert.match(brief.text, /Single sounding/);
+  assert.match(brief.text, /not a global map/i);
+  assert.match(brief.text, /32\.99°N, 106\.97°W/);
+  assert.match(brief.text, /surface 5 m\/s from 270°/);
+  assert.match(brief.text, /1\.5 km 12 m\/s from 0°/);
+  assert.match(brief.text, /10\.0 km 30 m\/s from 270°/);
+  assert.match(brief.text, /Speed 5–30 m\/s/);
+});
+
+test("historical wind with no sounding explains the empty globe", () => {
+  const field = historicalWindField({
+    date: "2024-06-01",
+    hour_utc: 12,
+    source: "GFS 2024-06-01 12Z",
+    regions: [],
+  });
+  assert.equal(field.global, false);
+  assert.equal(historicalStreaksVisible(field), false);
+  const brief = historicalBrief(field);
+  assert.equal(brief.kind, "none");
+  assert.match(brief.text, /No sounding loaded/);
+  assert.match(brief.text, /not a global map/i);
+  assert.doesNotMatch(brief.text, /everywhere/i);
+});
+
+test("a historical corridor summary names the area and the speed range", () => {
+  const field = historicalWindField({
+    date: "2024-06-01",
+    hour_utc: 18,
+    source: "GFS 2024-06-01 18Z",
+    regions: [{
+      stations: [
+        { lat: 30, lon: -100, east_mps: 8, north_mps: 0 },
+        { lat: 32, lon: -98, east_mps: 14, north_mps: 0 },
+      ],
+      profiles: [
+        {
+          lat: 30,
+          lon: -100,
+          levels: [
+            { alt_m: 10, east_mps: 8, north_mps: 0 },
+            { alt_m: 10000, east_mps: 40, north_mps: 0 },
+          ],
+        },
+        {
+          lat: 32,
+          lon: -98,
+          levels: [
+            { alt_m: 10, east_mps: 14, north_mps: 0 },
+            { alt_m: 10000, east_mps: 20, north_mps: 0 },
+          ],
+        },
+      ],
+    }],
+  });
+  assert.equal(historicalStreaksVisible(field), true);
+  assert.equal(field.global, false);
+  const brief = historicalBrief(field);
+  assert.equal(brief.kind, "corridor");
+  assert.match(brief.text, /Sampled corridor/);
+  assert.match(brief.text, /not a global map/i);
+  assert.match(brief.text, /30\.00°N/);
+  assert.match(brief.text, /32\.00°N/);
+  assert.match(brief.text, /Surface 8–14 m\/s/);
+  assert.match(brief.text, /Speed 8–40 m\/s/);
+});
+
+test("the environment panel shows the historical summary for the selected sounding", () => {
+  const src = fs.readFileSync(new URL("./main.js", import.meta.url), "utf8");
+  const panel = src.slice(src.indexOf("function renderWindPanel"), src.indexOf("function bindWindPanel"));
+  assert.match(panel, /data-role="historical-summary"/);
+  assert.match(panel, /historicalBrief\(/);
+  const queue = src.slice(src.indexOf("function queueGlobeWind"), src.indexOf("function windSpecFromMission"));
+  assert.match(queue, /historicalPreviewSites\(\)/);
+  assert.match(queue, /invoke\("wind_animation_field"/);
+  assert.match(queue, /showHistoricalBrief\(brief\.text\)/);
+  const preview = src.indexOf("function historicalPreviewSites");
+  const startup = src.indexOf('await invoke("open_last_mission")');
+  assert.ok(preview > startup, "preview sites are collected when a sounding is picked, not during module startup");
 });
 
 test("historical coverage crosses the antimeridian the short way", () => {
