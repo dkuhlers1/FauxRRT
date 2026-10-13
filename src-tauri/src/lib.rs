@@ -29,8 +29,8 @@ use simulate::{
     sample_with_internal_velocity, BuiltTrack, DebrisCatalog, FtsSpec, NavFailSpec, SpentStageSpec, StateSample,
 };
 use wind::{
-    historical_resolve_key, prepare_flight_wind, profile_pair, resolve_wind_spec, surface_stations,
-    HistoricalAnimationRegion, WindAnimationField, WindSpec,
+    historical_resolve_key, prepare_flight_wind, preview_pair, profile_pair, resolve_wind_spec,
+    surface_stations, HistoricalAnimationRegion, WindAnimationField, WindPreviewSite, WindSpec,
 };
 use impact::extract_impact;
 use kde::{kde_lonlat, KdeGrid, WeightedPoint};
@@ -2044,7 +2044,7 @@ fn sim_pair(origin: &simulate::SimulateOrigin) -> (f64, f64, f64, f64) {
     (lat, lon, lat, aim_lon)
 }
 
-fn historical_animation_pairs(store: &Store) -> Vec<(f64, f64, f64, f64)> {
+fn historical_animation_pairs(store: &Store, extra: &[(f64, f64, f64, f64)]) -> Vec<(f64, f64, f64, f64)> {
     let mut pairs = Vec::new();
     let mut seen = HashSet::new();
     let mut push = |pair: (f64, f64, f64, f64)| {
@@ -2069,6 +2069,9 @@ fn historical_animation_pairs(store: &Store) -> Vec<(f64, f64, f64, f64)> {
         }
     }
     for obj in store.objects.values() {
+        if let Some(spec) = &obj.generate {
+            push((spec.launch_lat, spec.launch_lon, spec.aim_lat, spec.aim_lon));
+        }
         if let Some(spec) = &obj.rocketpy {
             push(profile_pair(spec.env.latitude, spec.env.longitude));
         }
@@ -2077,6 +2080,9 @@ fn historical_animation_pairs(store: &Store) -> Vec<(f64, f64, f64, f64)> {
         if let Some((_, origin)) = store.simulate_regen_jobs().into_iter().next() {
             push(sim_pair(&origin));
         }
+    }
+    for pair in extra {
+        push(*pair);
     }
     pairs
 }
@@ -2091,11 +2097,25 @@ fn animation_stamp(date: &str, hour_utc: u8, pairs: &[(f64, f64, f64, f64)]) -> 
 }
 
 #[tauri::command]
-fn wind_animation_field(state: State<AppState>) -> Result<WindAnimationField, String> {
+fn wind_animation_field(
+    state: State<AppState>,
+    sites: Option<Vec<WindPreviewSite>>,
+) -> Result<WindAnimationField, String> {
+    let extra: Vec<(f64, f64, f64, f64)> = sites
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|site| {
+            site.lat.is_finite()
+                && site.lon.is_finite()
+                && (-90.0..=90.0).contains(&site.lat)
+                && (-180.0..=180.0).contains(&site.lon)
+        })
+        .map(|site| preview_pair(site.lat, site.lon, site.aim_lat, site.aim_lon))
+        .collect();
     let (wind, pairs) = {
         let store = state.store.lock().map_err(|e| e.to_string())?;
         let pairs = if matches!(store.wind, WindSpec::Historical { .. }) {
-            historical_animation_pairs(&store)
+            historical_animation_pairs(&store, &extra)
         } else {
             Vec::new()
         };
@@ -2163,8 +2183,12 @@ fn wind_animation_field(state: State<AppState>) -> Result<WindAnimationField, St
             }
         }
         let stations = surface_stations(&resolved);
+        let profiles = match &resolved {
+            WindSpec::Historical { profiles, .. } => profiles.clone(),
+            _ => Vec::new(),
+        };
         if !stations.is_empty() {
-            regions.push(HistoricalAnimationRegion { stations });
+            regions.push(HistoricalAnimationRegion { stations, profiles });
         }
     }
     let field = WindAnimationField::Historical {
@@ -2711,12 +2735,38 @@ mod wind_animation_tests {
                 Some(mode),
             )
             .unwrap();
-        let pairs = historical_animation_pairs(&store);
+        let pairs = historical_animation_pairs(&store, &[]);
         assert_eq!(pairs.len(), 1, "{pairs:?}");
         assert!((pairs[0].0 - 32.4).abs() < 1e-9);
         assert!((pairs[0].1 + 106.4).abs() < 1e-9);
         assert!((pairs[0].2 - 34.0).abs() < 1e-9);
         assert!((pairs[0].3 + 99.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn historical_pairs_include_a_selected_profile_before_a_flight() {
+        let mut store = Store::new();
+        let obj = store.create_object("Sounding".into());
+        let spec = GenerateSpec {
+            launch_lat: 28.5,
+            launch_lon: -80.6,
+            launch_alt_m: 0.0,
+            aim_lat: 28.5,
+            aim_lon: -80.2,
+            aim_alt_m: 0.0,
+            ballistic_coeff: 2500.0,
+            burnout_alt_m: 80_000.0,
+            failure_count: 0,
+            wind: WindSpec::Off,
+        };
+        store.set_generate_spec(obj.id, spec).unwrap();
+        assert!(store.tracks.is_empty());
+        let pairs = historical_animation_pairs(&store, &[]);
+        assert_eq!(pairs.len(), 1, "{pairs:?}");
+        assert!((pairs[0].0 - 28.5).abs() < 1e-9);
+        assert!((pairs[0].1 + 80.6).abs() < 1e-9);
+        assert!((pairs[0].2 - 28.5).abs() < 1e-9);
+        assert!((pairs[0].3 + 80.2).abs() < 1e-9);
     }
 }
 

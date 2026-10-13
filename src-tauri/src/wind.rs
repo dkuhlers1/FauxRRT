@@ -92,6 +92,20 @@ pub enum WindAnimationField {
 #[derive(Debug, Clone, Serialize)]
 pub struct HistoricalAnimationRegion {
     pub stations: Vec<SurfaceStation>,
+    /// Full soundings for the Environment summary. Streaks still use `stations`.
+    #[serde(default)]
+    pub profiles: Vec<WindStation>,
+}
+
+/// A launch the user has already picked, before any trajectory is flown.
+#[derive(Debug, Clone, Deserialize)]
+pub struct WindPreviewSite {
+    pub lat: f64,
+    pub lon: f64,
+    #[serde(default)]
+    pub aim_lat: Option<f64>,
+    #[serde(default)]
+    pub aim_lon: Option<f64>,
 }
 
 impl WindAnimationField {
@@ -198,6 +212,20 @@ pub fn enu_to_meteo(east_mps: f64, north_mps: f64) -> (f64, f64) {
 pub fn profile_pair(lat: f64, lon: f64) -> (f64, f64, f64, f64) {
     let aim_lon = if lon <= 179.6 { lon + 0.4 } else { lon - 0.4 };
     (lat, lon, lat, aim_lon)
+}
+
+/// A picked launch with no separate aim stays a single local sounding.
+/// A distinct aim is the corridor trajectories will sample.
+pub fn preview_pair(lat: f64, lon: f64, aim_lat: Option<f64>, aim_lon: Option<f64>) -> (f64, f64, f64, f64) {
+    if let (Some(aim_lat), Some(aim_lon)) = (aim_lat, aim_lon) {
+        if aim_lat.is_finite()
+            && aim_lon.is_finite()
+            && ((aim_lat - lat).abs() > 1e-4 || (aim_lon - lon).abs() > 1e-4)
+        {
+            return (lat, lon, aim_lat, aim_lon);
+        }
+    }
+    profile_pair(lat, lon)
 }
 
 pub fn historical_resolve_key(date: &str, hour_utc: u8, launch_lat: f64, launch_lon: f64, aim_lat: f64, aim_lon: f64) -> String {
@@ -935,6 +963,20 @@ mod tests {
         let prepared = prepare_flight_wind(&surface, 32.4, -106.4).unwrap();
         let (east, _) = wind_enu(&prepared, 32.4, -106.4, 40_000.0);
         assert!((east - 16.0).abs() < 1e-6, "{east}");
+    }
+
+    #[test]
+    fn preview_pair_keeps_one_site_local_and_a_distant_aim_as_a_corridor() {
+        let local = preview_pair(28.5, -80.6, None, None);
+        let sounding = profile_pair(28.5, -80.6);
+        assert_eq!(local, sounding);
+        let same = preview_pair(28.5, -80.6, Some(28.5), Some(-80.6));
+        assert_eq!(same, sounding);
+        let (lat, lon, aim_lat, aim_lon) = preview_pair(30.0, -100.0, Some(32.0), Some(-98.0));
+        assert!((lat - 30.0).abs() < 1e-12);
+        assert!((lon + 100.0).abs() < 1e-12);
+        assert!((aim_lat - 32.0).abs() < 1e-12);
+        assert!((aim_lon + 98.0).abs() < 1e-12);
     }
 
     #[test]

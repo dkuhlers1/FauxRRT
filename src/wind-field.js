@@ -46,6 +46,15 @@ export function gridPointCount(latStep = GFS_GRID_LAT_STEP_DEG, lonStep = GFS_GR
   return spec.lats.length * spec.lons.length;
 }
 
+/** Eastward / northward components → meteorological speed and FROM direction. */
+export function uvToMeteo(east, north) {
+  const speed = Math.hypot(Number(east) || 0, Number(north) || 0);
+  if (speed < 1e-9) return { speed: 0, from: 0 };
+  let from = (Math.atan2(-east, -north) * 180) / Math.PI;
+  if (from < 0) from += 360;
+  return { speed, from };
+}
+
 /** Meteorological FROM direction → eastward (u) and northward (v), m/s. */
 export function meteoToUv(speedMps, fromDeg) {
   const speed = Number.isFinite(speedMps) ? Math.max(0, speedMps) : 0;
@@ -292,7 +301,7 @@ function historicalLegend(spec, regions) {
     return {
       title: "Historical wind",
       meta: `${when} UTC`,
-      source: "No sampled corridor yet. Streaks appear where trajectories use this wind.",
+      source: "No sounding loaded. Not a global map.",
     };
   }
   const local = regions.every((region) => regionSpanDeg(region) < 1);
@@ -303,6 +312,14 @@ function historicalLegend(spec, regions) {
   return { title: "Historical wind", meta: `${where} · ${when} UTC`, source: src };
 }
 
+function profileLevels(profile) {
+  return (profile?.levels || []).map((level) => ({
+    alt_m: Number(level.alt_m),
+    east: Number(level.east_mps ?? level.east),
+    north: Number(level.north_mps ?? level.north),
+  })).filter((level) => Number.isFinite(level.alt_m) && Number.isFinite(level.east) && Number.isFinite(level.north));
+}
+
 export function historicalWindField(spec = {}) {
   const regions = (spec.regions || []).map((region) => {
     const stations = (region.stations || []).map((station) => ({
@@ -311,7 +328,12 @@ export function historicalWindField(spec = {}) {
       east: Number(station.east_mps ?? station.east),
       north: Number(station.north_mps ?? station.north),
     })).filter((station) => Number.isFinite(station.lat) && Number.isFinite(station.lon) && Number.isFinite(station.east) && Number.isFinite(station.north));
-    return { stations, bounds: boundsFromStations(stations) };
+    const profiles = (region.profiles || []).map((profile) => ({
+      lat: Number(profile.lat),
+      lon: Number(profile.lon),
+      levels: profileLevels(profile),
+    })).filter((profile) => Number.isFinite(profile.lat) && Number.isFinite(profile.lon) && profile.levels.length);
+    return { stations, profiles, bounds: boundsFromStations(stations) };
   }).filter((region) => region.stations.length && region.bounds);
   return {
     kind: "historical",
@@ -324,6 +346,155 @@ export function historicalWindField(spec = {}) {
     error: spec.error || "",
     legend: historicalLegend(spec, regions),
   };
+}
+
+function fmtLat(lat) {
+  const n = Math.abs(lat).toFixed(2);
+  return `${n}°${lat >= 0 ? "N" : "S"}`;
+}
+
+function fmtLon(lon) {
+  const n = Math.abs(lon).toFixed(2);
+  return `${n}°${lon >= 0 ? "E" : "W"}`;
+}
+
+function fmtAlt(alt) {
+  if (alt < 200) return "surface";
+  return `${(alt / 1000).toFixed(1)} km`;
+}
+
+function windPhrase(level) {
+  const { speed, from } = uvToMeteo(level.east, level.north);
+  return `${fmtAlt(level.alt_m)} ${trimNum(speed)} m/s from ${Math.round(from)}°`;
+}
+
+function speedSpan(levels) {
+  const speeds = levels.map((level) => uvToMeteo(level.east, level.north).speed);
+  const min = Math.min(...speeds);
+  const max = Math.max(...speeds);
+  if (!Number.isFinite(min)) return "";
+  if (Math.abs(max - min) < 0.5) return `${trimNum(max)} m/s`;
+  return `${trimNum(min)}–${trimNum(max)} m/s`;
+}
+
+function notableLevels(levels) {
+  const sorted = [...levels].sort((a, b) => a.alt_m - b.alt_m);
+  if (!sorted.length) return [];
+  const targets = [sorted[0].alt_m, 1500, 5500, 10000, sorted[sorted.length - 1].alt_m];
+  const used = new Set();
+  const picked = [];
+  for (const target of targets) {
+    let best = 0;
+    let bestD = Infinity;
+    sorted.forEach((level, index) => {
+      const dist = Math.abs(level.alt_m - target);
+      if (dist < bestD) {
+        bestD = dist;
+        best = index;
+      }
+    });
+    const isEnd = target === sorted[0].alt_m || target === sorted[sorted.length - 1].alt_m;
+    if (!isEnd && bestD > 1800) continue;
+    if (used.has(best)) continue;
+    used.add(best);
+    picked.push(sorted[best]);
+  }
+  return picked;
+}
+
+function collectedProfiles(field) {
+  const profiles = [];
+  for (const region of field.regions || []) {
+    if (region.profiles?.length) {
+      profiles.push(...region.profiles);
+      continue;
+    }
+    for (const station of region.stations || []) {
+      profiles.push({
+        lat: station.lat,
+        lon: station.lon,
+        levels: [{ alt_m: 0, east: station.east, north: station.north }],
+      });
+    }
+  }
+  return profiles;
+}
+
+function coverageKind(field) {
+  const regions = field.regions || [];
+  if (!regions.length) return "none";
+  const span = Math.max(...regions.map((region) => regionSpanDeg(region)));
+  if (regions.length === 1 && span < 1) return "sounding";
+  return "corridor";
+}
+
+function areaText(profiles, kind) {
+  const lats = profiles.map((profile) => profile.lat);
+  const lons = profiles.map((profile) => profile.lon);
+  const minLat = Math.min(...lats);
+  const maxLat = Math.max(...lats);
+  const minLon = Math.min(...lons);
+  const maxLon = Math.max(...lons);
+  if (kind === "sounding" || profiles.length === 1 || maxLat - minLat < 1 && maxLon - minLon < 1) {
+    const midLat = (minLat + maxLat) / 2;
+    const midLon = (minLon + maxLon) / 2;
+    return `at ${fmtLat(midLat)}, ${fmtLon(midLon)}`;
+  }
+  if (maxLon - minLon > 180) return "across the dateline";
+  return `over ${fmtLat(minLat)}–${fmtLat(maxLat)}, ${fmtLon(minLon)}–${fmtLon(maxLon)}`;
+}
+
+/**
+ * Short Environment summary for the selected historical wind.
+ * A single profile is named as a sounding. An empty selection says why the
+ * globe has no streaks instead of pretending the field is global.
+ */
+export function historicalBrief(spec = {}) {
+  const prepared = spec.kind === "historical" && spec.regions?.[0]?.bounds
+    ? spec
+    : historicalWindField(spec);
+  const hour = String(prepared.hour_utc ?? spec.hour_utc ?? 0).padStart(2, "0");
+  const when = `${prepared.date || spec.date || "historical"} ${hour}Z`;
+  const source = prepared.source || spec.source || `GFS ${when}`;
+  if (prepared.loading || spec.loading) {
+    return { kind: "loading", text: `Loading ${source} ${when}…` };
+  }
+  if (prepared.error || spec.error) {
+    return { kind: "error", text: String(prepared.error || spec.error) };
+  }
+  const kind = coverageKind(prepared);
+  if (kind === "none") {
+    return {
+      kind: "none",
+      text: `${source} ${when}. No sounding loaded. Historical wind is not a global map — pick a launch site or corridor and streaks cover that area only.`,
+    };
+  }
+  const profiles = collectedProfiles(prepared);
+  const levels = profiles.flatMap((profile) => profile.levels);
+  const alts = levels.map((level) => level.alt_m);
+  const low = Math.min(...alts);
+  const high = Math.max(...alts);
+  const height = low === high ? fmtAlt(low) : `${fmtAlt(low)} to ${fmtAlt(high)}`;
+  const where = areaText(profiles, kind);
+  const speed = speedSpan(levels);
+  if (kind === "sounding") {
+    const notes = notableLevels(levels).map(windPhrase).join(". ");
+    return {
+      kind: "sounding",
+      text: `Single sounding · ${source} ${where}, ${height}. Not a global map. ${notes}. Speed ${speed}.`,
+    };
+  }
+  const surface = levels.filter((level) => level.alt_m < 200);
+  const surfaceNote = surface.length ? `Surface ${speedSpan(surface)}. ` : "";
+  return {
+    kind: "corridor",
+    text: `Sampled corridor · ${source} ${where}, ${height}. Not a global map. ${surfaceNote}Speed ${speed}.`,
+  };
+}
+
+/** Streaks draw on a loaded profile or corridor. An empty historical field stays blank. */
+export function historicalStreaksVisible(field) {
+  return Boolean(field && field.kind === "historical" && !field.loading && !field.error && field.regions?.length);
 }
 
 export function resolveAnimationField(request, signal) {

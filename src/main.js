@@ -39,7 +39,7 @@ import {
   setVisible,
 } from "./globe.js";
 import { enrichBoat, parseBoatKml, scoreBoatsAgainstGrid } from "./boats-kml.js";
-import { peekGfsSurfaceField } from "./wind-field.js";
+import { historicalBrief, peekGfsSurfaceField } from "./wind-field.js";
 import {
   acceptGroup,
   applyEditorDraft,
@@ -93,6 +93,7 @@ let missionWind = {
   hour_utc: 12,
   source: "",
   time: "",
+  brief: "",
 };
 // Initialized before the top-level mission load. That await calls
 // applySnapshot / refreshRisk, which reach queueGlobeWind while later
@@ -2214,6 +2215,7 @@ function paintRocketPyOverlay() {
       if (path === "env.latitude" || path === "env.longitude" || path === "env.elevation_m") {
         refreshSiteMarkers();
         syncRocketPyLaunchFields();
+        queueHistoricalSite();
       }
     };
     input.addEventListener("input", apply);
@@ -2233,9 +2235,11 @@ function paintRocketPyOverlay() {
     rocketpyDrafts.set(rocketpyOpenId, defaultRocketPySpec());
     paintRocketPyOverlay();
     render();
+    queueHistoricalSite();
   });
   overlay.querySelector("[data-act='rp-sounding']")?.addEventListener("click", () => {
     rocketpyDrafts.set(rocketpyOpenId, soundingRocketPySpec());
+    queueHistoricalSite();
     paintRocketPyOverlay();
     render();
   });
@@ -2292,6 +2296,7 @@ function openRocketPyBuilder(objectId) {
   objectMethod.set(objectId, "generate");
   rocketpyDraftFor(obj);
   rocketpyOpenId = objectId;
+  queueHistoricalSite();
   rocketpyTab = "env";
   expandedObjectId = objectId;
   if (els.rocketpyOverlay) {
@@ -2314,8 +2319,59 @@ function closeRocketPyBuilder(opts = {}) {
   if (opts.render !== false) render();
 }
 
+function finiteCoord(value) {
+  if (value === "" || value == null) return null;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+function historicalPreviewSites() {
+  const sites = [];
+  const push = (lat, lon, aimLat, aimLon) => {
+    const siteLat = finiteCoord(lat);
+    const siteLon = finiteCoord(lon);
+    if (siteLat == null || siteLon == null) return;
+    const site = { lat: siteLat, lon: siteLon };
+    const aimSiteLat = finiteCoord(aimLat);
+    const aimSiteLon = finiteCoord(aimLon);
+    if (aimSiteLat != null && aimSiteLon != null) {
+      site.aim_lat = aimSiteLat;
+      site.aim_lon = aimSiteLon;
+    }
+    sites.push(site);
+  };
+  for (const obj of riskModel.objects || []) {
+    const g = obj.generate || {};
+    push(g.launch_lat, g.launch_lon, g.aim_lat, g.aim_lon);
+    const env = obj.rocketpy?.env;
+    if (env) push(env.latitude, env.longitude);
+  }
+  for (const draft of generateDrafts.values()) {
+    push(draft.launch_lat, draft.launch_lon, draft.aim_lat, draft.aim_lon);
+  }
+  for (const draft of rocketpyDrafts.values()) {
+    push(draft.env?.latitude, draft.env?.longitude);
+  }
+  return sites;
+}
+
+let historicalSiteTimer = 0;
+
+function queueHistoricalSite() {
+  if (missionWind.type !== "historical") return;
+  clearTimeout(historicalSiteTimer);
+  historicalSiteTimer = setTimeout(() => queueGlobeWind(), 400);
+}
+
+function showHistoricalBrief(text) {
+  missionWind.brief = text;
+  const slot = document.querySelector("[data-role='historical-summary']");
+  if (slot) slot.textContent = text;
+}
+
 function globeWindStamp() {
   const w = missionWind;
+  const picked = historicalPreviewSites().map((site) => [site.lat, site.lon, site.aim_lat ?? "", site.aim_lon ?? ""].join(",")).join(";");
   const sites = (riskModel.objects || []).map((obj) => {
     const g = obj.generate || {};
     const env = obj.rocketpy?.env || {};
@@ -2341,6 +2397,7 @@ function globeWindStamp() {
     w.time,
     grid,
     sites,
+    picked,
     (riskModel.unassigned || []).length,
   ].join("|");
 }
@@ -2377,6 +2434,14 @@ function queueGlobeWind() {
     });
     return;
   }
+  const loading = historicalBrief({
+    type: "historical",
+    loading: true,
+    date: missionWind.date,
+    hour_utc: missionWind.hour_utc,
+    source: missionWind.source,
+  });
+  showHistoricalBrief(loading.text);
   setMissionWindAnimation({
     type: "historical",
     loading: true,
@@ -2384,13 +2449,24 @@ function queueGlobeWind() {
     hour_utc: missionWind.hour_utc,
     source: missionWind.source,
   });
-  invoke("wind_animation_field").then((field) => {
+  const sites = historicalPreviewSites();
+  invoke("wind_animation_field", ipcArgs({ sites })).then((field) => {
     if (windRequestStamp !== stamp || missionWind.type !== "historical") return;
     windShownStamp = stamp;
+    const brief = historicalBrief(field || { type: "historical" });
+    showHistoricalBrief(brief.text);
+    if (field?.source) missionWind.source = field.source;
     setMissionWindAnimation(field || { type: "off" });
   }).catch((err) => {
     if (windRequestStamp !== stamp || missionWind.type !== "historical") return;
     windRequestStamp = "";
+    const brief = historicalBrief({
+      type: "historical",
+      date: missionWind.date,
+      hour_utc: missionWind.hour_utc,
+      error: String(err),
+    });
+    showHistoricalBrief(brief.text);
     setMissionWindAnimation({
       type: "historical",
       date: missionWind.date,
@@ -2495,13 +2571,19 @@ function renderWindPanel() {
       const selected = Number(missionWind.hour_utc) === h ? " selected" : "";
       return `<option value="${h}"${selected}>${String(h).padStart(2, "0")}Z</option>`;
     }).join("");
-    const src = missionWind.source
-      ? `<div class="muted wind-hint">${escapeHtml(missionWind.source)} · changing date or hour regenerates generated trajectories</div>`
-      : `<div class="muted wind-hint">GFS pressure-level winds (from 2021). Changing date or hour regenerates generated trajectories.</div>`;
+    const summary = missionWind.brief || historicalBrief({
+      type: "historical",
+      date: missionWind.date || defaultWindDate(),
+      hour_utc: missionWind.hour_utc,
+      source: missionWind.source,
+      regions: [],
+    }).text;
     els.windFields.innerHTML = `<div class="gen-grid">
       <label>Date UTC <input type="date" data-mw="date" value="${escapeHtml(missionWind.date || defaultWindDate())}" /></label>
       <label>Hour <select data-mw="hour_utc">${hours}</select></label>
-    </div>${src}`;
+    </div>
+    <div class="muted wind-hint" data-role="historical-summary">${escapeHtml(summary)}</div>
+    <div class="muted wind-hint">Changing the date or hour reloads this sounding and regenerates generated trajectories.</div>`;
   } else if (missionWind.type === "surface") {
     const when = missionWind.time
       ? `${escapeHtml(String(missionWind.time).replace("T", " "))} UTC`
@@ -3128,6 +3210,7 @@ function fillBallisticGenerate(body, obj, destLabel) {
       if (/^(launch_|aim_)/.test(key)) {
         refreshSiteMarkers();
         syncGenerateSiteFields(obj.id);
+        queueHistoricalSite();
       }
     };
     input.addEventListener("input", apply);
@@ -3246,6 +3329,7 @@ function applySiteLla(objectId, kind, lla, opts = {}) {
     }
     syncRocketPyLaunchFields();
     refreshSiteMarkers();
+    queueHistoricalSite();
     return;
   }
   const obj = riskModel.objects.find((o) => o.id === objectId);
@@ -3264,6 +3348,7 @@ function applySiteLla(objectId, kind, lla, opts = {}) {
   }
   syncGenerateSiteFields(objectId);
   refreshSiteMarkers();
+  queueHistoricalSite();
 }
 
 function onGlobeSiteChange({ kind, lat, lon, alt }) {
