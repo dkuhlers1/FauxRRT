@@ -1,7 +1,8 @@
 //! Local schema classification for trajectory text files.
 //!
-//! The model is Meta Llama 3.1 8B Instruct, quantized GGUF, served by one resident
+//! Format detection uses Llama 3.2 3B Instruct, quantized GGUF, served by one resident
 //! llama-server process. Weights are downloaded on first use and are not part of the repository.
+//! The Llama 3.1 8B filename stays in the tree and is not downloaded or started.
 
 use std::cell::Cell;
 use std::collections::BTreeMap;
@@ -25,9 +26,23 @@ use crate::schema::{
 pub const LOW_CONFIDENCE: f64 = 0.6;
 pub const EXCERPT_LINES: usize = 40;
 
+/// Llama 3.1 8B Instruct. Left in the tree. Format detection does not download or start this file.
 pub const GGUF_FILENAME: &str = "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf";
 pub const GGUF_URL: &str = "https://huggingface.co/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF/resolve/main/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf";
 const GGUF_MIN_BYTES: u64 = 4_500_000_000;
+
+/// There is no Llama 3.1 3B. Format detection uses Llama 3.2 3B Instruct, Q4_K_M, from bartowski.
+pub const DETECT_MODEL_ID: &str = "Llama-3.2-3B-Instruct-Q4_K_M";
+pub const DETECT_GGUF_FILENAME: &str = "Llama-3.2-3B-Instruct-Q4_K_M.gguf";
+pub const DETECT_GGUF_URL: &str =
+    "https://huggingface.co/bartowski/Llama-3.2-3B-Instruct-GGUF/resolve/main/Llama-3.2-3B-Instruct-Q4_K_M.gguf";
+/// Q4_K_M is about 2.02 GB. A shorter file is a partial download.
+const DETECT_GGUF_MIN_BYTES: u64 = 1_800_000_000;
+
+/// The 8B weights stay named here so they can be turned back on. Detection does not use them.
+pub fn legacy_gguf() -> (&'static str, &'static str, u64) {
+    (GGUF_FILENAME, GGUF_URL, GGUF_MIN_BYTES)
+}
 
 const LLAMA_TAG: &str = "b11538";
 const LLAMA_RELEASE: &str = "https://github.com/ggml-org/llama.cpp/releases/download/b11538";
@@ -1292,19 +1307,39 @@ pub fn read_trajectory_format(text: &str, model: Option<&dyn TextCompleter>) -> 
     finish_with_model(local, text, model, None)
 }
 
+/// A column the local scan and stored cell names left blank. That is what starts the 3B.
+pub fn has_unset_column(class: &TrajectoryClassification) -> bool {
+    class.columns.values().any(|role| role.trim().is_empty())
+}
+
 pub fn finish_with_model(
     local: TrajectoryClassification,
     text: &str,
     model: Option<&dyn TextCompleter>,
     unavailable: Option<&str>,
 ) -> Result<TrajectoryClassification, String> {
+    finish_unset_columns(local, text, model, unavailable, &HeaderMemory::default())
+}
+
+/// Known columns stay as the local scan read them, including a stored cell. The model
+/// fills only columns that are still unset. A header with no unset column does not call it.
+pub(crate) fn finish_unset_columns(
+    local: TrajectoryClassification,
+    text: &str,
+    model: Option<&dyn TextCompleter>,
+    unavailable: Option<&str>,
+    memory: &HeaderMemory,
+) -> Result<TrajectoryClassification, String> {
+    if !has_unset_column(&local) {
+        return Ok(local);
+    }
     let Some(model) = model else {
         let mut local = local;
         note_model_did_not_run(&mut local, unavailable);
         return Ok(local);
     };
     match classify_with(model, &excerpt_of(text)) {
-        Ok(model_class) => Ok(classification_from_scan(&scan_header(text), Some(&model_class), &HeaderMemory::default())),
+        Ok(model_class) => Ok(classification_from_scan(&scan_header_with(text, memory), Some(&model_class), memory)),
         Err(err) if err == CANCELLED || err.contains(CANCELLED) => Err(err),
         Err(err) => {
             let mut local = local;
@@ -1340,10 +1375,6 @@ struct HeaderScan {
     data_width: usize,
     data_delim: Delimiter,
     header_lines: u32,
-}
-
-fn scan_header(text: &str) -> HeaderScan {
-    scan_header_with(text, &HeaderMemory::default())
 }
 
 fn scan_header_with(text: &str, memory: &HeaderMemory) -> HeaderScan {
@@ -1943,10 +1974,10 @@ pub fn device_message(backend: GpuBackend, layers: u32, fell_back: bool) -> Stri
     }
 }
 
-/// Prompt plus 20–50 excerpt lines. Llama 3.1's native 131072 context is about 16 GB of KV cache,
-/// which is the whole machine on a 16 GB Windows laptop. The process then prints an allocation
-/// error and no classification JSON.
-pub const CLASSIFY_CONTEXT: &str = "2048";
+/// Prompt plus the excerpt. The classification prompt is about 3000 tokens, so a 2048 context
+/// rejects the request before the model replies. 4096 holds that prompt and the 384-token reply.
+/// Llama 3.2's native 131072 context is still far too much KV cache for a 16 GB machine.
+pub const CLASSIFY_CONTEXT: &str = "4096";
 /// The classification object is a few hundred tokens. A long generation is prose, not a schema.
 pub const CLASSIFY_PREDICT: &str = "384";
 
@@ -1989,7 +2020,7 @@ pub fn backend_after_init(preferred: GpuBackend, init_ok: bool) -> (GpuBackend, 
     }
 }
 
-/// mmap the GGUF and keep the context at 2048. Never mlock and never disable mmap.
+/// mmap the GGUF and keep the context at 4096. Never mlock and never disable mmap.
 ///
 /// `--fit` defaults to on and sizes unset context up to the trained length. `--fit-ctx` is the
 /// smallest context that fit may use, not a maximum. Leaving fit on lets a 16 GB machine try to
@@ -2036,7 +2067,7 @@ pub fn offload_args_with(backend: GpuBackend, help: &str, free_mib: Option<u64>)
     vec!["-ngl".into(), gpu_layers(backend, free_mib).to_string()]
 }
 
-/// Arguments for one long-lived `llama-server`. Context stays 2048 and `--fit off` so the KV
+/// Arguments for one long-lived `llama-server`. Context stays 4096 and `--fit off` so the KV
 /// cache cannot grow toward the model's 131072-token default. `-ngl` is never `auto` and never
 /// zero on CUDA: that is the flag that copies the GGUF layers into GPU memory.
 /// `--device CUDA0` pins those layers to the NVIDIA device instead of leaving them on CPU.
@@ -2885,8 +2916,8 @@ pub fn installed_model(data_dir: &Path) -> Option<PathBuf> {
         let path = PathBuf::from(path);
         return path.is_file().then_some(path);
     }
-    let dest = data_dir.join("models").join(GGUF_FILENAME);
-    let ready = dest.is_file() && fs::metadata(&dest).map(|meta| meta.len() >= GGUF_MIN_BYTES).unwrap_or(false);
+    let dest = data_dir.join("models").join(DETECT_GGUF_FILENAME);
+    let ready = dest.is_file() && fs::metadata(&dest).map(|meta| meta.len() >= DETECT_GGUF_MIN_BYTES).unwrap_or(false);
     ready.then_some(dest)
 }
 
@@ -2916,15 +2947,15 @@ pub fn ensure_model(
         }
         return Err(format!("FAUXRRT_LLAMA_MODEL is not a file: {}", path.display()));
     }
-    let dest = data_dir.join("models").join(GGUF_FILENAME);
-    if dest.is_file() && fs::metadata(&dest).map(|m| m.len() >= GGUF_MIN_BYTES).unwrap_or(false) {
+    let dest = data_dir.join("models").join(DETECT_GGUF_FILENAME);
+    if dest.is_file() && fs::metadata(&dest).map(|m| m.len() >= DETECT_GGUF_MIN_BYTES).unwrap_or(false) {
         return Ok(dest);
     }
     fs::create_dir_all(dest.parent().unwrap()).map_err(|e| e.to_string())?;
     let device = device_name(backend);
-    download_to(GGUF_URL, &dest, cancel, &|status, bytes, total| {
+    download_to(DETECT_GGUF_URL, &dest, cancel, &|status, bytes, total| {
         let label = if status.is_empty() {
-            "Downloading Llama 3.1 8B Instruct"
+            "Downloading Llama 3.2 3B Instruct"
         } else {
             status
         };
@@ -2932,7 +2963,7 @@ pub fn ensure_model(
     })
     .map_err(|err| {
         format!(
-            "{err}. Llama-3.1-8B-Instruct Q4_K_M can also be placed at {}. Source: {GGUF_URL}",
+            "{err}. {DETECT_MODEL_ID} can also be placed at {}. Source: {DETECT_GGUF_URL}",
             dest.display()
         )
     })?;
@@ -3313,7 +3344,7 @@ fn expects_gguf(dest: &Path) -> bool {
 
 fn already_complete(dest: &Path) -> bool {
     let len = file_len(dest);
-    len > 0 && (!expects_gguf(dest) || len >= GGUF_MIN_BYTES)
+    len > 0 && (!expects_gguf(dest) || len >= DETECT_GGUF_MIN_BYTES)
 }
 
 pub fn retryable_download_error(err: &str) -> bool {
@@ -3487,9 +3518,9 @@ fn download_once(
     } else {
         (false, content_length)
     };
-    if expects_gguf(dest) && total > 0 && total < GGUF_MIN_BYTES {
+    if expects_gguf(dest) && total > 0 && total < DETECT_GGUF_MIN_BYTES {
         return Err(format!(
-            "download {url} failed: file is {total} bytes, smaller than Llama-3.1-8B-Instruct Q4_K_M"
+            "download {url} failed: file is {total} bytes, smaller than {DETECT_MODEL_ID}"
         ));
     }
     let mut file = if append {
@@ -3518,9 +3549,9 @@ fn download_once(
     if total > 0 && end < total {
         return Err(format!("download {url} failed: connection closed before the file finished"));
     }
-    if expects_gguf(dest) && end < GGUF_MIN_BYTES {
+    if expects_gguf(dest) && end < DETECT_GGUF_MIN_BYTES {
         return Err(format!(
-            "download {url} failed: connection closed before Llama-3.1-8B-Instruct Q4_K_M finished"
+            "download {url} failed: connection closed before {DETECT_MODEL_ID} finished"
         ));
     }
     file.sync_all().ok();
@@ -3683,8 +3714,17 @@ mod tests {
         assert!(!SYSTEM_PROMPT.contains("\"coordinate_system\""));
         assert!(GGUF_URL.contains("Llama-3.1-8B-Instruct"));
         assert!(GGUF_FILENAME.contains("Q4_K_M"));
-        assert!(!GGUF_URL.to_ascii_lowercase().contains("mistral"));
-        assert!(!GGUF_URL.to_ascii_lowercase().contains("nemo"));
+        assert_eq!(DETECT_MODEL_ID, "Llama-3.2-3B-Instruct-Q4_K_M");
+        assert!(DETECT_GGUF_FILENAME.starts_with(DETECT_MODEL_ID));
+        assert!(DETECT_GGUF_URL.contains("huggingface.co/bartowski/Llama-3.2-3B-Instruct-GGUF"));
+        assert!(DETECT_GGUF_URL.ends_with("/Llama-3.2-3B-Instruct-Q4_K_M.gguf"));
+        assert!(!DETECT_GGUF_URL.contains("Llama-3.1-8B"));
+        assert!(!DETECT_GGUF_URL.to_ascii_lowercase().contains("mistral"));
+        assert!(!DETECT_GGUF_URL.to_ascii_lowercase().contains("nemo"));
+        let (legacy_name, legacy_url, legacy_min) = legacy_gguf();
+        assert_eq!(legacy_name, GGUF_FILENAME);
+        assert_eq!(legacy_url, GGUF_URL);
+        assert!(legacy_min > DETECT_GGUF_MIN_BYTES);
     }
 
     #[test]
@@ -3703,8 +3743,10 @@ mod tests {
 
     #[test]
     fn a_non_json_reply_keeps_the_local_header_scan() {
-        let text = "time,lat,lon,alt\n0,30.33,-86.59,0\n1,30.34,-86.58,10\n";
+        let text = "time,lat,lon,alt,widget\n0,30.33,-86.59,0,1\n1,30.34,-86.58,10,2\n";
         let local = interpret_header(text);
+        assert!(has_unset_column(&local));
+        assert_eq!(local.columns.get("col_4").map(String::as_str), Some(""));
         let scripted = Scripted {
             replies: Mutex::new(vec!["not json".into(), "still not json".into()]),
             calls: Mutex::new(0),
@@ -3976,7 +4018,7 @@ mod tests {
         let help = "usage -c N --mmap --fit [on|off] -b N -ngl N --host --port -np N";
         let cuda = server_args(GpuBackend::Cuda, help, Path::new("model.gguf"), 8081, None);
         assert!(cuda.windows(2).any(|pair| pair == ["-m", "model.gguf"]), "{cuda:?}");
-        assert!(cuda.windows(2).any(|pair| pair == ["-c", "2048"]), "{cuda:?}");
+        assert!(cuda.windows(2).any(|pair| pair == ["-c", "4096"]), "{cuda:?}");
         assert!(cuda.windows(2).any(|pair| pair == ["--fit", "off"]), "{cuda:?}");
         assert!(cuda.windows(2).any(|pair| pair == ["-ngl", "33"]), "{cuda:?}");
         assert!(cuda.windows(2).any(|pair| pair == ["--host", "127.0.0.1"]), "{cuda:?}");
@@ -3986,12 +4028,12 @@ mod tests {
         assert!(vulkan.windows(2).any(|pair| pair == ["-ngl", "33"]), "{vulkan:?}");
         let cpu = server_args(GpuBackend::Cpu, help, Path::new("model.gguf"), 9, Some(16_000));
         assert!(cpu.windows(2).any(|pair| pair == ["-ngl", "0"]), "{cpu:?}");
-        assert!(cpu.windows(2).any(|pair| pair == ["-c", "2048"]), "{cpu:?}");
+        assert!(cpu.windows(2).any(|pair| pair == ["-c", "4096"]), "{cpu:?}");
         assert!(!cpu.iter().any(|arg| arg == "CUDA0"), "{cpu:?}");
         let pinned = server_args(GpuBackend::Cuda, "", Path::new("model.gguf"), 8081, None);
         assert_eq!(
             pinned,
-            ["-m", "model.gguf", "-c", "2048", "--fit", "off", "-ngl", "33", "--device", "CUDA0", "--host", "127.0.0.1", "--port", "8081"]
+            ["-m", "model.gguf", "-c", "4096", "--fit", "off", "-ngl", "33", "--device", "CUDA0", "--host", "127.0.0.1", "--port", "8081"]
                 .into_iter()
                 .map(str::to_string)
                 .collect::<Vec<_>>()
@@ -4047,7 +4089,7 @@ mod tests {
     fn llama_context_is_small_and_weights_stay_mmapd() {
         let help = "usage -c --ctx-size N --mmap --no-mmap --load-mode --fit --fit-ctx N -b --batch-size N --json-schema-file F --grammar-file F";
         let args = memory_args(help);
-        assert!(args.windows(2).any(|pair| pair == ["-c", "2048"]), "{args:?}");
+        assert!(args.windows(2).any(|pair| pair == ["-c", "4096"]), "{args:?}");
         assert!(args.windows(2).any(|pair| pair == ["--load-mode", "mmap"]), "{args:?}");
         assert!(args.windows(2).any(|pair| pair == ["--fit", "off"]), "{args:?}");
         assert!(args.windows(2).any(|pair| pair == ["-b", "512"]), "{args:?}");
@@ -4288,31 +4330,34 @@ s,rad,rad,m
             calls: Mutex::new(0),
         };
         let kept2 = read_trajectory_format(&format2, Some(&contradict)).unwrap();
-        assert_eq!(*contradict.calls.lock().unwrap(), 1);
+        assert_eq!(*contradict.calls.lock().unwrap(), 0, "a known header does not call the model");
         assert_eq!(kept2.header_lines, 3);
         assert_eq!(kept2.delimiter, "whitespace");
         assert_eq!(column_unit(&kept2, "pos_lat"), "rad");
         assert_eq!(column_unit(&kept2, "pos_lon"), "rad");
         assert!(!kept2.reasoning.contains("The model did not run."));
         let kept1 = read_trajectory_format(&format1, Some(&contradict)).unwrap();
+        assert_eq!(*contradict.calls.lock().unwrap(), 0);
         assert_eq!(column_unit(&kept1, "pos_lat"), "deg");
         assert_eq!(column_unit(&kept1, "pos_lon"), "deg");
         assert_eq!(kept1.header_lines, 2);
 
+        let fallback = read_trajectory_format(&format2, None).unwrap();
+        assert!(!fallback.reasoning.contains("The model did not run."), "{}", fallback.reasoning);
+        assert_eq!(column_unit(&fallback, "pos_lat"), "rad");
+        let unset = "time, lat(rad), alt_out, lon(rad), widget\n0, 0.53, 10, -1.51, 1\n1, 0.54, 12, -1.50, 2\n";
         let offline = Scripted {
             replies: Mutex::new(Vec::new()),
             calls: Mutex::new(0),
         };
-        let fallback = read_trajectory_format(&format2, None).unwrap();
-        assert!(fallback.reasoning.contains("The model did not run."), "{}", fallback.reasoning);
-        assert_eq!(column_unit(&fallback, "pos_lat"), "rad");
-        let failed = read_trajectory_format(&format2, Some(&offline)).unwrap();
+        let failed = read_trajectory_format(unset, Some(&offline)).unwrap();
         assert!(failed.reasoning.contains("no scripted reply"), "{}", failed.reasoning);
         assert!(failed.reasoning.contains("The model did not run."));
         assert_eq!(column_unit(&failed, "pos_lat"), "rad");
+        assert_eq!(failed.columns.get("col_4").map(String::as_str), Some(""));
         let detail = finish_with_model(
-            interpret_header(&format2),
-            &format2,
+            interpret_header(unset),
+            unset,
             None,
             Some("llama-server did not become ready: loading model"),
         )
@@ -4323,7 +4368,7 @@ s,rad,rad,m
         assert_eq!(*offline.calls.lock().unwrap(), 1);
 
         let clean_class = read_trajectory_format(&clean, Some(&contradict)).unwrap();
-        assert_eq!(*contradict.calls.lock().unwrap(), 3);
+        assert_eq!(*contradict.calls.lock().unwrap(), 0);
         assert_eq!(clean_class.header_lines, 1);
         assert_eq!(clean_class.delimiter, ",");
         assert_eq!(column_unit(&clean_class, "pos_lat"), "deg");
@@ -4332,7 +4377,7 @@ s,rad,rad,m
         assert!(angle_unit_warning(&clean, &clean_class).is_none());
         assert!(!clean_class.reasoning.contains("The model did not run."));
         let clean_offline = read_trajectory_format(&clean, None).unwrap();
-        assert!(clean_offline.reasoning.contains("The model did not run."), "{}", clean_offline.reasoning);
+        assert!(!clean_offline.reasoning.contains("The model did not run."), "{}", clean_offline.reasoning);
         assert_eq!(column_unit(&clean_offline, "pos_lat"), "deg");
         assert!(angle_unit_warning(&clean, &clean_offline).is_none());
 
@@ -4557,6 +4602,97 @@ s,rad,rad,m
         let bare = interpret_header_with("time,ecf,lat,lon,alt\n0,1,30,-86,10\n1,2,31,-85,11\n", &memory);
         assert_eq!(bare.columns.get("col_1").map(String::as_str), Some(""));
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_unset_column_is_what_calls_the_3b() {
+        assert_eq!(DETECT_MODEL_ID, "Llama-3.2-3B-Instruct-Q4_K_M");
+        assert!(DETECT_GGUF_URL.contains("bartowski/Llama-3.2-3B-Instruct-GGUF"));
+        assert_ne!(DETECT_GGUF_FILENAME, GGUF_FILENAME);
+        assert!(GGUF_FILENAME.contains("Meta-Llama-3.1-8B-Instruct"));
+
+        let known = "time,x-ecr,y-ecr,z-ecr\n0,1,2,3\n1,1,2,4\n";
+        let known_local = interpret_header(known);
+        assert!(!has_unset_column(&known_local));
+        assert_eq!(known_local.frames.position, "ECEF");
+        assert_eq!(known_local.columns.get("col_1").map(String::as_str), Some("pos_x"));
+        let idle = Scripted {
+            replies: Mutex::new(vec!["not called".into()]),
+            calls: Mutex::new(0),
+        };
+        let kept = read_trajectory_format(known, Some(&idle)).unwrap();
+        assert_eq!(*idle.calls.lock().unwrap(), 0);
+        assert_eq!(kept.columns, known_local.columns);
+        assert!(!kept.reasoning.contains("The model did not run."));
+
+        let ned = "time,north,east,down\n0,1,2,3\n1,4,5,6\n";
+        let ned_local = interpret_header(ned);
+        assert!(!has_unset_column(&ned_local));
+        assert_eq!(ned_local.frames.position, "NED");
+        let ned_kept = read_trajectory_format(ned, Some(&idle)).unwrap();
+        assert_eq!(*idle.calls.lock().unwrap(), 0);
+        assert_eq!(ned_kept.columns.get("col_1").map(String::as_str), Some("pos_n"));
+        assert_eq!(ned_kept.columns.get("col_3").map(String::as_str), Some("pos_d"));
+
+        let ecf = sample_text("eglin_traj_format_3_ecf.traj");
+        let ecf_local = interpret_header(&ecf);
+        assert!(!has_unset_column(&ecf_local), "{ecf_local:?}");
+        assert_eq!(ecf_local.frames.position, "LLA");
+        assert_eq!(ecf_local.frames.velocity.as_deref(), Some("ECEF"));
+        assert_eq!(ecf_local.frames.acceleration.as_deref(), Some("ECEF"));
+        let ecf_kept = read_trajectory_format(&ecf, Some(&idle)).unwrap();
+        assert_eq!(*idle.calls.lock().unwrap(), 0);
+        assert_eq!(ecf_kept.columns, ecf_local.columns);
+
+        let odd = "time,lat(rad),lon(rad),alt,widget\n0,0.53,-1.51,10,1\n1,0.54,-1.50,12,2\n";
+        let local = interpret_header(odd);
+        assert!(has_unset_column(&local));
+        assert_eq!(local.columns.get("col_1").map(String::as_str), Some("pos_lat"));
+        assert_eq!(column_unit(&local, "pos_lat"), "rad");
+        assert_eq!(local.columns.get("col_4").map(String::as_str), Some(""));
+        let reply = r#"{"header_lines":1,"delimiter":",","frames":{"position":"LLA","velocity":"ECEF"},"units":{"position":"m","velocity":"m/s"},"columns":{"col_0":"time","col_1":"pos_lat","col_2":"pos_lon","col_3":"pos_alt","col_4":"mass"},"column_units":{"col_1":"deg","col_2":"deg","col_3":"ft","col_4":"kg"},"confidence_score":0.55,"unsupported_flag":false,"reasoning":"filled the extra column"}"#;
+        let scripted = Scripted {
+            replies: Mutex::new(vec![reply.into()]),
+            calls: Mutex::new(0),
+        };
+        let class = read_trajectory_format(odd, Some(&scripted)).unwrap();
+        assert_eq!(*scripted.calls.lock().unwrap(), 1);
+        assert_eq!(class.columns.get("col_1").map(String::as_str), Some("pos_lat"));
+        assert_eq!(column_unit(&class, "pos_lat"), "rad");
+        assert_eq!(column_unit(&class, "pos_lon"), "rad");
+        assert_eq!(class.columns.get("col_4").map(String::as_str), Some("mass"));
+        assert_eq!(column_unit(&class, "mass"), "kg");
+        assert!(!class.reasoning.contains("The model did not run."));
+
+        let dir = std::env::temp_dir().join(format!(
+            "fauxrrt-3b-memory-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let remembered_text = "time,lat,lon,alt,body_rate,widget\n0,30.33,-86.59,10,1,2\n1,30.34,-86.58,11,3,4\n";
+        let mut confirmed = interpret_header(remembered_text);
+        confirmed.columns.insert("col_4".into(), "mass".into());
+        remember_confirmed_columns(&dir, remembered_text, &confirmed).unwrap();
+        let memory = load_header_memory(&dir);
+        assert!(memory.cells.contains_key("body_rate"));
+        assert!(!memory.cells.contains_key("widget"));
+        let with_memory = interpret_header_with(remembered_text, &memory);
+        assert_eq!(with_memory.columns.get("col_4").map(String::as_str), Some("mass"));
+        assert_eq!(with_memory.columns.get("col_5").map(String::as_str), Some(""));
+        assert!(has_unset_column(&with_memory));
+        let both = r#"{"header_lines":1,"delimiter":",","frames":{"position":"LLA"},"units":{"position":"m"},"columns":{"col_0":"time","col_1":"pos_lat","col_2":"pos_lon","col_3":"pos_alt","col_4":"ignore","col_5":"orientation_roll"},"column_units":{"col_5":"deg"},"confidence_score":0.5,"unsupported_flag":false,"reasoning":"tried to replace a stored cell"}"#;
+        let scripted = Scripted {
+            replies: Mutex::new(vec![both.into()]),
+            calls: Mutex::new(0),
+        };
+        let merged = finish_unset_columns(with_memory, remembered_text, Some(&scripted), None, &memory).unwrap();
+        assert_eq!(*scripted.calls.lock().unwrap(), 1);
+        assert_eq!(merged.columns.get("col_4").map(String::as_str), Some("mass"));
+        assert_eq!(merged.columns.get("col_5").map(String::as_str), Some("orientation_roll"));
+        assert_eq!(merged.frames.position, "LLA");
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -5019,7 +5155,7 @@ time.sleep(60)
         assert!(argv.contains("\"-ngl\""), "{argv}");
         assert!(argv.contains("\"33\""), "{argv}");
         assert!(argv.contains("\"-c\""), "{argv}");
-        assert!(argv.contains("\"2048\""), "{argv}");
+        assert!(argv.contains("\"4096\""), "{argv}");
         assert!(argv.contains("\"--fit\""), "{argv}");
         assert!(argv.contains("\"off\""), "{argv}");
         let posted = fs::read_to_string(&requests).unwrap();
@@ -5149,8 +5285,11 @@ time.sleep(60)
         let dir = std::env::temp_dir().join(format!("fauxrrt-partial-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         assert!(installed_model(&dir).is_none());
-        let dest = dir.join("models").join(GGUF_FILENAME);
-        fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        let eight = dir.join("models").join(GGUF_FILENAME);
+        fs::create_dir_all(eight.parent().unwrap()).unwrap();
+        fs::write(&eight, vec![0u8; 64]).unwrap();
+        assert!(installed_model(&dir).is_none(), "the 8B file is not the detection model");
+        let dest = dir.join("models").join(DETECT_GGUF_FILENAME);
         fs::write(&dest, b"not a model").unwrap();
         assert!(installed_model(&dir).is_none(), "a partial weight must not start llama-server");
         let _ = fs::remove_dir_all(&dir);
