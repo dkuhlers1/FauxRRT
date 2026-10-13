@@ -43,6 +43,8 @@ pub struct TrackProb {
     pub probability: f64,
     pub object_id: Option<u64>,
     pub failure_mode_id: Option<u64>,
+    /// Globe color shared by this track, its mode-mates, and their impact points.
+    pub color: String,
 }
 
 #[derive(Debug, Clone, Serialize)]

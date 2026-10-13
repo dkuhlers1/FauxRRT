@@ -1564,6 +1564,12 @@ function syncTracksToModel() {
 }
 
 function applyRiskToTracks() {
+  const recolor = [];
+  const takeColor = (track, color) => {
+    if (!track || !color || track.color === color) return;
+    track.color = color;
+    recolor.push(track);
+  };
   for (const obj of riskModel.objects || []) {
     for (const mode of obj.modes || []) {
       for (const t of mode.tracks || []) {
@@ -1573,6 +1579,7 @@ function applyRiskToTracks() {
         track.failure_mode_id = mode.id;
         track.weight = t.weight;
         track.probability = t.probability;
+        takeColor(track, t.color);
       }
     }
   }
@@ -1582,7 +1589,9 @@ function applyRiskToTracks() {
     track.object_id = t.object_id;
     track.failure_mode_id = t.failure_mode_id;
     track.probability = 0;
+    takeColor(track, t.color);
   }
+  if (recolor.length) addTracks(recolor);
 }
 
 async function mutateRisk(cmd, args) {
