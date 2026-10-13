@@ -1233,7 +1233,7 @@ fn gather_impacts(
             alt,
             time,
             probability,
-            color: track.color.clone(),
+            color: store::trajectory_color(track.object_id, track.failure_mode_id, &track.color),
             impacted,
         };
         match extract_impact(&track.lla, track.times.as_deref(), threshold) {
@@ -1910,6 +1910,87 @@ mod tests {
             let summary = store.summarize_track(track, 120);
             assert!(!summary.show_path, "FTS fragments must not upload coast polylines");
             assert!(summary.display_lla.is_empty());
+        }
+    }
+
+    #[test]
+    fn impacts_and_paths_share_one_color_per_object_and_mode() {
+        let mut store = Store::new();
+        let vehicle = store.create_object("Vehicle".into());
+        let stage = store.create_object("Stage".into());
+        let nominal = store.ensure_named_mode(vehicle.id, "Nominal").unwrap();
+        let failure = store
+            .create_failure_mode(vehicle.id, "Failure".into(), 0.25)
+            .unwrap()
+            .modes
+            .iter()
+            .find(|m| m.name == "Failure")
+            .map(|m| m.id)
+            .unwrap();
+        let staging = store.ensure_named_mode(stage.id, "Nominal").unwrap();
+
+        let nominal_tracks = store
+            .insert_parsed_into(
+                vec![
+                    synthetic_ballistic("n1", -106.4, 32.4, 18.0, 80_000.0, 40_000.0, 1_200.0, 40),
+                    synthetic_ballistic("n2", -106.4, 32.4, 22.0, 84_000.0, 42_000.0, 1_200.0, 40),
+                ],
+                Some(vehicle.id),
+                Some(nominal),
+            )
+            .unwrap();
+        let failure_tracks = store
+            .insert_parsed_into(
+                vec![synthetic_ballistic("f1", -106.4, 32.4, 40.0, 70_000.0, 30_000.0, 1_200.0, 40)],
+                Some(vehicle.id),
+                Some(failure),
+            )
+            .unwrap();
+        let stage_tracks = store
+            .insert_parsed_into(
+                vec![synthetic_ballistic("s1", -106.5, 32.5, 10.0, 40_000.0, 20_000.0, 1_200.0, 40)],
+                Some(stage.id),
+                Some(staging),
+            )
+            .unwrap();
+
+        store
+            .set_track_style(nominal_tracks[0].id, None, Some("#112233".into()), None, None)
+            .unwrap();
+
+        let (impacts, missing, _) = gather_impacts(&store, None, 0.0);
+        assert!(missing.is_empty(), "expected every sample to impact");
+        let impact_color = |id: u64| {
+            impacts
+                .iter()
+                .find(|p| p.track_id == id)
+                .unwrap_or_else(|| panic!("missing impact {id}"))
+                .color
+                .clone()
+        };
+        let path_color = |id: u64| store.summarize_track(store.tracks.get(&id).unwrap(), 120).color;
+
+        let nominal_color = impact_color(nominal_tracks[0].id);
+        let failure_color = impact_color(failure_tracks[0].id);
+        let stage_color = impact_color(stage_tracks[0].id);
+
+        assert_eq!(nominal_color, impact_color(nominal_tracks[1].id));
+        assert_ne!(nominal_color, failure_color);
+        assert_ne!(nominal_color, stage_color);
+        assert_ne!(failure_color, stage_color);
+        assert_ne!(nominal_color, "#112233");
+        for id in [nominal_tracks[0].id, nominal_tracks[1].id, failure_tracks[0].id, stage_tracks[0].id] {
+            assert_eq!(impact_color(id), path_color(id), "path and impact diverged for {id}");
+        }
+
+        let distinct: std::collections::HashSet<_> = impacts.iter().map(|p| p.color.as_str()).collect();
+        assert!(distinct.len() > 1, "every impact collapsed to one color");
+        assert!(distinct.len() < impacts.len(), "each impact got its own color");
+
+        let model = store.risk_model();
+        let listed = model.objects.iter().flat_map(|o| o.modes.iter().flat_map(|m| m.tracks.iter()));
+        for track in listed {
+            assert_eq!(track.color, impact_color(track.id));
         }
     }
 }

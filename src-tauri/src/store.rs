@@ -114,6 +114,7 @@ struct TrackSnap {
     weight: f64,
     object_id: Option<u64>,
     failure_mode_id: Option<u64>,
+    color: String,
 }
 
 impl TrackSnap {
@@ -124,6 +125,7 @@ impl TrackSnap {
             weight: track.weight,
             object_id: track.object_id,
             failure_mode_id: track.failure_mode_id,
+            color: trajectory_color(track.object_id, track.failure_mode_id, &track.color),
         }
     }
 }
@@ -727,6 +729,7 @@ impl Store {
                 track.color = color;
             }
         }
+        let painted = paint_assigned_color(track);
         if let Some(visible) = visible {
             track.visible = visible;
         }
@@ -737,7 +740,7 @@ impl Store {
             dirty = true;
         }
         let object_id = track.object_id;
-        if dirty {
+        if dirty || painted {
             if let Some(object_id) = object_id {
                 self.mark_object(object_id);
             }
@@ -909,6 +912,12 @@ impl Store {
                 track.failure_mode_id = Some(failure_mode_id);
             }
         }
+        let color = color_for_object_mode(object_id, failure_mode_id);
+        for track in self.tracks.values_mut() {
+            if track.object_id == Some(object_id) && track.failure_mode_id == Some(failure_mode_id) {
+                track.color = color.clone();
+            }
+        }
         for id in touched {
             self.mark_object(id);
         }
@@ -925,6 +934,7 @@ impl Store {
                 }
                 track.object_id = None;
                 track.failure_mode_id = None;
+                track.color = color_for(*id);
             }
         }
         for id in touched {
@@ -1148,6 +1158,7 @@ impl Store {
                     probability: p,
                     object_id: t.object_id,
                     failure_mode_id: t.failure_mode_id,
+                    color: t.color.clone(),
                 });
             }
             failure_mode_sum += mode.probability;
@@ -1231,6 +1242,7 @@ impl Store {
                 probability: 0.0,
                 object_id: t.object_id,
                 failure_mode_id: t.failure_mode_id,
+                color: trajectory_color(t.object_id, t.failure_mode_id, &t.color),
             })
             .collect();
         unassigned.sort_by_key(|t| t.id);
@@ -1321,7 +1333,7 @@ fn summarize_with_prob(track: &Trajectory, budget: usize, probability: f64) -> T
         point_count: track.lla.len() / 3,
         display_count: display_lla.len() / 3,
         schema: track.schema.clone(),
-        color: track.color.clone(),
+        color: trajectory_color(track.object_id, track.failure_mode_id, &track.color),
         visible: track.visible,
         bounds,
         time_start,
@@ -1395,6 +1407,58 @@ pub fn color_for(id: u64) -> String {
     format!("#{r:02x}{g:02x}{b:02x}")
 }
 
+/// One globe color for every trajectory and impact that share an object and a mode.
+///
+/// The Szudzik pairing of `(object_id, mode_id)` is a single integer, so the same
+/// pair always repeats and two different pairs never share a key. That key picks
+/// one of 36 hues, multiplied by 11 (coprime to 36) so the next pair jumps about
+/// 110° around the wheel instead of sitting on a neighbor. After each full turn
+/// the lightness steps by 0.025, and every twelfth turn the saturation flips,
+/// which keeps later pairs from landing on the same RGB.
+pub fn color_for_object_mode(object_id: u64, mode_id: u64) -> String {
+    const HUE_STEPS: u64 = 36;
+    const HUE_STEP: u64 = 11;
+    let key = pair_object_mode(object_id, mode_id);
+    let hue_i = key.wrapping_mul(HUE_STEP) % HUE_STEPS;
+    let h = (hue_i as f64 + 0.5) / HUE_STEPS as f64;
+    let band = key / HUE_STEPS;
+    let lightness = (0.40 + (band % 12) as f64 * 0.025).min(0.70);
+    let saturation = if (band / 12) % 2 == 0 { 0.72 } else { 0.55 };
+    let (r, g, b) = hsl_to_rgb(h, saturation, lightness);
+    format!("#{r:02x}{g:02x}{b:02x}")
+}
+
+fn pair_object_mode(object_id: u64, mode_id: u64) -> u64 {
+    if object_id >= mode_id {
+        object_id * object_id + object_id + mode_id
+    } else {
+        object_id + mode_id * mode_id
+    }
+}
+
+/// Assigned tracks display the object+mode color. Unassigned tracks keep their own.
+pub fn trajectory_color(object_id: Option<u64>, mode_id: Option<u64>, stored: &str) -> String {
+    match (object_id, mode_id) {
+        (Some(object_id), Some(mode_id)) => color_for_object_mode(object_id, mode_id),
+        _ => stored.to_string(),
+    }
+}
+
+fn paint_assigned_color(track: &mut Trajectory) -> bool {
+    let Some(object_id) = track.object_id else {
+        return false;
+    };
+    let Some(mode_id) = track.failure_mode_id else {
+        return false;
+    };
+    let color = color_for_object_mode(object_id, mode_id);
+    if track.color == color {
+        return false;
+    }
+    track.color = color;
+    true
+}
+
 fn hsl_to_rgb(h: f64, s: f64, l: f64) -> (u8, u8, u8) {
     let a = s * l.min(1.0 - l);
     let f = |n: f64| {
@@ -1431,6 +1495,29 @@ mod tests {
         let obj = store.create_object("Vehicle".into());
         store.ensure_named_mode(obj.id, "Nominal").unwrap();
         store.object_view(obj.id).unwrap()
+    }
+
+    #[test]
+    fn object_mode_colors_stay_apart() {
+        let mut colors = std::collections::HashSet::new();
+        for object_id in 1..=16 {
+            for mode_id in 1..=16 {
+                let color = color_for_object_mode(object_id, mode_id);
+                assert_eq!(color, color_for_object_mode(object_id, mode_id));
+                assert!(color.starts_with('#') && color.len() == 7, "{color}");
+                assert!(
+                    colors.insert(color.clone()),
+                    "object {object_id} mode {mode_id} reused {color}"
+                );
+                if mode_id > 1 {
+                    assert_ne!(color, color_for_object_mode(object_id, mode_id - 1));
+                }
+                if object_id > 1 {
+                    assert_ne!(color, color_for_object_mode(object_id - 1, mode_id));
+                }
+            }
+        }
+        assert!(colors.len() > 1);
     }
 
     #[test]
