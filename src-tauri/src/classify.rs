@@ -52,48 +52,57 @@ pub const INFERENCE_TIMEOUT: Duration = Duration::from_secs(8 * 60);
 const SERVER_START_TIMEOUT: Duration = Duration::from_secs(180);
 pub const CANCELLED: &str = "classification cancelled";
 
-pub const SYSTEM_PROMPT: &str = r#"You classify trajectory state text files. Return one JSON object and nothing else. No markdown and no conversation.
+/// Closed role names. The grammar may emit these and nothing else.
+const COLUMN_ROLES: &[&str] = &[
+    "time",
+    "pos_x",
+    "pos_y",
+    "pos_z",
+    "pos_lat",
+    "pos_lon",
+    "pos_alt",
+    "pos_n",
+    "pos_e",
+    "pos_d",
+    "pos_u",
+    "vel_x",
+    "vel_y",
+    "vel_z",
+    "vel_n",
+    "vel_e",
+    "vel_d",
+    "vel_u",
+    "acc_x",
+    "acc_y",
+    "acc_z",
+    "acc_n",
+    "acc_e",
+    "acc_d",
+    "acc_u",
+    "orientation_roll",
+    "orientation_pitch",
+    "orientation_yaw",
+    "mass",
+    "ignore",
+];
 
-Supported coordinate systems, and only these: NED, NEU, LLA, ECEF, ECI.
-Supported units, and only these:
-- position: m, km, ft
-- velocity: m/s, ft/s, km/s
-- acceleration: m/s^2, ft/s^2
-- orientation: rad, deg
-- mass: kg, lbm
+/// Closed unit names. These are the canonical forms, not aliases such as meters or degrees.
+const COLUMN_UNITS: &[&str] = &[
+    "m", "km", "ft", "m/s", "ft/s", "km/s", "m/s^2", "ft/s^2", "rad", "deg", "kg", "lbm",
+];
 
-Column roles, and only these names: time, pos_x, pos_y, pos_z, pos_lat, pos_lon, pos_alt, pos_n, pos_e, pos_d, pos_u, vel_x, vel_y, vel_z, vel_n, vel_e, vel_d, vel_u, acc_x, acc_y, acc_z, acc_n, acc_e, acc_d, acc_u, orientation_roll, orientation_pitch, orientation_yaw, mass, ignore.
+/// Closed coordinate-system names.
+const COLUMN_FRAMES: &[&str] = &["NED", "NEU", "LLA", "ECEF", "ECI"];
 
-Position columns are required.
-LLA uses pos_lat, pos_lon, and pos_alt. The position unit is the altitude distance only.
-Latitude and longitude are angles. Trust a unit written on that column, including a parenthetical note such as lat(rad) or lon(rad), or a unit row. Do not change a stated unit because the numbers look like degrees or radians. When the header states no angle unit, latitude and longitude are degrees.
-alt_out is altitude.
-A junk line before or after the header is not a column name. header_lines counts every line before the first data row, including junk lines.
-When the header row uses a different delimiter from the data rows, delimiter is the data delimiter.
-Columns may be reordered. Match each name to its own column.
-Put each column unit in column_units. Latitude and longitude are deg or rad. Altitude is m, km, or ft.
-ECEF and ECI use pos_x, pos_y, pos_z.
-NED uses pos_n, pos_e, pos_d for north, east, and down.
-NEU uses pos_n, pos_e, pos_u for north, east, and up.
-Velocity, acceleration, and orientation use the same axis names when those columns exist.
+pub const SYSTEM_PROMPT: &str = r#"Map each listed unset trajectory column to one role, one unit, and one frame. Return one JSON object and nothing else. No markdown and no extra words.
 
-Read the names in the excerpt. They are not a fixed dictionary, and a named header is still your job.
-lat, latitude, lon, longitude, alt, altitude, and alt_out are LLA position: pos_lat, pos_lon, pos_alt.
-x-ecr, y-ecr, and z-ecr are Earth-centered rotating position, which is ECEF: pos_x, pos_y, and pos_z. Match each column by the axis in its name. z-ecr may appear before y-ecr.
-north, east, and down are NED: pos_n, pos_e, and pos_d.
-Return that identification only. Do not convert coordinates into another frame.
+Use only these roles: time, pos_x, pos_y, pos_z, pos_lat, pos_lon, pos_alt, pos_n, pos_e, pos_d, pos_u, vel_x, vel_y, vel_z, vel_n, vel_e, vel_d, vel_u, acc_x, acc_y, acc_z, acc_n, acc_e, acc_d, acc_u, orientation_roll, orientation_pitch, orientation_yaw, mass, ignore.
 
-frames.position, frames.velocity, and frames.acceleration are separate coordinate systems. They may differ. Position in ECEF with velocity in NED is valid. Omit frames.velocity when the file has no velocity columns. Omit frames.acceleration when the file has no acceleration columns. Do not use one coordinate system for the whole file.
-Always include position under units. Include velocity, acceleration, orientation, and mass under units only when those columns exist.
+Use only these units: m, km, ft, m/s, ft/s, km/s, m/s^2, ft/s^2, rad, deg, kg, lbm.
 
-delimiter is one of "," , "\t" , ";" , "|" , or "whitespace".
-header_lines is how many leading lines to skip before the first data row.
-Set unsupported_flag to true when a coordinate system or any unit is outside the supported list. Do not rename an unsupported frame or unit into a supported one.
-Set confidence_score below 0.6 when the layout is ambiguous. Do not guess past a low-confidence result.
-reasoning is one short classification note, not a conversation.
+Use only these frames: NED, NEU, LLA, ECEF, ECI.
 
-Return exactly this JSON shape and no other field names:
-{"header_lines":1,"delimiter":",","frames":{"position":"ECEF","velocity":"NED"},"units":{"position":"m","velocity":"m/s"},"columns":{"col_0":"time","col_1":"pos_x","col_2":"pos_y","col_3":"pos_z","col_4":"vel_n","col_5":"vel_e","col_6":"vel_d"},"column_units":{"col_1":"m","col_2":"m","col_3":"m","col_4":"m/s","col_5":"m/s","col_6":"m/s"},"confidence_score":0.85,"unsupported_flag":false,"reasoning":"position ECEF, velocity NED"}
+Do not invent columns. Do not copy a header word into the role. pos_lat and pos_lon are angles. ECEF and ECI use pos_x, pos_y, and pos_z. NED uses pos_n, pos_e, and pos_d. NEU uses pos_n, pos_e, and pos_u.
 "#;
 
 const JSON_SCHEMA: &str = r#"{
@@ -266,6 +275,13 @@ pub struct SchemaAssignment {
 
 pub trait TextCompleter {
     fn complete(&self, system: &str, user: &str) -> Result<String, String>;
+
+    /// Same call as [`complete`], with a closed GBNF grammar on the request.
+    /// The default ignores the grammar so test doubles stay on [`complete`].
+    fn complete_with_grammar(&self, system: &str, user: &str, grammar: &str) -> Result<String, String> {
+        let _ = grammar;
+        self.complete(system, user)
+    }
 }
 
 pub fn excerpt_of(text: &str) -> String {
@@ -301,6 +317,176 @@ fn retry_message(excerpt: &str) -> String {
     format!(
         "The previous output was not the required JSON object. Return only that JSON object for this excerpt.\n\n{excerpt}"
     )
+}
+
+struct PendingColumn {
+    key: String,
+    header: String,
+}
+
+struct ModelColumns {
+    columns: BTreeMap<String, String>,
+    units: BTreeMap<String, String>,
+    frames: BTreeMap<String, String>,
+}
+
+struct UnsetColumnRequest {
+    system: &'static str,
+    user: String,
+    retry: String,
+    grammar: String,
+    keys: Vec<String>,
+    n_predict: u64,
+}
+
+/// Columns the local scan left unset. A stored cell and `identify_header_name` are not listed.
+fn pending_columns(scan: &HeaderScan, memory: &HeaderMemory) -> Vec<PendingColumn> {
+    let width = if !scan.names.is_empty() { scan.names.len() } else { scan.data_width };
+    let mut pending = Vec::new();
+    for index in 0..width {
+        let header = scan.names.get(index).map(String::as_str).unwrap_or("").trim();
+        if memory.lookup(header).is_some() || identify_header_name(header).is_some() {
+            continue;
+        }
+        pending.push(PendingColumn {
+            key: format!("col_{index}"),
+            header: header.to_string(),
+        });
+    }
+    pending
+}
+
+fn unset_user_message(columns: &[PendingColumn]) -> String {
+    let mut text = String::from("Assign only these unset columns, in this order.\n");
+    for column in columns {
+        if column.header.is_empty() {
+            text.push_str(&format!("{} has no header name\n", column.key));
+        } else {
+            text.push_str(&format!("{} header {}\n", column.key, column.header));
+        }
+    }
+    text
+}
+
+/// Prompt, closed grammar, and token cap for the columns the scan left unset.
+/// `None` when every column is already known, so the model is not called.
+fn unset_column_request(text: &str, memory: &HeaderMemory) -> Option<UnsetColumnRequest> {
+    let scan = scan_header_with(text, memory);
+    let pending = pending_columns(&scan, memory);
+    if pending.is_empty() {
+        return None;
+    }
+    let user = unset_user_message(&pending);
+    let retry = format!("The previous reply was not the JSON object. Return only that object.\n{user}");
+    let keys = pending.iter().map(|column| column.key.clone()).collect::<Vec<_>>();
+    Some(UnsetColumnRequest {
+        system: SYSTEM_PROMPT,
+        user,
+        retry,
+        grammar: closed_column_grammar(&keys),
+        n_predict: unset_n_predict(keys.len()),
+        keys,
+    })
+}
+
+/// A few dozen tokens per unset column, with headroom, and still under the old 384 cap.
+fn unset_n_predict(columns: usize) -> u64 {
+    let n = columns.max(1) as u64;
+    (48 + 36 * n).clamp(96, 320)
+}
+
+fn ask_unset(model: &dyn TextCompleter, request: &UnsetColumnRequest) -> Result<ModelColumns, String> {
+    let first = model.complete_with_grammar(request.system, &request.user, &request.grammar)?;
+    match model_columns_from_reply(&first, &request.keys) {
+        Ok(columns) => Ok(columns),
+        Err(first_err) => {
+            let second = model.complete_with_grammar(request.system, &request.retry, &request.grammar)?;
+            model_columns_from_reply(&second, &request.keys).map_err(|retry_err| {
+                format!("classification was not the JSON object ({first_err}; retry: {retry_err})")
+            })
+        }
+    }
+}
+
+fn model_columns_from_reply(raw: &str, keys: &[String]) -> Result<ModelColumns, String> {
+    let objects = json_objects(raw);
+    let Some(object) = objects.last() else {
+        return Err("model output was not a JSON object".into());
+    };
+    let value: Value = serde_json::from_str(object).map_err(|_| "model output was not a JSON object".to_string())?;
+    let Some(map) = value.as_object() else {
+        return Err("model output was not a JSON object".into());
+    };
+    let mut columns = BTreeMap::new();
+    let mut units = BTreeMap::new();
+    let mut frames = BTreeMap::new();
+    for key in keys {
+        let Some(cell) = map.get(key).and_then(|value| value.as_object()) else {
+            return Err(format!("JSON did not match the classification object: missing {key}"));
+        };
+        let role = cell.get("role").and_then(|value| value.as_str()).unwrap_or("");
+        let unit = cell.get("unit").and_then(|value| value.as_str()).unwrap_or("");
+        let frame = cell.get("frame").and_then(|value| value.as_str()).unwrap_or("");
+        if !COLUMN_ROLES.contains(&role) || !COLUMN_UNITS.contains(&unit) || !COLUMN_FRAMES.contains(&frame) {
+            return Err(format!("JSON did not match the classification object: {key}"));
+        }
+        columns.insert(key.clone(), role.to_string());
+        units.insert(key.clone(), unit.to_string());
+        frames.insert(key.clone(), frame.to_string());
+    }
+    Ok(ModelColumns { columns, units, frames })
+}
+
+/// Closed GBNF. Each unset column is one object of role, unit, and frame enums.
+/// The root rule ends at the closing brace, so sampling stops there. No character class.
+fn closed_column_grammar(keys: &[String]) -> String {
+    let mut object = vec![gbnf_lit("{")];
+    for (index, key) in keys.iter().enumerate() {
+        if index > 0 {
+            object.push(gbnf_lit(","));
+        }
+        object.push(json_string_token(key));
+        object.push(gbnf_lit(":"));
+        object.push("cell".into());
+    }
+    object.push(gbnf_lit("}"));
+    let cell = [
+        gbnf_lit("{"),
+        json_string_token("role"),
+        gbnf_lit(":"),
+        "role".into(),
+        gbnf_lit(","),
+        json_string_token("unit"),
+        gbnf_lit(":"),
+        "unit".into(),
+        gbnf_lit(","),
+        json_string_token("frame"),
+        gbnf_lit(":"),
+        "frame".into(),
+        gbnf_lit("}"),
+    ]
+    .join(" ");
+    format!(
+        "root ::= {}\ncell ::= {cell}\nrole ::= {}\nunit ::= {}\nframe ::= {}\n",
+        object.join(" "),
+        enum_alts(COLUMN_ROLES),
+        enum_alts(COLUMN_UNITS),
+        enum_alts(COLUMN_FRAMES),
+    )
+}
+
+fn enum_alts(values: &[&str]) -> String {
+    values.iter().map(|value| json_string_token(value)).collect::<Vec<_>>().join(" | ")
+}
+
+/// GBNF literal that the model must emit exactly, including a JSON string's quotes.
+fn json_string_token(value: &str) -> String {
+    gbnf_lit(&format!("\"{value}\""))
+}
+
+fn gbnf_lit(text: &str) -> String {
+    let escaped = text.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("\"{escaped}\"")
 }
 
 pub fn accept_output(raw: &str) -> Result<TrajectoryClassification, String> {
@@ -1300,7 +1486,7 @@ pub fn angle_unit_warning(text: &str, class: &TrajectoryClassification) -> Optio
     inside.then(|| ANGLE_LOOKS_LIKE_RADIANS.to_string())
 }
 
-/// Local scan of the first excerpt, then Llama on that same short slice.
+/// Local header scan. Llama is asked only for columns that scan left unset.
 /// A unit written in the header is kept. If the model is missing or fails, the local guess is returned.
 pub fn read_trajectory_format(text: &str, model: Option<&dyn TextCompleter>) -> Result<TrajectoryClassification, String> {
     let local = interpret_header(text);
@@ -1338,8 +1524,15 @@ pub(crate) fn finish_unset_columns(
         note_model_did_not_run(&mut local, unavailable);
         return Ok(local);
     };
-    match classify_with(model, &excerpt_of(text)) {
-        Ok(model_class) => Ok(classification_from_scan(&scan_header_with(text, memory), Some(&model_class), memory)),
+    let Some(request) = unset_column_request(text, memory) else {
+        return Ok(local);
+    };
+    match ask_unset(model, &request) {
+        Ok(model_columns) => Ok(classification_from_scan(
+            &scan_header_with(text, memory),
+            Some(&model_columns),
+            memory,
+        )),
         Err(err) if err == CANCELLED || err.contains(CANCELLED) => Err(err),
         Err(err) => {
             let mut local = local;
@@ -1490,7 +1683,7 @@ fn is_data_line(line: &str, delim: Delimiter) -> bool {
 
 fn classification_from_scan(
     scan: &HeaderScan,
-    model: Option<&TrajectoryClassification>,
+    model: Option<&ModelColumns>,
     memory: &HeaderMemory,
 ) -> TrajectoryClassification {
     let width = if !scan.names.is_empty() { scan.names.len() } else { scan.data_width };
@@ -1498,15 +1691,21 @@ fn classification_from_scan(
     for index in 0..width {
         let raw_name = scan.names.get(index).map(String::as_str).unwrap_or("");
         let key = format!("col_{index}");
-        // A stored cell name wins over the built-in list. The model is not used on Choose files.
+        // A stored cell or a known header wins. The model fills a column only when both missed.
         let mut hit = memory_hit(raw_name, memory).or_else(|| {
             identify_header_name(raw_name).map(|(role, frame, unit)| (role, frame.map(str::to_string), unit))
         });
         if hit.is_none() {
-            if let Some(role) = model.and_then(|class| class.columns.get(&key)) {
-                if !role.trim().is_empty() {
-                    let unit = model.and_then(|class| class.column_units.get(&key)).cloned().unwrap_or_default();
-                    hit = Some((role.clone(), None, unit));
+            if let Some(model) = model {
+                if let Some(role) = model.columns.get(&key) {
+                    if COLUMN_ROLES.contains(&role.as_str()) {
+                        let unit = model.units.get(&key).cloned().filter(|unit| COLUMN_UNITS.contains(&unit.as_str()));
+                        let frame = model
+                            .frames
+                            .get(&key)
+                            .and_then(|frame| canonical_frame(frame).map(str::to_string));
+                        hit = Some((role.clone(), frame, unit.unwrap_or_default()));
+                    }
                 }
             }
         }
@@ -1974,12 +2173,11 @@ pub fn device_message(backend: GpuBackend, layers: u32, fell_back: bool) -> Stri
     }
 }
 
-/// Prompt plus the excerpt. The classification prompt is about 3000 tokens, so a 2048 context
-/// rejects the request before the model replies. 4096 holds that prompt and the 384-token reply.
+/// The unset-column prompt is a few hundred tokens, so 2048 holds it and the short reply.
 /// Llama 3.2's native 131072 context is still far too much KV cache for a 16 GB machine.
-pub const CLASSIFY_CONTEXT: &str = "4096";
-/// The classification object is a few hundred tokens. A long generation is prose, not a schema.
-pub const CLASSIFY_PREDICT: &str = "384";
+pub const CLASSIFY_CONTEXT: &str = "2048";
+/// Ceiling for one short column object. Wider replies use [`unset_n_predict`], still under 384.
+pub const CLASSIFY_PREDICT: &str = "96";
 
 /// Llama 3.1 8B repeating blocks. This is not the `-ngl` count.
 pub const MODEL_LAYERS: u32 = 32;
@@ -2020,7 +2218,7 @@ pub fn backend_after_init(preferred: GpuBackend, init_ok: bool) -> (GpuBackend, 
     }
 }
 
-/// mmap the GGUF and keep the context at 4096. Never mlock and never disable mmap.
+/// mmap the GGUF and keep the context at 2048. Never mlock and never disable mmap.
 ///
 /// `--fit` defaults to on and sizes unset context up to the trained length. `--fit-ctx` is the
 /// smallest context that fit may use, not a maximum. Leaving fit on lets a 16 GB machine try to
@@ -2067,7 +2265,7 @@ pub fn offload_args_with(backend: GpuBackend, help: &str, free_mib: Option<u64>)
     vec!["-ngl".into(), gpu_layers(backend, free_mib).to_string()]
 }
 
-/// Arguments for one long-lived `llama-server`. Context stays 4096 and `--fit off` so the KV
+/// Arguments for one long-lived `llama-server`. Context stays 2048 and `--fit off` so the KV
 /// cache cannot grow toward the model's 131072-token default. `-ngl` is never `auto` and never
 /// zero on CUDA: that is the flag that copies the GGUF layers into GPU memory.
 /// `--device CUDA0` pins those layers to the NVIDIA device instead of leaving them on CPU.
@@ -2100,17 +2298,25 @@ fn push_flag(args: &mut Vec<String>, flag: &str, value: &str) {
     args.push(value.into());
 }
 
-/// JSON body for one classification. The prompt is the header sample. `n_predict` is only a
-/// ceiling. No GBNF grammar is sent; a reply that is not a JSON object is parsed and rejected
-/// by [`accept_output`], and the local header scan stays in the review.
+/// JSON body for one full-object completion. Unset-column calls pass a closed grammar
+/// through [`completion_request_with`]. That grammar's root rule ends at the closing brace,
+/// so sampling stops there. `n_predict` is only a ceiling.
 pub fn completion_request(system: &str, user: &str) -> Value {
-    serde_json::json!({
+    completion_request_with(system, user, None, CLASSIFY_PREDICT.parse::<u64>().unwrap_or(96))
+}
+
+fn completion_request_with(system: &str, user: &str, grammar: Option<&str>, n_predict: u64) -> Value {
+    let mut body = serde_json::json!({
         "prompt": llama_prompt(system, user),
-        "n_predict": CLASSIFY_PREDICT.parse::<u64>().unwrap_or(384),
+        "n_predict": n_predict,
         "temperature": 0,
         "cache_prompt": true,
         "stop": ["<|eot_id|>"],
-    })
+    });
+    if let Some(grammar) = grammar {
+        body["grammar"] = Value::String(grammar.to_string());
+    }
+    body
 }
 
 #[derive(Clone)]
@@ -2240,9 +2446,17 @@ impl LlamaServerPool {
         }
     }
 
-    fn infer(&self, spec: &ServerSpec, system: &str, user: &str, cancel: &AtomicBool) -> Result<String, String> {
+    fn infer(
+        &self,
+        spec: &ServerSpec,
+        system: &str,
+        user: &str,
+        grammar: Option<&str>,
+        n_predict: u64,
+        cancel: &AtomicBool,
+    ) -> Result<String, String> {
         let info = self.start(spec, cancel)?;
-        match post_completion(info.port, &completion_request(system, user), cancel) {
+        match post_completion(info.port, &completion_request_with(system, user, grammar, n_predict), cancel) {
             Ok(text) => Ok(text),
             Err(err) if err == CANCELLED || cancel.load(Ordering::SeqCst) => Err(CANCELLED.into()),
             Err(err) => Err(err),
@@ -2770,8 +2984,8 @@ fn note(progress: &dyn Fn(ClassifyNote), label: &str, bytes: u64, bytes_total: u
     });
 }
 
-impl TextCompleter for LlamaRuntime {
-    fn complete(&self, system: &str, user: &str) -> Result<String, String> {
+impl LlamaRuntime {
+    fn post(&self, system: &str, user: &str, grammar: Option<&str>, n_predict: u64) -> Result<String, String> {
         if self.cancel.load(Ordering::SeqCst) {
             return Err(CANCELLED.into());
         }
@@ -2780,15 +2994,33 @@ impl TextCompleter for LlamaRuntime {
         } else {
             match self.pool.wait_for_existing(&self.cancel) {
                 ExistingWait::Ready(info) => info,
-                ExistingWait::Exited => return self.pool.infer(&self.spec, system, user, &self.cancel),
+                ExistingWait::Exited => {
+                    return self.pool.infer(&self.spec, system, user, grammar, n_predict, &self.cancel)
+                }
                 ExistingWait::Failed(err) => return Err(err),
             }
         };
-        match post_completion(info.port, &completion_request(system, user), &self.cancel) {
+        match post_completion(
+            info.port,
+            &completion_request_with(system, user, grammar, n_predict),
+            &self.cancel,
+        ) {
             Ok(text) => Ok(text),
             Err(err) if err == CANCELLED || self.cancel.load(Ordering::SeqCst) => Err(CANCELLED.into()),
             Err(err) => Err(err),
         }
+    }
+}
+
+impl TextCompleter for LlamaRuntime {
+    fn complete(&self, system: &str, user: &str) -> Result<String, String> {
+        let n_predict = CLASSIFY_PREDICT.parse::<u64>().unwrap_or(96);
+        self.post(system, user, None, n_predict)
+    }
+
+    fn complete_with_grammar(&self, system: &str, user: &str, grammar: &str) -> Result<String, String> {
+        let columns = grammar.matches("\"\\\"col_").count().max(1);
+        self.post(system, user, Some(grammar), unset_n_predict(columns))
     }
 }
 
@@ -3678,40 +3910,23 @@ mod tests {
 
     #[test]
     fn prompt_lists_supported_frames_units_and_exact_keys() {
-        for frame in ["NED", "NEU", "LLA", "ECEF", "ECI"] {
-            assert!(SYSTEM_PROMPT.contains(frame), "{frame}");
+        assert!(SYSTEM_PROMPT.contains("Do not invent columns"));
+        assert!(!SYSTEM_PROMPT.contains('{'), "the prompt has no example JSON object");
+        assert!(!SYSTEM_PROMPT.contains("header_lines"));
+        assert!(!SYSTEM_PROMPT.contains("confidence_score"));
+        assert!(!SYSTEM_PROMPT.contains("reasoning"));
+        assert!(!SYSTEM_PROMPT.contains("position ECEF, velocity NED"));
+        assert!(!SYSTEM_PROMPT.contains("x-ecr"));
+        for role in COLUMN_ROLES {
+            assert!(SYSTEM_PROMPT.contains(role), "{role}");
         }
-        for unit in ["m", "ft", "m/s", "ft/s", "m/s^2", "ft/s^2", "rad", "deg", "kg", "lbm", "km"] {
+        for unit in COLUMN_UNITS {
             assert!(SYSTEM_PROMPT.contains(unit), "{unit}");
         }
-        for key in [
-            "header_lines",
-            "delimiter",
-            "frames",
-            "confidence_score",
-            "unsupported_flag",
-            "reasoning",
-            "pos_x",
-            "vel_",
-            "orientation_",
-            "mass",
-        ] {
-            assert!(SYSTEM_PROMPT.contains(key), "{key}");
+        for frame in COLUMN_FRAMES {
+            assert!(SYSTEM_PROMPT.contains(frame), "{frame}");
         }
-        assert!(!SYSTEM_PROMPT.contains("header_line_count"));
-        assert!(!SYSTEM_PROMPT.contains("needs_manual_override"));
-        assert!(!SYSTEM_PROMPT.contains("coordinate_system_supported"));
-        assert!(SYSTEM_PROMPT.contains("x-ecr") && SYSTEM_PROMPT.contains("y-ecr") && SYSTEM_PROMPT.contains("z-ecr"));
-        assert!(SYSTEM_PROMPT.contains("north, east, and down"));
-        assert!(SYSTEM_PROMPT.contains("Do not convert coordinates"));
-        assert!(SYSTEM_PROMPT.contains("lat(rad)"));
-        assert!(SYSTEM_PROMPT.contains("Do not change a stated unit"));
-        assert!(SYSTEM_PROMPT.contains("column_units"));
-        assert!(!SYSTEM_PROMPT.contains("Latitude and longitude stay in degrees"));
-        assert!(SYSTEM_PROMPT.contains("frames.position"));
-        assert!(SYSTEM_PROMPT.contains("frames.velocity"));
-        assert!(SYSTEM_PROMPT.contains("frames.acceleration"));
-        assert!(!SYSTEM_PROMPT.contains("\"coordinate_system\""));
+        assert!(SYSTEM_PROMPT.len() < 2_400, "prompt is {} bytes", SYSTEM_PROMPT.len());
         assert!(GGUF_URL.contains("Llama-3.1-8B-Instruct"));
         assert!(GGUF_FILENAME.contains("Q4_K_M"));
         assert_eq!(DETECT_MODEL_ID, "Llama-3.2-3B-Instruct-Q4_K_M");
@@ -3725,6 +3940,169 @@ mod tests {
         assert_eq!(legacy_name, GGUF_FILENAME);
         assert_eq!(legacy_url, GGUF_URL);
         assert!(legacy_min > DETECT_GGUF_MIN_BYTES);
+    }
+
+    #[test]
+    fn unset_prompt_has_no_example_and_lists_only_unset_columns() {
+        let text = "time,lat,lon,vx_ecf,widget\n0,30.4,-86.5,1.5,9\n1,30.5,-86.4,1.6,8\n";
+        let request = unset_column_request(text, &HeaderMemory::default()).unwrap();
+        let prompt = llama_prompt(request.system, &request.user);
+        assert!(!prompt.contains('{'), "{prompt}");
+        assert!(!prompt.contains("header_lines"));
+        assert!(!prompt.contains("confidence_score"));
+        assert!(!prompt.contains("position ECEF, velocity NED"));
+        assert!(!prompt.contains("col_1\":\"pos_x"));
+        assert!(prompt.contains("Do not invent columns"));
+        assert!(prompt.len() / 4 < 800, "about {} tokens", prompt.len() / 4);
+        assert_eq!(request.keys, vec!["col_4".to_string()]);
+        assert!(request.user.contains("col_4 header widget"));
+        assert!(!request.user.contains("time"));
+        assert!(!request.user.contains("lat"));
+        assert!(!request.user.contains("lon"));
+        assert!(!request.user.contains("vx_ecf"));
+        assert!(!request.user.contains("30.4"));
+        assert!(!prompt.contains("vx_ecf"));
+        assert_eq!(request.n_predict, 96);
+        assert!(request.n_predict < 384);
+
+        let wider = "time,lat,alpha,beta\n0,1,2,3\n1,1,2,4\n";
+        let two = unset_column_request(wider, &HeaderMemory::default()).unwrap();
+        assert_eq!(two.keys, vec!["col_2".to_string(), "col_3".to_string()]);
+        assert!(two.user.contains("alpha"));
+        assert!(two.user.contains("beta"));
+        assert!(!two.user.contains("lat"));
+        assert!(!two.user.contains("time"));
+        assert_eq!(two.n_predict, 120);
+        assert!(two.n_predict < 384);
+
+        let mut memory = HeaderMemory::default();
+        memory.cells.insert(
+            "body_rate".into(),
+            RememberedCell {
+                role: "mass".into(),
+                unit: "kg".into(),
+                frame: String::new(),
+            },
+        );
+        let remembered = "time,vx_ecf,body_rate,widget\n0,1,2,3\n1,4,5,6\n";
+        let pending = unset_column_request(remembered, &memory).unwrap();
+        assert_eq!(pending.keys, vec!["col_3".to_string()]);
+        assert!(pending.user.contains("widget"));
+        assert!(!pending.user.contains("body_rate"));
+        assert!(!pending.user.contains("vx_ecf"));
+        assert!(unset_column_request("time,lat,lon,vx_ecf\n0,1,2,3\n1,1,2,4\n", &HeaderMemory::default()).is_none());
+    }
+
+    #[test]
+    fn unset_grammar_is_closed_roles_units_and_frames() {
+        let text = "time,lat,lon,vx_ecf,widget\n0,30.4,-86.5,1,9\n1,30.5,-86.4,2,8\n";
+        let request = unset_column_request(text, &HeaderMemory::default()).unwrap();
+        assert!(request.grammar.starts_with("root ::= \"{\""), "{}", request.grammar);
+        assert!(request.grammar.contains("\"}\""), "the root rule ends at the closing brace\n{}", request.grammar);
+        assert!(!request.grammar.contains("[^"), "{}", request.grammar);
+        assert!(!request.grammar.contains('['), "{}", request.grammar);
+        assert!(!request.grammar.contains("reasoning"));
+        assert!(!request.grammar.contains("widget"));
+        assert!(!request.grammar.contains("east"));
+        assert!(!request.grammar.contains("x-ecr"));
+        assert!(!request.grammar.contains("col_0"));
+        assert!(!request.grammar.contains("col_1"));
+        assert!(!request.grammar.contains("col_3"));
+        assert!(request.grammar.contains("col_4"));
+        let mut allowed = vec!["{".to_string(), "}".to_string(), ":".to_string(), ",".to_string()];
+        for value in COLUMN_ROLES.iter().chain(COLUMN_UNITS).chain(COLUMN_FRAMES) {
+            allowed.push(format!("\"{value}\""));
+        }
+        for field in ["role", "unit", "frame"] {
+            allowed.push(format!("\"{field}\""));
+        }
+        for key in &request.keys {
+            allowed.push(format!("\"{key}\""));
+        }
+        for literal in gbnf_literals(&request.grammar) {
+            assert!(allowed.iter().any(|item| item == &literal), "open literal {literal:?} in {}", request.grammar);
+        }
+        let body = completion_request_with(request.system, &request.user, Some(&request.grammar), request.n_predict);
+        assert_eq!(body["grammar"].as_str(), Some(request.grammar.as_str()));
+        assert_eq!(body["n_predict"].as_u64(), Some(request.n_predict));
+        assert!(request.n_predict < 384);
+        assert_eq!(request.grammar.matches("\"\\\"col_").count(), request.keys.len());
+        let prompt = body["prompt"].as_str().unwrap();
+        assert!(prompt.contains("widget"));
+        assert!(!prompt.contains("vx_ecf"));
+        assert!(!prompt.contains("time,lat"));
+    }
+
+    #[test]
+    fn model_reply_fills_only_unset_columns() {
+        let text = "time,lat,lon,vx_ecf,widget\n0,30.4,-86.5,1.5,9\n1,30.5,-86.4,1.6,8\n";
+        let local = interpret_header(text);
+        assert_eq!(local.columns.get("col_0").map(String::as_str), Some("time"));
+        assert_eq!(local.columns.get("col_1").map(String::as_str), Some("pos_lat"));
+        assert_eq!(local.columns.get("col_3").map(String::as_str), Some("vel_x"));
+        assert_eq!(local.columns.get("col_4").map(String::as_str), Some(""));
+        assert_eq!(column_unit(&local, "pos_lat"), "deg");
+        let reply = r#"{"col_0":{"role":"ignore","unit":"m","frame":"ECEF"},"col_1":{"role":"pos_x","unit":"ft","frame":"ECEF"},"col_3":{"role":"pos_e","unit":"ft","frame":"NED"},"col_4":{"role":"mass","unit":"kg","frame":"LLA"}}"#;
+        let scripted = Scripted {
+            replies: Mutex::new(vec![reply.into()]),
+            calls: Mutex::new(0),
+        };
+        let class = read_trajectory_format(text, Some(&scripted)).unwrap();
+        assert_eq!(*scripted.calls.lock().unwrap(), 1);
+        assert_eq!(class.columns.get("col_0").map(String::as_str), Some("time"));
+        assert_eq!(class.columns.get("col_1").map(String::as_str), Some("pos_lat"));
+        assert_eq!(class.columns.get("col_2").map(String::as_str), Some("pos_lon"));
+        assert_eq!(class.columns.get("col_3").map(String::as_str), Some("vel_x"));
+        assert_eq!(column_unit(&class, "pos_lat"), "deg");
+        assert_eq!(column_unit(&class, "pos_lon"), "deg");
+        assert_eq!(column_unit(&class, "vel_x"), "m/s");
+        assert_eq!(class.columns.get("col_4").map(String::as_str), Some("mass"));
+        assert_eq!(column_unit(&class, "mass"), "kg");
+        assert_eq!(class.frames.position, "LLA");
+        assert_eq!(class.frames.velocity.as_deref(), Some("ECEF"));
+
+        let raw = r#"{"col_4":{"role":"east","unit":"m","frame":"NED"}}"#;
+        assert!(model_columns_from_reply(raw, &["col_4".to_string()]).is_err());
+        let parrot = r#"{"header_lines":1,"delimiter":",","frames":{"position":"ECEF","velocity":"NED"},"units":{"position":"m","velocity":"m/s"},"columns":{"col_0":"time","col_1":"pos_x","col_2":"pos_y","col_3":"pos_z","col_4":"vel_n"},"confidence_score":0.85,"unsupported_flag":false,"reasoning":"position ECEF, velocity NED"}"#;
+        let scripted = Scripted {
+            replies: Mutex::new(vec![parrot.into(), parrot.into()]),
+            calls: Mutex::new(0),
+        };
+        let kept = read_trajectory_format(text, Some(&scripted)).unwrap();
+        assert_eq!(kept.columns, local.columns);
+        assert_eq!(column_unit(&kept, "pos_lat"), "deg");
+        assert!(kept.reasoning.contains("model output was not a JSON object") || kept.reasoning.contains("JSON did not match"));
+    }
+
+    fn gbnf_literals(grammar: &str) -> Vec<String> {
+        let chars: Vec<char> = grammar.chars().collect();
+        let mut out = Vec::new();
+        let mut index = 0;
+        while index < chars.len() {
+            if chars[index] != '"' {
+                index += 1;
+                continue;
+            }
+            index += 1;
+            let mut literal = String::new();
+            while index < chars.len() {
+                let ch = chars[index];
+                index += 1;
+                if ch == '\\' {
+                    if index < chars.len() {
+                        literal.push(chars[index]);
+                        index += 1;
+                    }
+                    continue;
+                }
+                if ch == '"' {
+                    break;
+                }
+                literal.push(ch);
+            }
+            out.push(literal);
+        }
+        out
     }
 
     #[test]
@@ -3932,10 +4310,12 @@ mod tests {
             )
             .expect("live llama-server");
         let runtime = LlamaRuntime::from_info(Arc::clone(&pool), info, cancel);
-        let excerpt = "time,lat,lon,alt\n0,32.4,-106.4,1000\n1,32.41,-106.39,1100\n";
-        let class = classify_with(&runtime, excerpt).expect("live classification");
-        assert_eq!(class.frames.position, "LLA");
-        assert!(has_position_columns(&class));
+        let text = "time,lat,lon,alt,widget\n0,32.4,-106.4,1000,1\n1,32.41,-106.39,1100,2\n";
+        let class = read_trajectory_format(text, Some(&runtime)).expect("live classification");
+        assert_eq!(class.columns.get("col_1").map(String::as_str), Some("pos_lat"));
+        assert_eq!(column_unit(&class, "pos_lat"), "deg");
+        let role = class.columns.get("col_4").map(String::as_str).unwrap_or("");
+        assert!(COLUMN_ROLES.contains(&role), "{class:?}");
         pool.shutdown();
     }
 
@@ -4018,7 +4398,7 @@ mod tests {
         let help = "usage -c N --mmap --fit [on|off] -b N -ngl N --host --port -np N";
         let cuda = server_args(GpuBackend::Cuda, help, Path::new("model.gguf"), 8081, None);
         assert!(cuda.windows(2).any(|pair| pair == ["-m", "model.gguf"]), "{cuda:?}");
-        assert!(cuda.windows(2).any(|pair| pair == ["-c", "4096"]), "{cuda:?}");
+        assert!(cuda.windows(2).any(|pair| pair == ["-c", "2048"]), "{cuda:?}");
         assert!(cuda.windows(2).any(|pair| pair == ["--fit", "off"]), "{cuda:?}");
         assert!(cuda.windows(2).any(|pair| pair == ["-ngl", "33"]), "{cuda:?}");
         assert!(cuda.windows(2).any(|pair| pair == ["--host", "127.0.0.1"]), "{cuda:?}");
@@ -4028,12 +4408,12 @@ mod tests {
         assert!(vulkan.windows(2).any(|pair| pair == ["-ngl", "33"]), "{vulkan:?}");
         let cpu = server_args(GpuBackend::Cpu, help, Path::new("model.gguf"), 9, Some(16_000));
         assert!(cpu.windows(2).any(|pair| pair == ["-ngl", "0"]), "{cpu:?}");
-        assert!(cpu.windows(2).any(|pair| pair == ["-c", "4096"]), "{cpu:?}");
+        assert!(cpu.windows(2).any(|pair| pair == ["-c", "2048"]), "{cpu:?}");
         assert!(!cpu.iter().any(|arg| arg == "CUDA0"), "{cpu:?}");
         let pinned = server_args(GpuBackend::Cuda, "", Path::new("model.gguf"), 8081, None);
         assert_eq!(
             pinned,
-            ["-m", "model.gguf", "-c", "4096", "--fit", "off", "-ngl", "33", "--device", "CUDA0", "--host", "127.0.0.1", "--port", "8081"]
+            ["-m", "model.gguf", "-c", "2048", "--fit", "off", "-ngl", "33", "--device", "CUDA0", "--host", "127.0.0.1", "--port", "8081"]
                 .into_iter()
                 .map(str::to_string)
                 .collect::<Vec<_>>()
@@ -4073,14 +4453,14 @@ mod tests {
     fn completion_request_sends_the_header_sample_without_a_grammar() {
         let excerpt = "time,lat,lon,alt\n0,32.4,-106.4,1000\n";
         let body = completion_request(SYSTEM_PROMPT, &user_message(excerpt));
-        assert_eq!(body["n_predict"], 384);
+        assert_eq!(body["n_predict"], 96);
         assert_eq!(body["temperature"], 0);
         assert_eq!(body["cache_prompt"], true);
         assert!(body.get("grammar").is_none(), "{body}");
         let prompt = body["prompt"].as_str().unwrap();
         assert!(prompt.contains("time,lat,lon,alt"));
         assert!(prompt.contains(excerpt.trim()));
-        assert!(!prompt.contains("root ::="));
+        assert!(!prompt.contains('{'), "{prompt}");
         assert!(classification_schema().contains("header_lines"));
         assert!(!prompt.contains("131072"));
     }
@@ -4089,7 +4469,7 @@ mod tests {
     fn llama_context_is_small_and_weights_stay_mmapd() {
         let help = "usage -c --ctx-size N --mmap --no-mmap --load-mode --fit --fit-ctx N -b --batch-size N --json-schema-file F --grammar-file F";
         let args = memory_args(help);
-        assert!(args.windows(2).any(|pair| pair == ["-c", "4096"]), "{args:?}");
+        assert!(args.windows(2).any(|pair| pair == ["-c", "2048"]), "{args:?}");
         assert!(args.windows(2).any(|pair| pair == ["--load-mode", "mmap"]), "{args:?}");
         assert!(args.windows(2).any(|pair| pair == ["--fit", "off"]), "{args:?}");
         assert!(args.windows(2).any(|pair| pair == ["-b", "512"]), "{args:?}");
@@ -4651,7 +5031,7 @@ s,rad,rad,m
         assert_eq!(local.columns.get("col_1").map(String::as_str), Some("pos_lat"));
         assert_eq!(column_unit(&local, "pos_lat"), "rad");
         assert_eq!(local.columns.get("col_4").map(String::as_str), Some(""));
-        let reply = r#"{"header_lines":1,"delimiter":",","frames":{"position":"LLA","velocity":"ECEF"},"units":{"position":"m","velocity":"m/s"},"columns":{"col_0":"time","col_1":"pos_lat","col_2":"pos_lon","col_3":"pos_alt","col_4":"mass"},"column_units":{"col_1":"deg","col_2":"deg","col_3":"ft","col_4":"kg"},"confidence_score":0.55,"unsupported_flag":false,"reasoning":"filled the extra column"}"#;
+        let reply = r#"{"col_1":{"role":"pos_x","unit":"ft","frame":"ECEF"},"col_4":{"role":"mass","unit":"kg","frame":"LLA"}}"#;
         let scripted = Scripted {
             replies: Mutex::new(vec![reply.into()]),
             calls: Mutex::new(0),
@@ -4683,7 +5063,7 @@ s,rad,rad,m
         assert_eq!(with_memory.columns.get("col_4").map(String::as_str), Some("mass"));
         assert_eq!(with_memory.columns.get("col_5").map(String::as_str), Some(""));
         assert!(has_unset_column(&with_memory));
-        let both = r#"{"header_lines":1,"delimiter":",","frames":{"position":"LLA"},"units":{"position":"m"},"columns":{"col_0":"time","col_1":"pos_lat","col_2":"pos_lon","col_3":"pos_alt","col_4":"ignore","col_5":"orientation_roll"},"column_units":{"col_5":"deg"},"confidence_score":0.5,"unsupported_flag":false,"reasoning":"tried to replace a stored cell"}"#;
+        let both = r#"{"col_4":{"role":"ignore","unit":"m","frame":"ECEF"},"col_5":{"role":"orientation_roll","unit":"deg","frame":"NED"}}"#;
         let scripted = Scripted {
             replies: Mutex::new(vec![both.into()]),
             calls: Mutex::new(0),
@@ -5155,7 +5535,7 @@ time.sleep(60)
         assert!(argv.contains("\"-ngl\""), "{argv}");
         assert!(argv.contains("\"33\""), "{argv}");
         assert!(argv.contains("\"-c\""), "{argv}");
-        assert!(argv.contains("\"4096\""), "{argv}");
+        assert!(argv.contains("\"2048\""), "{argv}");
         assert!(argv.contains("\"--fit\""), "{argv}");
         assert!(argv.contains("\"off\""), "{argv}");
         let posted = fs::read_to_string(&requests).unwrap();
@@ -5163,7 +5543,7 @@ time.sleep(60)
         assert!(posted.contains("time,lat,lon,alt"));
         assert!(!posted.contains("root ::="), "grammar was sent: {posted}");
         assert!(!posted.contains("\"grammar\""), "{posted}");
-        assert!(posted.contains("\"n_predict\":384") || posted.contains("\"n_predict\": 384"), "{posted}");
+        assert!(posted.contains("\"n_predict\":96") || posted.contains("\"n_predict\": 96"), "{posted}");
         pool.shutdown();
         assert!(pool.current().is_none());
         let _ = fs::remove_dir_all(&dir);
