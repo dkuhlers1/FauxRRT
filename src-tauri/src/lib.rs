@@ -2908,8 +2908,13 @@ mod classify_command_tests {
         assert!(wait.contains("health_ok"), "{wait}");
         assert!(!wait.contains("shutdown"), "{wait}");
         assert!(!wait.contains("gpu_offload_failed"), "{wait}");
-        let completion = function_source(classify_src, "pub fn completion_request(");
-        assert!(!completion.contains("\"grammar\""), "{completion}");
+        let completion = function_source(classify_src, "fn completion_request_with(");
+        assert!(completion.contains("\"grammar\""), "{completion}");
+        assert!(!completion.contains("[^"), "{completion}");
+        let grammar = function_source(classify_src, "fn closed_column_grammar(");
+        assert!(!grammar.contains("[^"), "{grammar}");
+        assert!(!grammar.contains("reasoning"), "{grammar}");
+        assert!(classify_src.contains("Do not invent columns"));
         assert_eq!(
             super::format_detection_label("eglin_traj_format_2.traj"),
             "Detecting trajectory file format for eglin_traj_format_2.traj"
