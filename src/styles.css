@@ -785,6 +785,28 @@ input[type="number"], input[type="text"] {
 .load-path .path-blurb { display: block; margin: 0; }
 .load-path-body { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; }
 .load-path.collapsed .load-path-body { display: none; }
+.recover-panel {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #101820;
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.recover-panel h3 { margin: 0; font-size: 13px; font-weight: 600; }
+.recover-panel .recover-note { margin: 0; font-size: 11px; line-height: 1.35; color: var(--muted); }
+.recover-phases { margin: 0; padding-left: 16px; font-size: 12px; }
+.recover-products {
+  margin: 0;
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 2px 10px;
+  font-size: 12px;
+}
+.recover-products dt { color: var(--muted); }
+.recover-products dd { margin: 0; }
+.recover-panel [data-role="thrust-summary"] { margin: 0; font-size: 12px; }
 #globe-panel.drawer-open #rocketpy-overlay {
   left: min(440px, 46vw);
   width: min(480px, 40vw);

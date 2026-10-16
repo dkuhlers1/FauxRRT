@@ -30,6 +30,18 @@ pub fn enu_to_lla(lat0: f64, lon0: f64, alt0: f64, east: f64, north: f64, up: f6
     ecef_to_lla(x, y, z)
 }
 
+/// ECEF vector, in metres, to local east/north/up. The origin is not added.
+pub fn ecef_to_enu_vector(lat_deg: f64, lon_deg: f64, x: f64, y: f64, z: f64) -> (f64, f64, f64) {
+    let lat = lat_deg.to_radians();
+    let lon = lon_deg.to_radians();
+    let (sl, cl) = (lat.sin(), lat.cos());
+    let (so, co) = (lon.sin(), lon.cos());
+    let east = (-so) * x + co * y;
+    let north = (-sl * co) * x + (-sl * so) * y + cl * z;
+    let up = (cl * co) * x + (cl * so) * y + sl * z;
+    (east, north, up)
+}
+
 /// Local east/north/up vector, in metres, to an ECEF vector. The origin is not added.
 pub fn enu_to_ecef_vector(lat_deg: f64, lon_deg: f64, east: f64, north: f64, up: f64) -> (f64, f64, f64) {
     let lat = lat_deg.to_radians();
@@ -84,6 +96,15 @@ mod tests {
         assert!((lat - 32.4).abs() < 1e-6);
         assert!((lon + 106.4).abs() < 1e-6);
         assert!((alt - 1200.0).abs() < 0.05);
+    }
+
+    #[test]
+    fn enu_vector_round_trips_through_ecef() {
+        let (x, y, z) = enu_to_ecef_vector(32.4, -106.4, 40.0, -15.0, 8.0);
+        let (east, north, up) = ecef_to_enu_vector(32.4, -106.4, x, y, z);
+        assert!((east - 40.0).abs() < 1e-6);
+        assert!((north + 15.0).abs() < 1e-6);
+        assert!((up - 8.0).abs() < 1e-6);
     }
 
     #[test]

@@ -29,6 +29,7 @@ commands.allow = [
   "generate_trajectories",
   "generate_rocketpy",
   "rocketpy_status",
+  "recover_trajectory",
   "sample_state_vector",
   "upsert_debris_catalog",
   "remove_debris_catalog",

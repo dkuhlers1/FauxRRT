@@ -64,6 +64,7 @@ import {
   resolveTrajectoryDest,
   trajectoryDrawerDestHtml,
 } from "./trajectory-dest.js";
+import { recoveryPanelHtml } from "./recover-panel.js";
 
 const tracks = new Map();
 let schemaSession = null;
@@ -72,6 +73,8 @@ let fileLoadProgress = "";
 let detectingFormat = false;
 let boats = [];
 let selectedId = null;
+/** Last parameter recovery for one trajectory. Cleared when another track is selected. */
+let recoveryView = { id: null, busy: false, result: null, error: "" };
 let selectedBoatId = null;
 let hoveredBoatId = null;
 let lastKdeGrid = null;
@@ -1469,8 +1472,30 @@ function applySectionCollapsed() {
 }
 
 function selectTrack(id) {
+  if (id !== selectedId && recoveryView.id !== id) {
+    recoveryView = { id: null, busy: false, result: null, error: "" };
+  }
   selectedId = id;
   highlight(id);
+  render();
+}
+
+async function recoverSelectedParameters() {
+  const id = selectedId;
+  const track = id == null ? null : tracks.get(id);
+  if (!track) {
+    recoveryView = { id: null, busy: false, result: null, error: "Select a trajectory first." };
+    render();
+    return;
+  }
+  recoveryView = { id, busy: true, result: null, error: "" };
+  render();
+  try {
+    const result = await invoke("recover_trajectory", { id });
+    recoveryView = { id, busy: false, result, error: "" };
+  } catch (err) {
+    recoveryView = { id, busy: false, result: null, error: String(err) };
+  }
   render();
 }
 
@@ -2918,6 +2943,14 @@ function renderTrajectoryDrawer() {
       modeId: mode?.id,
       modeName: mode?.name,
     })}
+    ${recoveryPanelHtml({
+      track: selectedId != null && tracks.get(selectedId)
+        ? { id: selectedId, name: tracks.get(selectedId).name || `Trajectory ${selectedId}` }
+        : null,
+      result: recoveryView.id === selectedId ? recoveryView.result : null,
+      error: recoveryView.id === selectedId ? recoveryView.error : "",
+      busy: recoveryView.id === selectedId && recoveryView.busy,
+    })}
     ${paths.map(([id, title, blurb]) => `
       <section class="load-path${method === id ? "" : " collapsed"}" data-load-path="${id}">
         <button type="button" class="load-path-head" data-load-path-btn="${id}" aria-expanded="${method === id}">
@@ -2928,6 +2961,9 @@ function renderTrajectoryDrawer() {
       </section>`).join("")}`;
   root.querySelector("[data-act='add-object']")?.addEventListener("click", () => {
     addTrajectoryObject();
+  });
+  root.querySelector("[data-act='recover-parameters']")?.addEventListener("click", () => {
+    recoverSelectedParameters();
   });
   root.querySelector("[data-act='add-mode']")?.addEventListener("click", () => {
     addTrajectoryMode();

@@ -7,6 +7,7 @@ mod kde;
 mod mission;
 mod parse;
 mod pick;
+mod recover;
 mod risk;
 mod rocketpy;
 mod schema;
@@ -46,6 +47,7 @@ use classify::{
 };
 use parse::{parse_path_with, parse_text, parse_with_classification, read_trajectory_text, ParsedTrack};
 use pick::{pick_kml_sources, pick_trajectory_folder, pick_trajectory_sources};
+use recover::RecoveryInput;
 use rocketpy::{check_rocketpy, fly_rocketpy, RocketPySpec, RocketPyStatus};
 use rayon::prelude::*;
 use risk::RiskModelView;
@@ -1300,6 +1302,38 @@ fn track_positions(state: State<AppState>, id: u64, budget: Option<u32>) -> Resu
     let budget = budget.unwrap_or(8000) as usize;
     let lla = store.positions(id, budget).ok_or_else(|| "unknown track".to_string())?;
     Ok(TrackPositions { id, lla })
+}
+
+/// Infer thrust and Cd·A / Cl_alpha·A for the selected trajectory. Nav failure,
+/// spent stage, and FTS are left alone.
+#[tauri::command]
+fn recover_trajectory(state: State<AppState>, id: u64) -> Result<serde_json::Value, String> {
+    let table = {
+        let store = state.store.lock().map_err(|e| e.to_string())?;
+        let track = store.tracks.get(&id).ok_or_else(|| "unknown track".to_string())?;
+        let samples = track.lla.len() / 3;
+        let (latitude, longitude) = match (track.origin_lat, track.origin_lon) {
+            (Some(lat), Some(lon)) => (lat, lon),
+            _ => {
+                if samples == 0 {
+                    return Err("The trajectory needs at least four state samples to recover parameters.".into());
+                }
+                (track.lla[1] as f64, track.lla[0] as f64)
+            }
+        };
+        let time = track.times.clone().unwrap_or_default();
+        recover::recovery_table(&RecoveryInput {
+            time_s: &time,
+            lla: &track.lla,
+            velocity_ecef_mps: track.states.velocity_mps.as_deref(),
+            acceleration_ecef_mps2: track.states.acceleration_mps2.as_deref(),
+            orientation_rad: track.states.orientation_rad.as_deref(),
+            mass_kg: track.states.mass_kg.as_deref(),
+            latitude_deg: latitude,
+            longitude_deg: longitude,
+        })?
+    };
+    recover::run_recovery(&table)
 }
 
 #[tauri::command]
@@ -2717,6 +2751,7 @@ pub fn run() {
             generate_trajectories,
             generate_rocketpy,
             rocketpy_status,
+            recover_trajectory,
             sample_state_vector,
             upsert_debris_catalog,
             remove_debris_catalog,
