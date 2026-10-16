@@ -75,8 +75,12 @@ export function recoveryPanelHtml({ track = null, result = null, error = "", bus
         <dt>Cd·A boost</dt><dd data-role="cd-a-boost">${escapeHtml(productValue(cd?.boost, cd?.boost_observable, "m²"))}</dd>
         <dt>Cd·A coast</dt><dd data-role="cd-a-coast">${escapeHtml(productValue(cd?.coast, cd?.coast_observable, "m²"))}</dd>
         <dt>Cl_alpha·A</dt><dd data-role="cl-alpha-a">${escapeHtml(productValue(result.cl_alpha_a_m2_per_rad, result.lift_observable, "m²/rad"))}</dd>
+        <dt>C_cross cylinder extrapolation</dt><dd data-role="c-cross">${escapeHtml(productValue(result.c_cross_m2, result.c_cross_observable, "m²"))}</dd>
+        ${finite(result.c_cross_assumed_m2) != null ? `<dt>C_cross from 1.2·L·D</dt><dd data-role="c-cross-assumed">assumed ${escapeHtml(fmt(result.c_cross_assumed_m2))} m²</dd>` : ""}
       </dl>
-      ${result.lift_observable ? "" : `<p class="recover-note" data-role="lift-note">${escapeHtml(result.lift_note || "Lift is not observable: the angle of attack stays near zero, so a lift-curve slope was not fit.")}</p>`}`
+      ${result.lift_observable ? "" : `<p class="recover-note" data-role="lift-note">${escapeHtml(result.lift_note || "Lift is not observable: the angle of attack stays near zero, so a lift-curve slope was not fit.")}</p>`}
+      <p class="recover-note" data-role="c-cross-note">${escapeHtml(result.c_cross_note || (result.c_cross_observable ? "Cylinder extrapolation of broadside drag area." : "Broadside drag area is not observable: the angle of attack stays small, so the cylinder extrapolation was not fit."))}</p>
+      ${finite(result.c_cross_assumed_m2) != null ? `<p class="recover-note" data-role="c-cross-assumed-note">${escapeHtml(result.c_cross_assumed_note || "Assumed from 1.2·L·D. Not fit from the states.")}</p>` : ""}`
     : "";
   const errorBody = error
     ? `<p class="schema-error" data-role="recover-error">${escapeHtml(error)}</p>`

@@ -249,6 +249,11 @@ class RecoverRoundTripTest(unittest.TestCase):
         self.assertFalse(result["lift_observable"])
         self.assertIsNone(result["cl_alpha_a_m2_per_rad"])
         self.assertIn("not observable", result["lift_note"].lower())
+        self.assertFalse(result["c_cross_observable"])
+        self.assertIsNone(result["c_cross_m2"])
+        self.assertIn("not observable", result["c_cross_note"].lower())
+        self.assertIn("cylinder extrapolation", result["c_cross_note"].lower())
+        self.assertIsNone(result["c_cross_assumed_m2"])
         self.assertTrue(result["cd_a_m2"]["coast_observable"])
         coast = result["cd_a_m2"]["coast"]
         self.assertLess(abs(coast - 0.5 * AREA_M2) / (0.5 * AREA_M2), 0.08)
@@ -279,6 +284,91 @@ class RecoverRoundTripTest(unittest.TestCase):
             self.assertNotIn("cd_a", message.lower())
         self.assertIn("acceleration", recover.missing_message(["acceleration", "mass"]))
         self.assertIn("Nothing was guessed", recover.missing_message(["orientation"]))
+
+
+def _allen_perkins_table(alphas_deg, c_alpha, c_cross, cd_a, speed=220.0, mass=18.0, altitude=1400.0, latitude=LATITUDE):
+    """States whose normal force is exactly C_α sinα cosα + C_cross sin²α, times q."""
+    alpha = np.radians(np.asarray(alphas_deg, dtype=float))
+    count = len(alpha)
+    time = np.linspace(0.4, 0.4 + 0.05 * (count - 1), count)
+    yaw = np.full(count, math.pi / 2.0)
+    pitch = np.zeros(count)
+    roll = np.zeros(count)
+    body = np.column_stack([np.ones(count), np.zeros(count), np.zeros(count)])
+    velocity = speed * np.column_stack([np.cos(alpha), np.zeros(count), np.sin(alpha)])
+    density = float(recover.isa_density([altitude])[0])
+    dynamic_pressure = 0.5 * density * speed**2
+    normal = np.column_stack([np.zeros(count), np.zeros(count), np.ones(count)])
+    magnitude = dynamic_pressure * (
+        c_alpha * np.sin(alpha) * np.cos(alpha) + c_cross * np.sin(alpha) ** 2
+    )
+    force = (-dynamic_pressure * cd_a) * body - magnitude[:, None] * normal
+    gravity = recover.somigliana_gravity(latitude, np.full(count, altitude))
+    earth_rate = 2.0 * math.pi / 86164.1
+    latitude_rad = math.radians(latitude)
+    omega_north = earth_rate * math.cos(latitude_rad)
+    omega_up = earth_rate * math.sin(latitude_rad)
+    east, north, up = velocity[:, 0], velocity[:, 1], velocity[:, 2]
+    specific = force / mass
+    return {
+        "latitude_deg": latitude,
+        "longitude_deg": LONGITUDE,
+        "time_s": time,
+        "east_m": np.linspace(0.0, 800.0, count),
+        "north_m": np.zeros(count),
+        "up_m": np.full(count, altitude),
+        "vel_east_mps": east,
+        "vel_north_mps": north,
+        "vel_up_mps": up,
+        "acc_east_mps2": specific[:, 0] - 2.0 * (up * omega_north - north * omega_up),
+        "acc_north_mps2": specific[:, 1] - 2.0 * (east * omega_up),
+        "acc_up_mps2": specific[:, 2] - gravity - 2.0 * (-east * omega_north),
+        "yaw_rad": yaw,
+        "pitch_rad": pitch,
+        "roll_rad": roll,
+        "mass_kg": np.full(count, mass),
+    }
+
+
+class AllenPerkinsCrossTest(unittest.TestCase):
+    def test_high_alpha_recovers_broadside_area(self):
+        c_alpha = 0.04
+        c_cross = 0.25
+        table = _allen_perkins_table(np.linspace(4.0, 90.0, 40), c_alpha, c_cross, cd_a=0.01)
+        result = recover.recover_states(table)
+        self.assertTrue(result["c_cross_observable"], result.get("c_cross_note"))
+        self.assertIn("cylinder extrapolation", result["c_cross_label"])
+        self.assertIn("cylinder extrapolation", result["c_cross_note"].lower())
+        fitted = result["c_cross_m2"]
+        error = abs(fitted - c_cross) / c_cross
+        print(f"C_cross {fitted:.6f} m² vs {c_cross:.6f} m² ({(fitted - c_cross) / c_cross:+.2%})")
+        self.assertLess(error, 0.05, f"C_cross {fitted} vs {c_cross}")
+        self.assertIsNone(result["c_cross_assumed_m2"])
+        # The existing products are still reported. This series is a coast, so boost drag stays unset.
+        self.assertTrue(result["cd_a_m2"]["coast_observable"])
+        self.assertFalse(result["cd_a_m2"]["boost_observable"])
+
+    def test_broadside_only_at_ninety_degrees(self):
+        c_cross = 0.18
+        table = _allen_perkins_table(np.full(12, 90.0), c_alpha=0.04, c_cross=c_cross, cd_a=0.01)
+        result = recover.recover_states(table)
+        self.assertTrue(result["c_cross_observable"])
+        self.assertLess(abs(result["c_cross_m2"] - c_cross) / c_cross, 0.05)
+
+    def test_near_zero_alpha_leaves_cross_unset_and_length_diameter_are_assumed(self):
+        table = _allen_perkins_table(np.linspace(0.2, 6.0, 24), c_alpha=0.04, c_cross=0.25, cd_a=0.01)
+        table["length_m"] = 2.0
+        table["diameter_m"] = 0.07
+        result = recover.recover_states(table)
+        self.assertFalse(result["c_cross_observable"])
+        self.assertIsNone(result["c_cross_m2"])
+        self.assertIn("not observable", result["c_cross_note"].lower())
+        self.assertIn("cylinder extrapolation", result["c_cross_note"].lower())
+        assumed = 1.2 * 2.0 * 0.07
+        self.assertAlmostEqual(result["c_cross_assumed_m2"], assumed)
+        self.assertIn("assumed", result["c_cross_assumed_note"].lower())
+        self.assertIn("not fit", result["c_cross_assumed_note"].lower())
+        self.assertNotEqual(result["c_cross_assumed_m2"], result["c_cross_m2"])
 
 
 if __name__ == "__main__":

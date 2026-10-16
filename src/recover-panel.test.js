@@ -34,6 +34,10 @@ test("the trajectory pop-out offers recovery for the selected trajectory", () =>
   assert.match(html, /data-role="cd-a-boost"[^>]*>0\.0061 m²</);
   assert.match(html, /data-role="cd-a-coast"[^>]*>0\.0095 m²</);
   assert.match(html, /data-role="cl-alpha-a"[^>]*>0\.0385 m²\/rad</);
+  assert.match(html, /C_cross cylinder extrapolation/);
+  assert.match(html, /data-role="c-cross"[^>]*>not observable</);
+  assert.match(html, /cylinder extrapolation was not fit/);
+  assert.doesNotMatch(html, /data-role="c-cross-assumed"/);
   assert.doesNotMatch(html, /data-role="lift-note"/);
   assert.doesNotMatch(html, /disabled/);
 });
@@ -56,6 +60,28 @@ test("a near-zero alpha flight marks lift not observable and does not invent a C
   assert.match(html, /data-role="cd-a-coast"[^>]*>0\.0095 m²</);
   assert.match(html, /Thrust: not observable/);
   assert.doesNotMatch(html, /Cl =/);
+  assert.match(html, /data-role="c-cross"[^>]*>not observable</);
+  assert.match(html, /cylinder extrapolation/);
+});
+
+test("a fitted broadside area is labeled a cylinder extrapolation, and 1.2·L·D stays assumed", () => {
+  const html = recoveryPanelHtml({
+    track: { id: 4, name: "High alpha" },
+    result: {
+      ...result,
+      c_cross_m2: 0.252,
+      c_cross_observable: true,
+      c_cross_note: "Cylinder extrapolation of broadside drag area. At 90° only the second term remains.",
+      c_cross_assumed_m2: 0.168,
+      c_cross_assumed_note: "Assumed from 1.2·L·D for a circular cylinder in subsonic flow. Not fit from the states.",
+    },
+  });
+  assert.match(html, /data-role="c-cross"[^>]*>0\.2520 m²</);
+  assert.match(html, /C_cross cylinder extrapolation/);
+  assert.match(html, /data-role="c-cross-note"[^>]*>Cylinder extrapolation/);
+  assert.match(html, /data-role="c-cross-assumed"[^>]*>assumed 0\.1680 m²</);
+  assert.match(html, /data-role="c-cross-assumed-note"[^>]*>[^<]*Not fit from the states/);
+  assert.doesNotMatch(html, /data-role="c-cross"[^>]*>assumed/);
 });
 
 test("a missing channel is shown as the recovery error, and an empty selection cannot run", () => {

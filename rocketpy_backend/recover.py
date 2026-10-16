@@ -34,6 +34,16 @@ Nose direction (body +Z, tail to nose), in that same East-North-Up frame:
 
 Optional ``# latitude_deg=`` and ``# longitude_deg=`` comments (or the same
 JSON fields) set the launch site used for gravity and Earth rotation.
+
+The normal force per unit dynamic pressure is the Allen–Perkins split
+
+    C_α · sin(α) · cos(α) + C_cross · sin²(α)
+
+``C_α`` is the fitted Cl_α·A. ``C_cross`` is the broadside drag area (m²), the
+cylinder extrapolation. It is fit only when some sample has |α| large enough
+that sin²α separates from the linear term, about 15° or more. A flight that
+stays at small α leaves ``C_cross`` unset. Optional ``length_m`` and
+``diameter_m`` may supply an assumed 1.2·L·D; that value is not a fit.
 """
 
 from __future__ import annotations
@@ -62,6 +72,18 @@ PRODUCT_NOTE = (
 LIFT_NOT_OBSERVABLE = (
     "Lift is not observable: the angle of attack stays near zero, so a lift-curve slope was not fit."
 )
+CROSS_NOT_OBSERVABLE = (
+    "Broadside drag area is not observable: the angle of attack stays small, "
+    "so the cylinder extrapolation was not fit."
+)
+CROSS_FIT_NOTE = (
+    "Cylinder extrapolation of broadside drag area. "
+    "Normal force per unit dynamic pressure is C_α·sin(α)·cos(α) + C_cross·sin²(α). "
+    "At 90° only the second term remains."
+)
+ASSUMED_CROSS_NOTE = (
+    "Assumed from 1.2·L·D for a circular cylinder in subsonic flow. Not fit from the states."
+)
 
 # ISO 2533 / RocketPy standard_atmosphere constants.
 _EARTH_RADIUS_M = 6.3781e6
@@ -77,6 +99,7 @@ _Q_EXO_PA = 10.0
 _Q_FIT_PA = 40.0
 _ALPHA_MIN_RAD = math.radians(2.0)
 _ALPHA_MAX_RAD = math.radians(28.0)
+_CROSS_ALPHA_RAD = math.radians(15.0)
 _MIN_SPEED = 20.0
 
 
@@ -169,7 +192,7 @@ def _header_value(text: str, key: str) -> float | None:
 
 def _split_header(text: str) -> tuple[dict[str, float], str]:
     meta = {}
-    for key in ("latitude_deg", "longitude_deg"):
+    for key in ("latitude_deg", "longitude_deg", "length_m", "diameter_m"):
         value = _header_value(text, key)
         if value is not None:
             meta[key] = value
@@ -223,10 +246,67 @@ def load_table(payload: dict) -> dict:
             raise ValueError(f"{name} must have one value per sample.")
     if n < 4:
         raise ValueError("The trajectory needs at least four state samples to recover parameters.")
-    for key in ("latitude_deg", "longitude_deg"):
+    for key in ("latitude_deg", "longitude_deg", "length_m", "diameter_m"):
         if payload.get(key) is not None:
             arrays[key] = float(payload[key])
     return arrays
+
+
+def _assumed_cross_area(table: dict) -> float | None:
+    """1.2·L·D when both are supplied. Never used as a substitute for a fit."""
+    length = table.get("length_m")
+    diameter = table.get("diameter_m")
+    if length is None or diameter is None:
+        return None
+    length = float(length)
+    diameter = float(diameter)
+    if not (math.isfinite(length) and math.isfinite(diameter) and length > 0.0 and diameter > 0.0):
+        return None
+    return 1.2 * length * diameter
+
+
+def _cylinder_cross(
+    dynamic_pressure: np.ndarray,
+    alpha: np.ndarray,
+    speed: np.ndarray,
+    observed_normal: np.ndarray,
+) -> tuple[float | None, bool]:
+    """Broadside area from N/q = C_α sinα cosα + C_cross sin²α.
+
+    ``C_α`` is a nuisance parameter here. The returned area is unset when no
+    usable sample reaches about 15°, or when sin²α lies on the linear term.
+    """
+    usable = (speed > _MIN_SPEED) & (dynamic_pressure >= _Q_FIT_PA) & (alpha <= math.radians(92.0))
+    if int(np.count_nonzero(usable & (alpha >= _CROSS_ALPHA_RAD))) < 1:
+        return None, False
+    fit = usable & (alpha >= math.radians(1.0))
+    if int(np.count_nonzero(fit)) < 4:
+        return None, False
+    sine = np.sin(alpha[fit])
+    cosine = np.cos(alpha[fit])
+    pressure = dynamic_pressure[fit]
+    linear = pressure * sine * cosine
+    broadside = pressure * sine**2
+    observed = observed_normal[fit]
+    linear_norm = float(np.linalg.norm(linear))
+    broadside_norm = float(np.linalg.norm(broadside))
+    if broadside_norm <= 1e-8:
+        return None, False
+    # Near 90° the linear term drops out and the broadside area stands alone.
+    if linear_norm <= 1e-6 * broadside_norm:
+        value = float(np.dot(observed, broadside) / np.dot(broadside, broadside))
+        return max(value, 0.0), True
+    correlation = abs(float(np.dot(linear, broadside))) / (linear_norm * broadside_norm)
+    if correlation > 0.995:
+        return None, False
+    coefficient, _, rank, _ = np.linalg.lstsq(
+        np.column_stack([linear, broadside]),
+        observed,
+        rcond=None,
+    )
+    if int(rank) < 2:
+        return None, False
+    return max(float(coefficient[1]), 0.0), True
 
 
 def _body_axis(yaw: np.ndarray, pitch: np.ndarray) -> np.ndarray:
@@ -453,6 +533,11 @@ def recover_states(table: dict) -> dict:
         summary_t, summary_f = [], []
         thrust_time, thrust_n = [], []
 
+    perpendicular_force = force - np.sum(force * body, axis=1)[:, None] * body
+    observed_normal = np.sum(perpendicular_force * (-normal), axis=1)
+    c_cross, cross_observable = _cylinder_cross(dynamic_pressure, alpha, speed, observed_normal)
+    assumed_cross = _assumed_cross_area(table)
+
     return {
         "ok": True,
         "phases": phases,
@@ -475,6 +560,12 @@ def recover_states(table: dict) -> dict:
         "cl_alpha_a_m2_per_rad": cl_alpha_a if lift_observable else None,
         "lift_observable": lift_observable,
         "lift_note": None if lift_observable else LIFT_NOT_OBSERVABLE,
+        "c_cross_m2": c_cross if cross_observable else None,
+        "c_cross_observable": cross_observable,
+        "c_cross_note": CROSS_FIT_NOTE if cross_observable else CROSS_NOT_OBSERVABLE,
+        "c_cross_label": "cylinder extrapolation",
+        "c_cross_assumed_m2": assumed_cross,
+        "c_cross_assumed_note": None if assumed_cross is None else ASSUMED_CROSS_NOTE,
         "product_note": PRODUCT_NOTE,
         "mass_kg": [float(value) for value in mass],
         "latitude_deg": latitude,
