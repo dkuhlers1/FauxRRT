@@ -16,10 +16,18 @@ Required columns:
 - time_s
 - east_m, north_m, up_m
   ``up_m`` is geometric altitude above sea level.
-- vel_east_mps, vel_north_mps, vel_up_mps
-- acc_east_mps2, acc_north_mps2, acc_up_mps2
 - yaw_rad, pitch_rad, roll_rad
 - mass_kg
+
+Velocity (``vel_east_mps``, ``vel_north_mps``, ``vel_up_mps``) and acceleration
+(``acc_east_mps2``, ``acc_north_mps2``, ``acc_up_mps2``) are used when the file
+has them. If velocity is missing it is the derivative of this East-North-Up
+position with respect to time. If acceleration is missing it is the derivative
+of velocity — the file's velocity, or the velocity just derived from position.
+Differences follow ``numpy.gradient`` on the actual sample times, including
+uneven spacing: second-order central differences in the interior and one-sided
+differences at the ends. The samples are not smoothed. Latitude and longitude
+are not differenced; a lat/lon track is converted to these metres first.
 
 Nose direction (body +Z, tail to nose), in that same East-North-Up frame:
 
@@ -64,7 +72,9 @@ REQUIRED_GROUPS = {
 }
 
 # Named in the clear error when absent. The fit does not invent them.
-STATED_GROUPS = ("acceleration", "orientation", "mass")
+# Velocity and acceleration are differentiated from position when those columns are absent.
+STATED_GROUPS = ("orientation", "mass")
+REQUIRED_TO_LOAD = ("time", "position", *STATED_GROUPS)
 
 PRODUCT_NOTE = (
     "Drag and lift are a coefficient times area because the states cannot separate reference area."
@@ -201,14 +211,22 @@ def _split_header(text: str) -> tuple[dict[str, float], str]:
 
 
 def load_csv(text: str) -> dict:
-    """Read the state table. Missing acceleration, orientation, or mass is an error."""
+    """Read the state table. Missing orientation or mass is an error.
+
+    Velocity and acceleration may be omitted. ``recover_states`` fills them
+    from the East-North-Up position.
+    """
     meta, body = _split_header(text)
     lines = [line for line in body.splitlines() if line.strip()]
     if not lines:
-        raise ValueError(missing_message(["time", "position", "velocity", "acceleration", "orientation", "mass"]))
+        raise ValueError(missing_message(list(REQUIRED_TO_LOAD)))
     header = [cell.strip().lower() for cell in lines[0].split(",")]
     present = set(header)
-    missing = [group for group, columns in REQUIRED_GROUPS.items() if any(column not in present for column in columns)]
+    missing = [
+        group
+        for group in REQUIRED_TO_LOAD
+        if any(column not in present for column in REQUIRED_GROUPS[group])
+    ]
     if missing:
         raise ValueError(missing_message(missing))
     index = {name: header.index(name) for name in header}
@@ -232,9 +250,16 @@ def load_table(payload: dict) -> dict:
     """Read the same columns from a JSON object."""
     missing = []
     arrays = {}
-    for group, columns in REQUIRED_GROUPS.items():
+    for group in REQUIRED_TO_LOAD:
+        columns = REQUIRED_GROUPS[group]
         if any(column not in payload or payload[column] is None for column in columns):
             missing.append(group)
+            continue
+        for column in columns:
+            arrays[column] = np.asarray(payload[column], dtype=float).ravel()
+    for group in ("velocity", "acceleration"):
+        columns = REQUIRED_GROUPS[group]
+        if any(column not in payload or payload[column] is None for column in columns):
             continue
         for column in columns:
             arrays[column] = np.asarray(payload[column], dtype=float).ravel()
@@ -385,27 +410,92 @@ def _downsample(time: np.ndarray, values: np.ndarray, limit: int = 24) -> tuple[
     return [float(time[i]) for i in chosen], [float(values[i]) for i in chosen]
 
 
+def _sample_columns(table: dict) -> dict[str, np.ndarray]:
+    """One-dimensional per-sample columns, sorted by time."""
+    time = np.asarray(table["time_s"], dtype=float).ravel()
+    n = len(time)
+    order = np.argsort(time)
+    columns = {"time_s": time[order]}
+    for key, value in table.items():
+        if key == "time_s" or value is None or isinstance(value, (bool, int, float, np.floating, np.integer)):
+            continue
+        array = np.asarray(value, dtype=float).ravel()
+        if array.shape[0] == n:
+            columns[key] = array[order]
+    return columns
+
+
+def _gradient(values: np.ndarray, time: np.ndarray) -> np.ndarray:
+    """``numpy.gradient`` on the sample times.
+
+    Central differences in the interior, one-sided at the ends. ``edge_order=2``
+    is the second-order one-sided stencil, so a constant acceleration is recovered
+    on the whole series. The samples are not smoothed.
+    """
+    if len(time) < 2 or np.any(np.diff(time) <= 0):
+        raise ValueError("Time stamps must be strictly increasing to derive velocity or acceleration.")
+    return np.gradient(values, time, axis=0, edge_order=2)
+
+
+def derived_kinematics_note(channels: list[str]) -> str | None:
+    """One sentence naming the channels that were not in the file."""
+    if channels == ["velocity", "acceleration"]:
+        return "Velocity and acceleration were derived from position."
+    if channels == ["velocity"]:
+        return "Velocity was derived from position."
+    if channels == ["acceleration"]:
+        return "Acceleration was derived from velocity."
+    return None
+
+
+def with_derived_kinematics(table: dict) -> tuple[dict, list[str]]:
+    """Sort by time and fill velocity or acceleration that the table left out.
+
+    Position is the East-North-Up metres the fitter already uses. Velocity is
+    dr/dt of that position. Acceleration is dv/dt. A velocity that is already
+    present is kept; acceleration is then derived from that velocity.
+    """
+    columns = _sample_columns(table)
+    time = columns["time_s"]
+    position = np.column_stack([columns["east_m"], columns["north_m"], columns["up_m"]])
+    derived: list[str] = []
+    if all(name in columns for name in REQUIRED_GROUPS["velocity"]):
+        velocity = np.column_stack([columns[name] for name in REQUIRED_GROUPS["velocity"]])
+    else:
+        velocity = _gradient(position, time)
+        for index, name in enumerate(REQUIRED_GROUPS["velocity"]):
+            columns[name] = velocity[:, index]
+        derived.append("velocity")
+    if not all(name in columns for name in REQUIRED_GROUPS["acceleration"]):
+        acceleration = _gradient(velocity, time)
+        for index, name in enumerate(REQUIRED_GROUPS["acceleration"]):
+            columns[name] = acceleration[:, index]
+        derived.append("acceleration")
+    out = dict(table)
+    out.update(columns)
+    return out, derived
+
+
 def recover_states(table: dict) -> dict:
     """Fit thrust(t), Cd*A, and Cl_alpha*A. Does not call RocketPy."""
+    table, derived = with_derived_kinematics(table)
     time = np.asarray(table["time_s"], dtype=float)
-    order = np.argsort(time)
-    time = time[order]
-    yaw = np.asarray(table["yaw_rad"], dtype=float)[order]
-    pitch = np.asarray(table["pitch_rad"], dtype=float)[order]
-    mass = np.asarray(table["mass_kg"], dtype=float)[order]
-    altitude = np.asarray(table["up_m"], dtype=float)[order]
+    yaw = np.asarray(table["yaw_rad"], dtype=float)
+    pitch = np.asarray(table["pitch_rad"], dtype=float)
+    mass = np.asarray(table["mass_kg"], dtype=float)
+    altitude = np.asarray(table["up_m"], dtype=float)
     velocity = np.column_stack(
         [
-            np.asarray(table["vel_east_mps"], dtype=float)[order],
-            np.asarray(table["vel_north_mps"], dtype=float)[order],
-            np.asarray(table["vel_up_mps"], dtype=float)[order],
+            np.asarray(table["vel_east_mps"], dtype=float),
+            np.asarray(table["vel_north_mps"], dtype=float),
+            np.asarray(table["vel_up_mps"], dtype=float),
         ]
     )
     acceleration = np.column_stack(
         [
-            np.asarray(table["acc_east_mps2"], dtype=float)[order],
-            np.asarray(table["acc_north_mps2"], dtype=float)[order],
-            np.asarray(table["acc_up_mps2"], dtype=float)[order],
+            np.asarray(table["acc_east_mps2"], dtype=float),
+            np.asarray(table["acc_north_mps2"], dtype=float),
+            np.asarray(table["acc_up_mps2"], dtype=float),
         ]
     )
     latitude = float(table.get("latitude_deg") or 0.0)
@@ -567,6 +657,8 @@ def recover_states(table: dict) -> dict:
         "c_cross_assumed_m2": assumed_cross,
         "c_cross_assumed_note": None if assumed_cross is None else ASSUMED_CROSS_NOTE,
         "product_note": PRODUCT_NOTE,
+        "derived_channels": derived,
+        "derived_note": derived_kinematics_note(derived),
         "mass_kg": [float(value) for value in mass],
         "latitude_deg": latitude,
     }

@@ -39,6 +39,7 @@ test("the trajectory pop-out offers recovery for the selected trajectory", () =>
   assert.match(html, /cylinder extrapolation was not fit/);
   assert.doesNotMatch(html, /data-role="c-cross-assumed"/);
   assert.doesNotMatch(html, /data-role="lift-note"/);
+  assert.doesNotMatch(html, /data-role="derived-note"/);
   assert.doesNotMatch(html, /disabled/);
 });
 
@@ -82,6 +83,29 @@ test("a fitted broadside area is labeled a cylinder extrapolation, and 1.2·L·D
   assert.match(html, /data-role="c-cross-assumed"[^>]*>assumed 0\.1680 m²</);
   assert.match(html, /data-role="c-cross-assumed-note"[^>]*>[^<]*Not fit from the states/);
   assert.doesNotMatch(html, /data-role="c-cross"[^>]*>assumed/);
+});
+
+test("derived velocity and acceleration are one short note on the trajectory pop-out", () => {
+  const html = recoveryPanelHtml({
+    track: { id: 8, name: "Positions" },
+    result: {
+      ...result,
+      derived_channels: ["velocity", "acceleration"],
+      derived_note: "Velocity and acceleration were derived from position.",
+    },
+  });
+  assert.match(html, /data-role="derived-note"[^>]*>Velocity and acceleration were derived from position\./);
+  assert.equal(html.match(/data-role="derived-note"/g).length, 1);
+
+  const fromVelocity = recoveryPanelHtml({
+    track: { id: 8, name: "Positions" },
+    result: {
+      ...result,
+      derived_channels: ["acceleration"],
+      derived_note: "Acceleration was derived from velocity.",
+    },
+  });
+  assert.match(fromVelocity, /data-role="derived-note"[^>]*>Acceleration was derived from velocity\./);
 });
 
 test("a missing channel is shown as the recovery error, and an empty selection cannot run", () => {
