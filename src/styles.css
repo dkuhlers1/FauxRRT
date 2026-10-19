@@ -111,6 +111,65 @@ body {
 
 #globe { flex: 1; min-height: 0; position: relative; }
 
+/* Bottom-right overlay. The bottom inset clears the Cesium credit strip.
+   max-height stays under the home / scene-mode toolbar at the top right.
+   max-width keeps the stack inside a narrow globe. */
+.globe-layers {
+  position: absolute;
+  z-index: 6;
+  right: 8px;
+  bottom: 36px;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 2px;
+  width: max-content;
+  max-width: calc(100% - 16px);
+  max-height: calc(100% - 108px);
+  overflow: auto;
+  margin: 0;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid rgba(215, 225, 234, 0.45);
+  background: rgba(12, 16, 22, 0.9);
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.5);
+  color: #f4f7fb;
+  text-transform: none;
+  letter-spacing: 0;
+  pointer-events: auto;
+}
+.globe-layers:not(:has(label:not(.hidden))) { display: none; }
+.globe-layers label {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  width: max-content;
+  margin: 0;
+  color: #f4f7fb;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.35;
+  letter-spacing: 0;
+  text-transform: none;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.85);
+}
+.globe-layers label span {
+  white-space: nowrap;
+}
+.globe-layers input {
+  margin: 2px 0 0;
+  flex: 0 0 auto;
+  accent-color: var(--accent);
+}
+@media (max-width: 640px) {
+  .globe-layers {
+    right: 4px;
+    bottom: 36px;
+    max-width: calc(100% - 8px);
+    padding: 6px 8px;
+  }
+}
+
 .surface-wind-canvas {
   position: absolute;
   pointer-events: none;
@@ -347,14 +406,6 @@ select {
 .cesium-credit-logoContainer, .cesium-credit-textContainer { filter: grayscale(1) brightness(1.4); }
 
 .risk-hint { margin: 0 0 8px; line-height: 1.4; }
-.globe-bar-right .inline {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  font-size: 11px;
-  text-transform: none;
-  letter-spacing: 0;
-}
 input[type="number"], input[type="text"] {
   background: #0f151c;
   color: var(--text);

@@ -7,6 +7,7 @@
  * so the Cesium scene stays on its on-demand render loop.
  */
 
+import { windFieldOnGlobe } from "./globe-layers.js";
 import {
   advectInto,
   boundsContain,
@@ -33,6 +34,22 @@ let legend = null;
 let particles = null;
 let currentField = null;
 let layerAlpha = DEFAULT_WIND_ALPHA;
+let windVisible = true;
+
+export function setWindLayerVisible(visible) {
+  windVisible = Boolean(visible);
+  applyWindLayerVisibility();
+}
+
+export function windLayerActive() {
+  return windFieldOnGlobe(currentField);
+}
+
+function applyWindLayerVisibility() {
+  const shown = windVisible ? "visible" : "hidden";
+  if (canvas) canvas.style.visibility = shown;
+  if (legend) legend.style.visibility = shown;
+}
 
 export function setSurfaceWindAlpha(alpha) {
   const value = Number(alpha);
@@ -133,6 +150,7 @@ function startLayer(viewer) {
   legend = buildLegend(currentField);
   parent.appendChild(legend);
   placeOverlay(canvas, legend, hostCanvas, parent);
+  applyWindLayerVisibility();
 
   const ctx = canvas.getContext("2d", { alpha: true });
   const lat = new Float32Array(MAX_WIND_PARTICLES);
