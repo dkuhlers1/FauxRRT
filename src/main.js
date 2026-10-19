@@ -34,10 +34,23 @@ import {
   setTerminateHullVisible,
   setRiskIsolines,
   setRiskIsolinesVisible,
+  setTrajectoriesVisible,
   setVesselRiskCells,
   setVesselRiskVisible,
   setVisible,
+  setWindLayerVisible,
+  windLayerActive,
 } from "./globe.js";
+import {
+  boatOnGlobe,
+  globeLayersToShow,
+  GLOBE_LAYER_ROWS,
+  isolineOnGlobe,
+  kdeGridOnGlobe,
+  layerPresenceFromCounts,
+  trackDrawsOnGlobe,
+  vesselCellOnGlobe,
+} from "./globe-layers.js";
 import { enrichBoat, parseBoatKml, scoreBoatsAgainstGrid } from "./boats-kml.js";
 import { historicalBrief, peekGfsSurfaceField } from "./wind-field.js";
 import {
@@ -157,6 +170,7 @@ let vesselResult = null;
 let lastPointKey = "";
 let lastWeightKey = "";
 let lastImpactSummary = "";
+let impactCount = 0;
 const KDE_IDLE_MS = 1000;
 
 const els = {
@@ -176,6 +190,8 @@ const els = {
   objectList: document.getElementById("object-list"),
   unassigned: document.getElementById("unassigned"),
   kdeStatus: document.getElementById("kde-status"),
+  showTrajectories: document.getElementById("show-trajectories"),
+  showWind: document.getElementById("show-wind"),
   showImpacts: document.getElementById("show-impacts"),
   showKde: document.getElementById("show-kde"),
   showVessel: document.getElementById("show-vessel-risk"),
@@ -212,6 +228,12 @@ els.fit?.addEventListener("click", () => {
   flyToImpactsOrTracks(list);
 });
 els.addObject?.addEventListener("click", () => addTrajectoryObject());
+els.showTrajectories?.addEventListener("change", () => {
+  setTrajectoriesVisible(els.showTrajectories.checked);
+});
+els.showWind?.addEventListener("change", () => {
+  setWindLayerVisible(els.showWind.checked);
+});
 els.showImpacts?.addEventListener("change", () => {
   setImpactVisible(els.showImpacts.checked);
   persistMissionUi();
@@ -718,6 +740,7 @@ function vesselScore(boat) {
 }
 
 function renderBoats() {
+  syncGlobeLayers();
   if (els.boatRisk) {
     if (!boats.length) {
       els.boatRisk.textContent = "";
@@ -1586,6 +1609,7 @@ function syncTracksToModel() {
     removeTrack(id);
     if (selectedId === id) selectedId = null;
   }
+  syncGlobeLayers();
 }
 
 function applyRiskToTracks() {
@@ -2436,6 +2460,13 @@ function globeWindStamp() {
   ].join("|");
 }
 
+function pushGlobeWind(request) {
+  return setMissionWindAnimation(request, () => syncGlobeLayers()).then((result) => {
+    syncGlobeLayers();
+    return result;
+  });
+}
+
 function queueGlobeWind() {
   const stamp = globeWindStamp();
   if (stamp === windShownStamp || stamp === windRequestStamp) return;
@@ -2443,12 +2474,12 @@ function queueGlobeWind() {
   const type = missionWind.type || "off";
   if (type === "off") {
     windShownStamp = stamp;
-    setMissionWindAnimation({ type: "off" });
+    pushGlobeWind({ type: "off" });
     return;
   }
   if (type === "constant") {
     windShownStamp = stamp;
-    setMissionWindAnimation({
+    pushGlobeWind({
       type: "constant",
       speed_mps: missionWind.speed_mps,
       from_deg: missionWind.from_deg,
@@ -2457,7 +2488,7 @@ function queueGlobeWind() {
   }
   if (type === "surface") {
     windShownStamp = stamp;
-    setMissionWindAnimation({
+    pushGlobeWind({
       type: "surface",
       time: missionWind.time,
       source: missionWind.source,
@@ -2476,7 +2507,7 @@ function queueGlobeWind() {
     source: missionWind.source,
   });
   showHistoricalBrief(loading.text);
-  setMissionWindAnimation({
+  pushGlobeWind({
     type: "historical",
     loading: true,
     date: missionWind.date,
@@ -2490,7 +2521,7 @@ function queueGlobeWind() {
     const brief = historicalBrief(field || { type: "historical" });
     showHistoricalBrief(brief.text);
     if (field?.source) missionWind.source = field.source;
-    setMissionWindAnimation(field || { type: "off" });
+    pushGlobeWind(field || { type: "off" });
   }).catch((err) => {
     if (windRequestStamp !== stamp || missionWind.type !== "historical") return;
     windRequestStamp = "";
@@ -2501,7 +2532,7 @@ function queueGlobeWind() {
       error: String(err),
     });
     showHistoricalBrief(brief.text);
-    setMissionWindAnimation({
+    pushGlobeWind({
       type: "historical",
       date: missionWind.date,
       hour_utc: missionWind.hour_utc,
@@ -4305,6 +4336,36 @@ function setImpactStatus(text) {
   if (els.kdeStatus) els.kdeStatus.textContent = text;
 }
 
+function publishImpacts(impacts) {
+  const list = Array.isArray(impacts) ? impacts : [];
+  impactCount = list.length;
+  setImpactPoints(list);
+}
+
+function countWhere(list, pred) {
+  let n = 0;
+  for (const item of list || []) if (pred(item)) n += 1;
+  return n;
+}
+
+function syncGlobeLayers() {
+  const shown = new Set(globeLayersToShow(layerPresenceFromCounts({
+    trajectories: countWhere(tracks.values(), trackDrawsOnGlobe),
+    wind: windLayerActive(),
+    impacts: impactCount,
+    kde: kdeGridOnGlobe(lastKdeGrid),
+    vessel: countWhere(vesselResult?.cells, vesselCellOnGlobe),
+    isolines: countWhere(vesselResult?.isolines, isolineOnGlobe),
+    boats: countWhere(boats, boatOnGlobe),
+    terminate: terminateHullPoints().length,
+  })).map((row) => row.id));
+  for (const row of GLOBE_LAYER_ROWS) {
+    const el = document.querySelector(`#globe-layers [data-layer="${row.id}"]`);
+    if (!el) continue;
+    el.classList.toggle("hidden", !shown.has(row.id));
+  }
+}
+
 async function saveVesselParams() {
   const params = {
     ke_threshold_j: Number(els.vesselKe?.value),
@@ -4420,7 +4481,8 @@ async function refreshOverlays(opts = {}) {
     lastPointKey = "";
     lastWeightKey = "";
     lastImpactSummary = "";
-    setImpactPoints([]);
+    lastKdeGrid = null;
+    publishImpacts([]);
     await setKdeGrid(null);
     setVesselRiskCells([]);
     setRiskIsolines([]);
@@ -4435,6 +4497,7 @@ async function refreshOverlays(opts = {}) {
   lastPointKey = pointKey;
   lastWeightKey = weightKey;
   if (pointsChanged) {
+    lastKdeGrid = null;
     await setKdeGrid(null);
     await extractAndShowImpacts();
   }
@@ -4449,6 +4512,7 @@ async function refreshOverlays(opts = {}) {
       scheduleVessel();
     }
   }
+  syncGlobeLayers();
 }
 
 async function extractAndShowImpacts() {
@@ -4456,9 +4520,10 @@ async function extractAndShowImpacts() {
   try {
     const result = await invoke("extract_impacts", ipcArgs({ thresholdM: 0 }));
     if (seq !== impactSeq) return;
-    setImpactPoints(result.impacts);
+    publishImpacts(result.impacts);
     setImpactVisible(els.showImpacts?.checked !== false);
     setImpactStatus(`${result.impacts.length} impacts, ${result.missing.length} no-impact`);
+    syncGlobeLayers();
   } catch (err) {
     if (seq !== impactSeq) return;
     setImpactStatus(`Impact extract failed: ${String(err)}`);
@@ -4473,7 +4538,7 @@ async function runKde(seq) {
     const result = await invoke("compute_kde", ipcArgs({ objectId: null, thresholdM: 0 }));
     if (seq !== kdeSeq) return;
     lastWeightKey = assignedWeightKey();
-    setImpactPoints(result.impacts);
+    publishImpacts(result.impacts);
     setImpactVisible(els.showImpacts?.checked !== false);
     lastKdeGrid = result.grid || null;
     await setKdeGrid(result.grid);
@@ -4591,6 +4656,8 @@ async function applySnapshot(snap, fit) {
   selectedBoatId = null;
   hoveredBoatId = null;
   lastKdeGrid = null;
+  vesselResult = null;
+  impactCount = 0;
   generateDrafts.clear();
   generateEngine.clear();
   rocketpyDrafts.clear();

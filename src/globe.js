@@ -1,9 +1,22 @@
-import { setMissionWindAnimation as startMissionWind, setSurfaceWindAlpha } from "./wind-layer.js";
+import {
+  setMissionWindAnimation as startMissionWind,
+  setSurfaceWindAlpha,
+  setWindLayerVisible,
+  windLayerActive,
+} from "./wind-layer.js";
 
-export { setSurfaceWindAlpha };
+export { setSurfaceWindAlpha, setWindLayerVisible, windLayerActive };
 
 const tracks = new Map();
+let trajectoriesVisible = true;
 let viewer;
+
+function applyTrackShow(item) {
+  if (!item) return;
+  const show = trajectoriesVisible && item.meta.visible !== false;
+  if (item.line) item.line.show = show;
+  if (item.arrowPrim) item.arrowPrim.show = show;
+}
 let polylines;
 let arrowPrims;
 let sitePoints;
@@ -492,10 +505,7 @@ function addTrackNow(meta, opts = {}) {
   const wantArrow = !opts.skipArrow && (visibleCount() < ARROW_LIMIT || meta.id === selectedId);
   const arrowPrim = wantArrow ? addTravelArrow(Cesium, positions, color) : null;
   tracks.set(meta.id, { line, arrowPrim, meta, color, positions });
-  if (meta.visible === false) {
-    line.show = false;
-    if (arrowPrim) arrowPrim.show = false;
-  }
+  applyTrackShow(tracks.get(meta.id));
 }
 
 export function addTracks(list) {
@@ -554,9 +564,15 @@ export function clearTracks() {
 export function setVisible(id, visible) {
   const item = tracks.get(id);
   if (!item) return;
-  item.line.show = visible;
-  if (item.arrowPrim) item.arrowPrim.show = visible;
   item.meta.visible = visible;
+  applyTrackShow(item);
+  syncArrows();
+  requestRender();
+}
+
+export function setTrajectoriesVisible(visible) {
+  trajectoriesVisible = Boolean(visible);
+  for (const item of tracks.values()) applyTrackShow(item);
   syncArrows();
   requestRender();
 }
@@ -604,7 +620,7 @@ function syncArrows() {
   if (!arrowPrims) return;
   const showAll = visibleCount() <= ARROW_LIMIT;
   for (const [id, item] of tracks) {
-    const want = item.meta.visible !== false && (showAll || id === selectedId);
+    const want = trajectoriesVisible && item.meta.visible !== false && (showAll || id === selectedId);
     if (want && !item.arrowPrim) {
       item.arrowPrim = addTravelArrow(Cesium, item.positions, item.color);
     } else if (!want && item.arrowPrim) {

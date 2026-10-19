@@ -115,13 +115,6 @@
         <header class="globe-bar">
           <span>Globe</span>
           <div class="globe-bar-right">
-            <label class="inline muted"><input type="checkbox" id="show-impacts" checked /> Impacts</label>
-            <label class="inline muted"><input type="checkbox" id="show-kde" checked /> KDE</label>
-            <label class="inline muted" title="H3 cell risk Risk(g) for vessels"><input type="checkbox" id="show-vessel-risk" checked /> Vessel risk</label>
-            <label class="inline muted" title="Contours of Risk(g) at 10⁻¹, 10⁻², 10⁻³, and so on"><input type="checkbox" id="show-risk-isolines" checked /> Risk isolines</label>
-            <label class="inline muted"><input type="checkbox" id="show-boats" checked /> Boats</label>
-            <label class="inline muted" title="Convex hull on the ellipsoid around impact points"><input type="checkbox" id="show-iip-boundary" /> IIP boundary</label>
-            <label class="inline muted" title="Convex hull on the ellipsoid around nav-failure FTS fire positions"><input type="checkbox" id="show-terminate-boundary" /> Terminate boundary</label>
             <select id="imagery-kind" title="Basemap">
               <option value="satellite">Satellite</option>
               <option value="streets">Streets</option>
@@ -131,7 +124,37 @@
             <button type="button" id="btn-cancel-classify" class="ghost compact" hidden>Cancel</button>
           </div>
         </header>
-        <div id="globe"></div>
+        <div id="globe">
+          <div id="globe-layers" class="globe-layers" role="group" aria-label="Globe layers">
+            <label class="globe-layer hidden" data-layer="trajectories" title="Flight paths">
+              <input type="checkbox" id="show-trajectories" checked /> <span>Trajectories</span>
+            </label>
+            <label class="globe-layer hidden" data-layer="wind" title="Wind streaks for the mission wind">
+              <input type="checkbox" id="show-wind" checked /> <span>Wind</span>
+            </label>
+            <label class="globe-layer hidden" data-layer="impacts">
+              <input type="checkbox" id="show-impacts" checked /> <span>Impacts</span>
+            </label>
+            <label class="globe-layer hidden" data-layer="kde">
+              <input type="checkbox" id="show-kde" checked /> <span>KDE</span>
+            </label>
+            <label class="globe-layer hidden" data-layer="vessel" title="H3 cell risk Risk(g) for vessels">
+              <input type="checkbox" id="show-vessel-risk" checked /> <span>Vessel risk</span>
+            </label>
+            <label class="globe-layer hidden" data-layer="isolines" title="Contours of Risk(g) at 10⁻¹, 10⁻², 10⁻³, and so on">
+              <input type="checkbox" id="show-risk-isolines" checked /> <span>Risk isolines</span>
+            </label>
+            <label class="globe-layer hidden" data-layer="boats">
+              <input type="checkbox" id="show-boats" checked /> <span>Boats</span>
+            </label>
+            <label class="globe-layer hidden" data-layer="iip" title="Convex hull on the ellipsoid around impact points">
+              <input type="checkbox" id="show-iip-boundary" /> <span>IIP boundary</span>
+            </label>
+            <label class="globe-layer hidden" data-layer="terminate" title="Convex hull on the ellipsoid around nav-failure FTS fire positions">
+              <input type="checkbox" id="show-terminate-boundary" /> <span>Terminate boundary</span>
+            </label>
+          </div>
+        </div>
         <aside id="side-drawer" class="side-drawer" hidden>
           <header class="drawer-head">
             <h2 id="drawer-title">Trajectories</h2>
