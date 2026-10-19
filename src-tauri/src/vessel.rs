@@ -19,6 +19,11 @@
 //! present (`10^-1`, `10^-2`, `10^-3`, …). They are not linear steps, and
 //! drawing them does not change cell risk, collective risk, or per-boat
 //! individual risk.
+//!
+//! The smoothed field is sampled back onto H3 cells around each impact.
+//! That disk does not cover the whole density. A boat the density still
+//! covers is scored from the value at the boat, and a boat outside the
+//! density keeps the cell value it already had.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -387,11 +392,16 @@ pub fn compute_vessel_risk(objects: &[ObjectInput], params: &VesselParams, boats
         }
         let mut weighted = Vec::new();
         for (traj, p) in object.trajectories.iter().zip(probs) {
-            let (field, bw) = trajectory_risk(traj, &params, a_g, cap);
+            let (mut field, bw, density) = trajectory_risk(traj, &params, a_g, cap);
             if let Some((east, north)) = bw {
                 smoothed = true;
                 bw_e = Some(bw_e.map(|v: f64| v.max(east)).unwrap_or(east));
                 bw_n = Some(bw_n.map(|v: f64| v.max(north)).unwrap_or(north));
+            }
+            if let Some(density) = density.as_ref() {
+                // The H3 disk around impacts stops short of the density.
+                // Write the overlap onto a boat cell the disk left empty.
+                paint_boat_overlaps(&mut field, density, boats);
             }
             weighted.push((p, field));
         }
@@ -425,10 +435,10 @@ fn trajectory_risk(
     params: &VesselParams,
     a_g: f64,
     cap: usize,
-) -> (HashMap<u64, f64>, Option<(f64, f64)>) {
+) -> (HashMap<u64, f64>, Option<(f64, f64)>, Option<DensityGrid>) {
     let n = traj.trials.len().min(cap);
     if n == 0 {
-        return (HashMap::new(), None);
+        return (HashMap::new(), None, None);
     }
     let mut trials = Vec::with_capacity(n);
     let mut points: Vec<[f64; 2]> = Vec::new();
@@ -457,12 +467,53 @@ fn trajectory_risk(
     }
     let raw = mean_trials(&trials);
     match smooth_risk(&raw, &points) {
-        Some((field, east, north)) => (field, Some((east, north))),
-        None => (raw, None),
+        Some((field, density)) => {
+            let bw = (density.band.bandwidth_x, density.band.bandwidth_y);
+            (field, Some(bw), Some(density))
+        }
+        None => (raw, None, None),
     }
 }
 
-fn smooth_risk(field: &HashMap<u64, f64>, lonlat: &[[f64; 2]]) -> Option<(HashMap<u64, f64>, f64, f64)> {
+/// Smoothed risk on the same local frame used to build the density.
+struct DensityGrid {
+    frame: LocalFrame,
+    values: Vec<f64>,
+    n: usize,
+    band: BotevBand,
+}
+
+impl DensityGrid {
+    /// Risk at `lon`, `lat`. `None` when the point is outside the density,
+    /// so an edge cell is not treated as an overlap.
+    fn sample(&self, lon: f64, lat: f64) -> Option<f64> {
+        let [east, north] = self.frame.to_metres(lon, lat);
+        sample_inside(&self.values, self.n, &self.band, east, north)
+    }
+}
+
+/// Fill boat cells the impact disk did not paint, using the density at the
+/// boat. Cells that already have a risk are left alone, and a boat outside
+/// the density is not given a strike from it.
+fn paint_boat_overlaps(field: &mut HashMap<u64, f64>, density: &DensityGrid, boats: &[BoatQuery]) {
+    for boat in boats {
+        let Some(cell) = cell_index(boat.lon, boat.lat) else {
+            continue;
+        };
+        let key = u64::from(cell);
+        if field.contains_key(&key) {
+            continue;
+        }
+        let Some(value) = density.sample(boat.lon, boat.lat) else {
+            continue;
+        };
+        if value.is_finite() && value > 0.0 {
+            field.insert(key, value.clamp(0.0, 1.0));
+        }
+    }
+}
+
+fn smooth_risk(field: &HashMap<u64, f64>, lonlat: &[[f64; 2]]) -> Option<(HashMap<u64, f64>, DensityGrid)> {
     if field.is_empty() || lonlat.len() < 2 {
         return None;
     }
@@ -497,7 +548,15 @@ fn smooth_risk(field: &HashMap<u64, f64>, lonlat: &[[f64; 2]]) -> Option<(HashMa
             }
         }
     }
-    Some((out, botev.bandwidth_x, botev.bandwidth_y))
+    Some((
+        out,
+        DensityGrid {
+            frame,
+            values: diffused,
+            n: BOTEV_N,
+            band: botev,
+        },
+    ))
 }
 
 fn rasterize_field(field: &HashMap<u64, f64>, frame: &LocalFrame, botev: &BotevBand) -> Vec<f64> {
@@ -519,18 +578,36 @@ fn rasterize_field(field: &HashMap<u64, f64>, frame: &LocalFrame, botev: &BotevB
 }
 
 fn sample_grid(grid: &[f64], n: usize, botev: &BotevBand, east: f64, north: f64) -> f64 {
-    if botev.scale_x <= 0.0 || botev.scale_y <= 0.0 {
+    if botev.scale_x <= 0.0 || botev.scale_y <= 0.0 || n == 0 {
         return 0.0;
     }
     let fx = ((east - botev.min_x) / botev.scale_x * n as f64 - 0.5).clamp(0.0, (n - 1) as f64);
     let fy = ((north - botev.min_y) / botev.scale_y * n as f64 - 0.5).clamp(0.0, (n - 1) as f64);
+    interp_grid(grid, n, fx, fy)
+}
+
+/// Bilinear sample. `None` outside the density extent — callers must not
+/// clamp onto the edge and call that an overlap.
+fn sample_inside(grid: &[f64], n: usize, botev: &BotevBand, east: f64, north: f64) -> Option<f64> {
+    if n < 2 || botev.scale_x <= 0.0 || botev.scale_y <= 0.0 {
+        return None;
+    }
+    let fx = (east - botev.min_x) / botev.scale_x * n as f64 - 0.5;
+    let fy = (north - botev.min_y) / botev.scale_y * n as f64 - 0.5;
+    if !(0.0..=(n - 1) as f64).contains(&fx) || !(0.0..=(n - 1) as f64).contains(&fy) {
+        return None;
+    }
+    Some(interp_grid(grid, n, fx, fy))
+}
+
+fn interp_grid(grid: &[f64], n: usize, fx: f64, fy: f64) -> f64 {
     let x0 = fx.floor() as usize;
     let y0 = fy.floor() as usize;
     let x1 = (x0 + 1).min(n - 1);
     let y1 = (y0 + 1).min(n - 1);
     let tx = fx - x0 as f64;
     let ty = fy - y0 as f64;
-    let v = |x, y| grid[x * n + y];
+    let v = |x: usize, y: usize| grid[x * n + y];
     (1.0 - ty) * ((1.0 - tx) * v(x0, y0) + tx * v(x1, y0)) + ty * ((1.0 - tx) * v(x0, y1) + tx * v(x1, y1))
 }
 
@@ -1817,5 +1894,143 @@ mod tests {
         assert!((result.boats[1].strike).abs() < 1e-12);
         assert!((result.boats[1].individual.unwrap() - 0.0).abs() < 1e-12);
         assert!(result.isolines.is_empty(), "0.36 sits inside one decade");
+    }
+
+    fn flat_density(lon: f64, lat: f64, value: f64) -> DensityGrid {
+        let frame = LocalFrame::from_lonlat(&[[lon, lat]]).unwrap();
+        let n = 8;
+        DensityGrid {
+            frame,
+            values: vec![value; n * n],
+            n,
+            band: BotevBand {
+                t_x: 0.01,
+                t_y: 0.01,
+                min_x: -50_000.0,
+                min_y: -50_000.0,
+                scale_x: 100_000.0,
+                scale_y: 100_000.0,
+                bandwidth_x: 10_000.0,
+                bandwidth_y: 10_000.0,
+            },
+        }
+    }
+
+    #[test]
+    fn kde_overlap_sets_finite_strike_and_individual() {
+        let on = BoatQuery {
+            id: 1,
+            name: "Under the KDE".into(),
+            lon: -90.0,
+            lat: 29.0,
+            people: Some(4),
+        };
+        let kept = BoatQuery {
+            id: 2,
+            name: "Cell only".into(),
+            lon: -70.0,
+            lat: 10.0,
+            people: Some(6),
+        };
+        let outside = BoatQuery {
+            id: 3,
+            name: "Outside the KDE".into(),
+            lon: -60.0,
+            lat: 12.0,
+            people: Some(3),
+        };
+        let density = flat_density(on.lon, on.lat, 0.25);
+        let on_cell = u64::from(cell_index(on.lon, on.lat).unwrap());
+        let kept_cell = u64::from(cell_index(kept.lon, kept.lat).unwrap());
+        let outside_cell = u64::from(cell_index(outside.lon, outside.lat).unwrap());
+        let mut field = HashMap::new();
+        field.insert(kept_cell, 0.2);
+        paint_boat_overlaps(&mut field, &density, &[on.clone(), kept.clone(), outside.clone()]);
+        assert!((field[&on_cell] - 0.25).abs() < 1e-12, "overlap is written onto the boat cell");
+        assert!(
+            (field[&kept_cell] - 0.2).abs() < 1e-12,
+            "a boat outside the density keeps its vessel-risk cell"
+        );
+        assert!(!field.contains_key(&outside_cell), "a boat outside the density gets no strike from it");
+        let (scores, _) = score_boats(&field, &[on, kept, outside]);
+        assert!(scores[0].strike.is_finite() && scores[0].strike > 0.0);
+        assert!(scores[0].individual.unwrap().is_finite());
+        assert!((scores[0].individual.unwrap() - scores[0].strike * 4.0).abs() < 1e-12);
+        assert!((scores[1].strike - 0.2).abs() < 1e-12);
+        assert!((scores[1].individual.unwrap() - 1.2).abs() < 1e-12);
+        assert!(scores[2].strike.abs() < 1e-12);
+        assert!(scores[2].individual.unwrap().abs() < 1e-12);
+    }
+
+    #[test]
+    fn smoothed_kde_scores_a_boat_outside_the_h3_disk() {
+        let a_g = cell_area_m2();
+        let params = VesselParams {
+            ke_threshold_j: 0.0,
+            a_proj_m2: 0.5 * a_g,
+            p_proj_m: 0.0,
+            max_trials: 8,
+            default_mass_kg: 20.0,
+            default_radius_m: 0.0,
+        };
+        let mut pieces = Vec::new();
+        let mut impact_cells = Vec::new();
+        for i in 0..40 {
+            let t = i as f64;
+            let lon = -91.0 + (t / 39.0) * 2.0;
+            let lat = 29.0 + (t * 0.35).sin() * 0.12;
+            pieces.push(vertical(lon, lat, 40.0, 0.0, 100.0));
+            impact_cells.push(cell_index(lon, lat).unwrap());
+        }
+        let covered = BoatQuery {
+            id: 1,
+            name: "In the density, outside the disk".into(),
+            lon: -91.30,
+            lat: 29.0,
+            people: Some(5),
+        };
+        let far = BoatQuery {
+            id: 2,
+            name: "Outside the density".into(),
+            lon: -40.0,
+            lat: 10.0,
+            people: Some(2),
+        };
+        let covered_cell = cell_index(covered.lon, covered.lat).unwrap();
+        let mut nearest = i32::MAX;
+        for cell in &impact_cells {
+            let d = covered_cell.grid_distance(*cell).expect("grid distance");
+            nearest = nearest.min(d);
+        }
+        assert!(nearest > 24, "boat must sit outside the H3 disk, nearest {nearest}");
+        let result = compute_vessel_risk(
+            &[ObjectInput {
+                name: "Vehicle".into(),
+                trajectories: vec![TrajectoryInput {
+                    weight: 1.0,
+                    trials: vec![pieces],
+                }],
+            }],
+            &params,
+            &[covered, far],
+        )
+        .unwrap();
+        assert!(result.smoothed, "this field has a KDE");
+        let hot = &result.boats[0];
+        assert!(
+            hot.strike.is_finite() && hot.strike > 0.0,
+            "strike {} bw {:?}",
+            hot.strike,
+            (result.bandwidth_east_m, result.bandwidth_north_m)
+        );
+        let individual = hot.individual.expect("people are known");
+        assert!(individual.is_finite() && individual > 0.0, "{individual}");
+        assert!((individual - hot.strike * 5.0).abs() < 1e-12);
+        assert!(
+            result.boats[1].strike.abs() < 1e-12,
+            "outside boat strike {}",
+            result.boats[1].strike
+        );
+        assert!(result.boats[1].individual.unwrap().abs() < 1e-12);
     }
 }
