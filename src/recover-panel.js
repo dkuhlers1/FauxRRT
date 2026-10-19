@@ -86,12 +86,16 @@ export function recoveryPanelHtml({ track = null, result = null, error = "", bus
     ? `<p class="schema-error" data-role="recover-error">${escapeHtml(error)}</p>`
     : "";
   const status = busy ? `<p class="muted" data-role="recover-status">Recovering parameters…</p>` : "";
+  const derivedNote = result?.derived_note
+    ? `<p class="recover-note" data-role="derived-note">${escapeHtml(result.derived_note)}</p>`
+    : "";
   return `<section class="recover-panel" data-role="recover-panel" data-track-id="${track ? escapeHtml(track.id) : ""}">
     <h3>Recover parameters</h3>
     <p class="muted" data-role="selected-trajectory">Selected trajectory: ${name}</p>
     <button type="button" data-act="recover-parameters" class="compact"${disabled}>Recover parameters</button>
     ${status}
     ${errorBody}
+    ${derivedNote}
     <p class="recover-note" data-role="product-note">${escapeHtml(note)}</p>
     ${phaseBody}
     ${thrustBody}

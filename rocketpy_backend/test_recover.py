@@ -229,6 +229,8 @@ class RecoverRoundTripTest(unittest.TestCase):
         print(f"re-fly peak position error {peak_error:.2f} m")
         self.assertLess(peak_error, 40.0, f"re-fly position error {peak_error:.1f} m")
         self.assertIn("coefficient times area", result["product_note"])
+        self.assertEqual(result["derived_channels"], [])
+        self.assertIsNone(result["derived_note"])
         self.assertTrue(any(phase["boosting"] and phase["atmosphere"] == "endoatmospheric" for phase in result["phases"]))
         self.assertTrue(any((not phase["boosting"]) and phase["atmosphere"] == "endoatmospheric" for phase in result["phases"]))
 
@@ -255,10 +257,12 @@ class RecoverRoundTripTest(unittest.TestCase):
         self.assertIn("cylinder extrapolation", result["c_cross_note"].lower())
         self.assertIsNone(result["c_cross_assumed_m2"])
         self.assertTrue(result["cd_a_m2"]["coast_observable"])
+        self.assertEqual(result["derived_channels"], [])
+        self.assertIsNone(result["derived_note"])
         coast = result["cd_a_m2"]["coast"]
         self.assertLess(abs(coast - 0.5 * AREA_M2) / (0.5 * AREA_M2), 0.08)
 
-    def test_missing_acceleration_orientation_or_mass_is_an_error(self):
+    def test_missing_orientation_or_mass_is_an_error(self):
         header = (
             "# latitude_deg=32.99\n"
             "time_s,east_m,north_m,up_m,vel_east_mps,vel_north_mps,vel_up_mps,"
@@ -266,7 +270,6 @@ class RecoverRoundTripTest(unittest.TestCase):
         )
         row = "0,0,0,1400,0,10,40,0,0,20,0,1.2,0,20\n"
         cases = {
-            "acceleration": ("acc_east_mps2", "acc_north_mps2", "acc_up_mps2"),
             "orientation": ("yaw_rad", "pitch_rad", "roll_rad"),
             "mass": ("mass_kg",),
         }
@@ -369,6 +372,135 @@ class AllenPerkinsCrossTest(unittest.TestCase):
         self.assertIn("assumed", result["c_cross_assumed_note"].lower())
         self.assertIn("not fit", result["c_cross_assumed_note"].lower())
         self.assertNotEqual(result["c_cross_assumed_m2"], result["c_cross_m2"])
+
+
+def _constant_acceleration_series():
+    """Uneven times and r = r0 + v0 t + ½ a t²."""
+    step = np.linspace(0.05, 0.2, 40)
+    time = np.cumsum(np.concatenate([[0.0], step]))
+    origin = np.array([1000.0, -250.0, 1400.0])
+    velocity0 = np.array([12.0, -3.0, 40.0])
+    acceleration = np.array([-0.4, 0.15, -6.2])
+    position = origin + velocity0 * time[:, None] + 0.5 * acceleration * time[:, None] ** 2
+    velocity = velocity0 + acceleration * time[:, None]
+    return time, position, velocity, acceleration
+
+
+def _state_csv(time, position, velocity=None, acceleration=None) -> str:
+    count = len(time)
+    columns = {
+        "time_s": time,
+        "east_m": position[:, 0],
+        "north_m": position[:, 1],
+        "up_m": position[:, 2],
+    }
+    if velocity is not None:
+        columns["vel_east_mps"] = velocity[:, 0]
+        columns["vel_north_mps"] = velocity[:, 1]
+        columns["vel_up_mps"] = velocity[:, 2]
+    if acceleration is not None:
+        columns["acc_east_mps2"] = acceleration[:, 0]
+        columns["acc_north_mps2"] = acceleration[:, 1]
+        columns["acc_up_mps2"] = acceleration[:, 2]
+    columns["yaw_rad"] = np.full(count, 0.2)
+    columns["pitch_rad"] = np.full(count, 0.8)
+    columns["roll_rad"] = np.zeros(count)
+    columns["mass_kg"] = np.full(count, 18.0)
+    names = list(columns)
+    stacked = np.column_stack([columns[name] for name in names])
+    body = "\n".join(",".join(f"{value:.17g}" for value in row) for row in stacked)
+    return (
+        f"# latitude_deg={LATITUDE}\n"
+        f"# longitude_deg={LONGITUDE}\n"
+        + ",".join(names)
+        + "\n"
+        + body
+        + "\n"
+    )
+
+
+def _state_payload(time, position, velocity=None) -> dict:
+    count = len(time)
+    payload = {
+        "latitude_deg": LATITUDE,
+        "longitude_deg": LONGITUDE,
+        "time_s": time,
+        "east_m": position[:, 0],
+        "north_m": position[:, 1],
+        "up_m": position[:, 2],
+        "yaw_rad": np.full(count, 0.2),
+        "pitch_rad": np.full(count, 0.8),
+        "roll_rad": np.zeros(count),
+        "mass_kg": np.full(count, 18.0),
+    }
+    if velocity is not None:
+        payload["vel_east_mps"] = velocity[:, 0]
+        payload["vel_north_mps"] = velocity[:, 1]
+        payload["vel_up_mps"] = velocity[:, 2]
+    return payload
+
+
+class DerivedKinematicsTest(unittest.TestCase):
+    def test_omitted_velocity_and_acceleration_match_constant_acceleration(self):
+        time, position, velocity, acceleration = _constant_acceleration_series()
+        text = _state_csv(time, position)
+        filled, channels = recover.with_derived_kinematics(recover.load_csv(text))
+        self.assertEqual(channels, ["velocity", "acceleration"])
+        got_velocity = np.column_stack(
+            [filled["vel_east_mps"], filled["vel_north_mps"], filled["vel_up_mps"]]
+        )
+        got_acceleration = np.column_stack(
+            [filled["acc_east_mps2"], filled["acc_north_mps2"], filled["acc_up_mps2"]]
+        )
+        velocity_error = float(np.max(np.abs(got_velocity - velocity)))
+        acceleration_error = float(np.max(np.abs(got_acceleration - acceleration)))
+        print(f"derived velocity max abs error {velocity_error:.3e} m/s")
+        print(f"derived acceleration max abs error {acceleration_error:.3e} m/s²")
+        self.assertLess(velocity_error, 1e-6)
+        self.assertLess(acceleration_error, 1e-6)
+
+        payload = _state_payload(time, position)
+        result = recover.recover_states(recover.load_table(payload))
+        self.assertEqual(result["derived_channels"], ["velocity", "acceleration"])
+        self.assertEqual(result["derived_note"], "Velocity and acceleration were derived from position.")
+
+    def test_omitted_acceleration_is_derived_from_the_given_velocity(self):
+        time, position, velocity, acceleration = _constant_acceleration_series()
+        # A constant offset is not the position derivative. It must be kept.
+        given = velocity + np.array([5.0, -2.0, 0.3])
+        text = _state_csv(time, position, velocity=given)
+        filled, channels = recover.with_derived_kinematics(recover.load_csv(text))
+        self.assertEqual(channels, ["acceleration"])
+        kept = np.column_stack(
+            [filled["vel_east_mps"], filled["vel_north_mps"], filled["vel_up_mps"]]
+        )
+        got_acceleration = np.column_stack(
+            [filled["acc_east_mps2"], filled["acc_north_mps2"], filled["acc_up_mps2"]]
+        )
+        velocity_error = float(np.max(np.abs(kept - given)))
+        acceleration_error = float(np.max(np.abs(got_acceleration - acceleration)))
+        print(f"kept velocity max abs error {velocity_error:.3e} m/s")
+        print(f"acceleration from given velocity max abs error {acceleration_error:.3e} m/s²")
+        self.assertLess(velocity_error, 1e-6)
+        self.assertLess(acceleration_error, 1e-6)
+        result = recover.recover_csv(text)
+        self.assertEqual(result["derived_channels"], ["acceleration"])
+        self.assertEqual(result["derived_note"], "Acceleration was derived from velocity.")
+
+    def test_existing_acceleration_is_kept_when_velocity_is_derived(self):
+        time, position, velocity, _acceleration = _constant_acceleration_series()
+        count = len(time)
+        table = _state_payload(time, position)
+        table["acc_east_mps2"] = np.full(count, 1.25)
+        table["acc_north_mps2"] = np.full(count, -0.5)
+        table["acc_up_mps2"] = np.full(count, 3.0)
+        filled, channels = recover.with_derived_kinematics(table)
+        self.assertEqual(channels, ["velocity"])
+        self.assertEqual(recover.derived_kinematics_note(channels), "Velocity was derived from position.")
+        velocity_error = float(np.max(np.abs(filled["vel_east_mps"] - velocity[:, 0])))
+        self.assertLess(velocity_error, 1e-6)
+        self.assertTrue(np.all(filled["acc_east_mps2"] == 1.25))
+        self.assertTrue(np.all(filled["acc_up_mps2"] == 3.0))
 
 
 if __name__ == "__main__":

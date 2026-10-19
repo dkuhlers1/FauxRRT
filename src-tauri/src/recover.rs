@@ -1,8 +1,13 @@
 //! Recover thrust and aerodynamic products from one loaded trajectory.
 //!
 //! The force fit lives in `rocketpy_backend/recover.py`. This module checks that
-//! acceleration, orientation, and mass were actually in the file, converts the
-//! stored ECEF states into the East-North-Up table that fitter reads, and runs it.
+//! orientation and mass were actually in the file, converts stored positions
+//! into the East-North-Up metres the fitter reads, and runs it.
+//!
+//! Velocity and acceleration are passed through when the file had them. When
+//! either is absent, the fitter differentiates that East-North-Up position
+//! (velocity is dr/dt, then acceleration is dv/dt). Latitude and longitude
+//! are not differenced.
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -14,8 +19,19 @@ use serde_json::{json, Value};
 use crate::geodesy::{ecef_to_enu_vector, lla_to_ecef};
 
 pub fn missing_parameter_message(groups: &[&str]) -> String {
-    let order = ["acceleration", "orientation", "mass", "time", "position", "velocity"];
-    let mut listed: Vec<&str> = order.iter().copied().filter(|name| groups.contains(name)).collect();
+    let order = [
+        "acceleration",
+        "orientation",
+        "mass",
+        "time",
+        "position",
+        "velocity",
+    ];
+    let mut listed: Vec<&str> = order
+        .iter()
+        .copied()
+        .filter(|name| groups.contains(name))
+        .collect();
     if listed.is_empty() {
         listed = groups.to_vec();
     }
@@ -52,21 +68,23 @@ fn full(channel: Option<&[f32]>, samples: usize, width: usize) -> bool {
 }
 
 /// Build the fitter's state table, or the clear missing-channel error.
+///
+/// Latitude and longitude are converted to East-North-Up metres before any
+/// derivative. Velocity and acceleration columns are omitted when the file
+/// did not have them, and the fitter differentiates the Cartesian position.
 pub fn recovery_table(input: &RecoveryInput) -> Result<Value, String> {
     let samples = input.lla.len() / 3;
     if samples < 4 || input.lla.len() != samples * 3 {
-        return Err("The trajectory needs at least four state samples to recover parameters.".into());
+        return Err(
+            "The trajectory needs at least four state samples to recover parameters.".into(),
+        );
     }
     let mut missing = Vec::new();
     if input.time_s.len() != samples {
         missing.push("time");
     }
-    if !full(input.velocity_ecef_mps, samples, 3) {
-        missing.push("velocity");
-    }
-    if !full(input.acceleration_ecef_mps2, samples, 3) {
-        missing.push("acceleration");
-    }
+    let have_velocity = full(input.velocity_ecef_mps, samples, 3);
+    let have_acceleration = full(input.acceleration_ecef_mps2, samples, 3);
     if !full(input.orientation_rad, samples, 3) {
         missing.push("orientation");
     }
@@ -76,8 +94,8 @@ pub fn recovery_table(input: &RecoveryInput) -> Result<Value, String> {
     if !missing.is_empty() {
         return Err(missing_parameter_message(&missing));
     }
-    let velocity = input.velocity_ecef_mps.unwrap();
-    let acceleration = input.acceleration_ecef_mps2.unwrap();
+    let velocity = input.velocity_ecef_mps.filter(|_| have_velocity);
+    let acceleration = input.acceleration_ecef_mps2.filter(|_| have_acceleration);
     let orientation = input.orientation_rad.unwrap();
     let mass = input.mass_kg.unwrap();
 
@@ -107,54 +125,63 @@ pub fn recovery_table(input: &RecoveryInput) -> Result<Value, String> {
         let alt = input.lla[i * 3 + 2] as f64;
         let (x, y, z) = lla_to_ecef(lat, lon, alt);
         let (east, north, _) = ecef_to_enu_vector(lat0, lon0, x - x0, y - y0, z - z0);
-        let (ve, vn, vu) = ecef_to_enu_vector(
-            lat0,
-            lon0,
-            velocity[i * 3] as f64,
-            velocity[i * 3 + 1] as f64,
-            velocity[i * 3 + 2] as f64,
-        );
-        let (ae, an, au) = ecef_to_enu_vector(
-            lat0,
-            lon0,
-            acceleration[i * 3] as f64,
-            acceleration[i * 3 + 1] as f64,
-            acceleration[i * 3 + 2] as f64,
-        );
         time_s.push(input.time_s[i]);
         east_m.push(east);
         north_m.push(north);
         up_m.push(alt);
-        vel_e.push(ve);
-        vel_n.push(vn);
-        vel_u.push(vu);
-        acc_e.push(ae);
-        acc_n.push(an);
-        acc_u.push(au);
+        if let Some(velocity) = velocity {
+            let (ve, vn, vu) = ecef_to_enu_vector(
+                lat0,
+                lon0,
+                velocity[i * 3] as f64,
+                velocity[i * 3 + 1] as f64,
+                velocity[i * 3 + 2] as f64,
+            );
+            vel_e.push(ve);
+            vel_n.push(vn);
+            vel_u.push(vu);
+        }
+        if let Some(acceleration) = acceleration {
+            let (ae, an, au) = ecef_to_enu_vector(
+                lat0,
+                lon0,
+                acceleration[i * 3] as f64,
+                acceleration[i * 3 + 1] as f64,
+                acceleration[i * 3 + 2] as f64,
+            );
+            acc_e.push(ae);
+            acc_n.push(an);
+            acc_u.push(au);
+        }
         roll.push(orientation[i * 3] as f64);
         pitch.push(orientation[i * 3 + 1] as f64);
         yaw.push(orientation[i * 3 + 2] as f64);
         mass_kg.push(mass[i] as f64);
     }
 
-    Ok(json!({
+    let mut table = json!({
         "latitude_deg": lat0,
         "longitude_deg": lon0,
         "time_s": time_s,
         "east_m": east_m,
         "north_m": north_m,
         "up_m": up_m,
-        "vel_east_mps": vel_e,
-        "vel_north_mps": vel_n,
-        "vel_up_mps": vel_u,
-        "acc_east_mps2": acc_e,
-        "acc_north_mps2": acc_n,
-        "acc_up_mps2": acc_u,
         "yaw_rad": yaw,
         "pitch_rad": pitch,
         "roll_rad": roll,
         "mass_kg": mass_kg,
-    }))
+    });
+    if have_velocity {
+        table["vel_east_mps"] = json!(vel_e);
+        table["vel_north_mps"] = json!(vel_n);
+        table["vel_up_mps"] = json!(vel_u);
+    }
+    if have_acceleration {
+        table["acc_east_mps2"] = json!(acc_e);
+        table["acc_north_mps2"] = json!(acc_n);
+        table["acc_up_mps2"] = json!(acc_u);
+    }
+    Ok(table)
 }
 
 fn backend_script() -> PathBuf {
@@ -175,7 +202,11 @@ fn python_bin() -> PathBuf {
         .join("..")
         .join("rocketpy_backend")
         .join(".venv")
-        .join(if cfg!(windows) { "Scripts/python.exe" } else { "bin/python" });
+        .join(if cfg!(windows) {
+            "Scripts/python.exe"
+        } else {
+            "bin/python"
+        });
     if venv.is_file() {
         return venv;
     }
@@ -185,9 +216,13 @@ fn python_bin() -> PathBuf {
 pub fn run_recovery(table: &Value) -> Result<Value, String> {
     let script = backend_script();
     if !script.is_file() {
-        return Err(format!("recovery script was not found at {}", script.display()));
+        return Err(format!(
+            "recovery script was not found at {}",
+            script.display()
+        ));
     }
-    let payload = serde_json::to_vec(table).map_err(|err| format!("encode recovery states: {err}"))?;
+    let payload =
+        serde_json::to_vec(table).map_err(|err| format!("encode recovery states: {err}"))?;
     let mut command = Command::new(python_bin());
     command
         .arg("-u")
@@ -198,7 +233,9 @@ pub fn run_recovery(table: &Value) -> Result<Value, String> {
         .env("PYTHONUTF8", "1")
         .env("PYTHONIOENCODING", "utf-8")
         .env("PYTHONUNBUFFERED", "1");
-    let mut child = command.spawn().map_err(|err| format!("start parameter recovery: {err}"))?;
+    let mut child = command
+        .spawn()
+        .map_err(|err| format!("start parameter recovery: {err}"))?;
     if let Some(mut stdin) = child.stdin.take() {
         stdin
             .write_all(&payload)
@@ -213,7 +250,11 @@ pub fn run_recovery(table: &Value) -> Result<Value, String> {
         .find(|line| line.trim_start().starts_with('{'))
         .unwrap_or(stdout.trim());
     let parsed: Value = serde_json::from_str(line).map_err(|err| {
-        let hint = stderr.lines().rev().find(|line| !line.trim().is_empty()).unwrap_or("no Python error text");
+        let hint = stderr
+            .lines()
+            .rev()
+            .find(|line| !line.trim().is_empty())
+            .unwrap_or("no Python error text");
         format!("parameter recovery did not return JSON ({err}). {hint}")
     })?;
     if parsed.get("ok").and_then(|value| value.as_bool()) == Some(false) {
@@ -224,17 +265,26 @@ pub fn run_recovery(table: &Value) -> Result<Value, String> {
             .to_string());
     }
     if !output.status.success() {
-        return Err(stderr.lines().last().unwrap_or("parameter recovery failed").to_string());
+        return Err(stderr
+            .lines()
+            .last()
+            .unwrap_or("parameter recovery failed")
+            .to_string());
     }
     Ok(parsed)
 }
 
-fn wait_child(mut child: std::process::Child, limit: Duration) -> Result<std::process::Output, String> {
+fn wait_child(
+    mut child: std::process::Child,
+    limit: Duration,
+) -> Result<std::process::Output, String> {
     let started = std::time::Instant::now();
     loop {
         match child.try_wait() {
             Ok(Some(_)) => {
-                return child.wait_with_output().map_err(|err| format!("wait for recovery: {err}"));
+                return child
+                    .wait_with_output()
+                    .map_err(|err| format!("wait for recovery: {err}"));
             }
             Ok(None) if started.elapsed() > limit => {
                 let _ = child.kill();
@@ -278,8 +328,76 @@ Nothing was guessed."
             longitude_deg: -106.0,
         };
         let err = recovery_table(&input).unwrap_err();
-        assert!(err.contains("acceleration, orientation, and mass are missing"));
+        assert!(err.contains("orientation and mass are missing"));
         assert!(err.contains("Nothing was guessed"));
+        assert!(!err.contains("acceleration, orientation, and mass are missing"));
+        assert!(!err.contains("acceleration is missing"));
         assert!(!err.to_lowercase().contains("cd"));
+    }
+
+    #[test]
+    fn missing_velocity_and_acceleration_build_enu_metres() {
+        let time = vec![0.0, 1.0, 2.0, 3.0];
+        let mut lla = Vec::new();
+        for i in 0..4 {
+            lla.push(0.001 * i as f32);
+            lla.push(0.0);
+            lla.push(100.0);
+        }
+        let orientation = vec![0.0; 12];
+        let mass = vec![20.0; 4];
+        let input = RecoveryInput {
+            time_s: &time,
+            lla: &lla,
+            velocity_ecef_mps: None,
+            acceleration_ecef_mps2: None,
+            orientation_rad: Some(&orientation),
+            mass_kg: Some(&mass),
+            latitude_deg: 0.0,
+            longitude_deg: 0.0,
+        };
+        let table = recovery_table(&input).unwrap();
+        assert!(table.get("vel_east_mps").is_none());
+        assert!(table.get("vel_north_mps").is_none());
+        assert!(table.get("vel_up_mps").is_none());
+        assert!(table.get("acc_east_mps2").is_none());
+        let east = table["east_m"].as_array().unwrap();
+        let up = table["up_m"].as_array().unwrap();
+        let last_east = east[3].as_f64().unwrap();
+        assert!(
+            last_east > 50.0,
+            "east displacement was {last_east}, expected metres not degrees"
+        );
+        assert!((up[0].as_f64().unwrap() - 100.0).abs() < 1e-6);
+        assert!((table["yaw_rad"][0].as_f64().unwrap()).abs() < 1e-12);
+    }
+
+    #[test]
+    fn file_velocity_is_kept_when_acceleration_is_absent() {
+        let time = vec![0.0, 1.0, 2.0, 3.0];
+        let lla = vec![0.0; 12];
+        let velocity = vec![
+            10.0, 0.0, 0.0, 10.0, 0.0, 0.0, 10.0, 0.0, 0.0, 10.0, 0.0, 0.0,
+        ];
+        let orientation = vec![0.1; 12];
+        let mass = vec![18.0; 4];
+        let input = RecoveryInput {
+            time_s: &time,
+            lla: &lla,
+            velocity_ecef_mps: Some(&velocity),
+            acceleration_ecef_mps2: None,
+            orientation_rad: Some(&orientation),
+            mass_kg: Some(&mass),
+            latitude_deg: 0.0,
+            longitude_deg: 0.0,
+        };
+        let table = recovery_table(&input).unwrap();
+        assert!(table.get("acc_east_mps2").is_none());
+        // ECEF +X at lat 0, lon 0 is local up, so the file velocity is kept in that frame.
+        let up = table["vel_up_mps"].as_array().unwrap();
+        let east = table["vel_east_mps"].as_array().unwrap();
+        assert_eq!(up.len(), 4);
+        assert!((up[0].as_f64().unwrap() - 10.0).abs() < 1e-5);
+        assert!(east[0].as_f64().unwrap().abs() < 1e-5);
     }
 }
