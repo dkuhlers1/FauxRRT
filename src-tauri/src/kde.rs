@@ -36,6 +36,18 @@ pub struct KdeGrid {
     pub bandwidth_east_m: f64,
     pub bandwidth_north_m: f64,
     pub n_points: usize,
+    /// Res-8 hexes that meet this grid and have a positive density at the
+    /// hex center. Display sampling of `values`; the FFT grid stays the estimator.
+    pub cells: Vec<KdeCell>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct KdeCell {
+    pub h3: String,
+    /// [`sample_density`] at the hex center, per m².
+    pub value: f64,
+    /// Ring as lon, lat, lon, lat, … in degrees.
+    pub boundary: Vec<f64>,
 }
 
 pub fn kde_lonlat(points: &[WeightedPoint]) -> Option<KdeGrid> {
@@ -124,7 +136,7 @@ pub fn kde_lonlat(points: &[WeightedPoint]) -> Option<KdeGrid> {
     let south = lat0 + ymin / my;
     let north = lat0 + ymax / my;
 
-    Some(KdeGrid {
+    let mut grid = KdeGrid {
         west,
         south,
         east,
@@ -137,7 +149,44 @@ pub fn kde_lonlat(points: &[WeightedPoint]) -> Option<KdeGrid> {
         bandwidth_east_m: hx,
         bandwidth_north_m: hy,
         n_points: pts.len(),
-    })
+        cells: Vec::new(),
+    };
+    grid.cells = hex_cells(&grid);
+    Some(grid)
+}
+
+fn align_lon(grid: &KdeGrid, mut lon: f64) -> f64 {
+    let mid = 0.5 * (grid.west + grid.east);
+    while lon - mid > 180.0 {
+        lon -= 360.0;
+    }
+    while lon - mid < -180.0 {
+        lon += 360.0;
+    }
+    lon
+}
+
+/// Every res-8 cell that intersects the KDE bounds and is positive at its center.
+fn hex_cells(grid: &KdeGrid) -> Vec<KdeCell> {
+    let mut cells = Vec::new();
+    for cell in crate::vessel::cells_covering_bounds(grid.west, grid.south, grid.east, grid.north) {
+        let center = h3o::LatLng::from(cell);
+        let value = sample_density(grid, align_lon(grid, center.lng()), center.lat());
+        if !value.is_finite() || value <= 0.0 {
+            continue;
+        }
+        let mut boundary = Vec::with_capacity(12);
+        for ll in cell.boundary().iter() {
+            boundary.push(ll.lng());
+            boundary.push(ll.lat());
+        }
+        cells.push(KdeCell {
+            h3: cell.to_string(),
+            value,
+            boundary,
+        });
+    }
+    cells
 }
 
 /// Bilinear sample of probability density (1/m²). Zero outside the grid.
@@ -560,6 +609,58 @@ mod tests {
         assert!(grid.east - grid.west > 0.05, "span {}", grid.east - grid.west);
         assert!(grid.north - grid.south > 0.05);
         assert!(grid.bandwidth_east_m >= 1_900.0);
+    }
+
+    #[test]
+    fn hexes_over_positive_density_are_res8_and_share_one_area() {
+        let mut pts = Vec::new();
+        for i in 0..40 {
+            let jitter = (i as f64 - 20.0) * 0.002;
+            pts.push(WeightedPoint {
+                lon: -106.4 + jitter,
+                lat: 32.4 + jitter * 0.4,
+                weight: 0.025,
+            });
+        }
+        let grid = kde_lonlat(&pts).expect("kde");
+        assert!(grid.mass > 0.7 && grid.mass < 1.3, "mass {}", grid.mass);
+        assert!(grid.bandwidth_east_m > 0.0);
+        assert!(grid.bandwidth_north_m > 0.0);
+        assert!(grid.max_value > 0.0);
+        assert!(!grid.cells.is_empty(), "positive density covers at least one hex");
+        let shared = h3o::Resolution::Eight.area_m2();
+        let mut min_exact = f64::INFINITY;
+        let mut max_exact = 0.0_f64;
+        for cell in &grid.cells {
+            let idx: h3o::CellIndex = cell.h3.parse().expect("h3");
+            assert_eq!(idx.resolution(), h3o::Resolution::Eight);
+            assert_eq!(idx.resolution().area_m2(), shared);
+            assert!(cell.value.is_finite() && cell.value > 0.0);
+            let center = h3o::LatLng::from(idx);
+            let mut lon = center.lng();
+            let mid = 0.5 * (grid.west + grid.east);
+            while lon - mid > 180.0 {
+                lon -= 360.0;
+            }
+            while lon - mid < -180.0 {
+                lon += 360.0;
+            }
+            let sampled = sample_density(&grid, lon, center.lat());
+            assert!((sampled - cell.value).abs() < 1e-12, "hex value is sample_density at the center");
+            if !idx.is_pentagon() {
+                assert_eq!(idx.boundary().len(), 6);
+                let neighbors: Vec<h3o::CellIndex> = idx.grid_disk(1);
+                let others: Vec<_> = neighbors.into_iter().filter(|n| *n != idx).collect();
+                assert_eq!(others.len(), 6, "six neighbors at one spacing");
+                for neighbor in &others {
+                    assert_eq!(idx.grid_distance(*neighbor).unwrap(), 1);
+                }
+            }
+            let exact = idx.area_m2();
+            min_exact = min_exact.min(exact);
+            max_exact = max_exact.max(exact);
+        }
+        assert!(max_exact / min_exact < 1.05, "hex areas {min_exact}..{max_exact}");
     }
 
     #[test]

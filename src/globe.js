@@ -1,3 +1,4 @@
+import { kdeGridOnGlobe, kdeHexesToDraw } from "./globe-layers.js";
 import {
   setMissionWindAnimation as startMissionWind,
   setSurfaceWindAlpha,
@@ -670,7 +671,6 @@ let impactPoints;
 let kdePrim;
 let lastImpacts = [];
 let lastGrid = null;
-let lastKdeCanvas = null;
 let iipHullEntity = null;
 let terminateHullEntity = null;
 let lastTerminatePts = [];
@@ -840,27 +840,50 @@ export async function setKdeGrid(grid) {
   const Cesium = window.Cesium;
   clearKde();
   lastGrid = grid;
-  if (!viewer || !grid || !grid.values?.length || !(grid.max_value > 0)) {
+  const hexes = kdeHexesToDraw(grid);
+  if (!viewer || !kdeGridOnGlobe(grid) || !hexes.length) {
     requestRender();
     return;
   }
-  const canvas = densityCanvas(grid);
-  lastKdeCanvas = canvas;
-  const rectangle = Cesium.Rectangle.fromDegrees(grid.west, grid.south, grid.east, grid.north);
-  const material = Cesium.Material.fromType("Image", { image: canvas });
-  kdePrim = viewer.scene.primitives.add(new Cesium.Primitive({
-    geometryInstances: new Cesium.GeometryInstance({
-      geometry: new Cesium.RectangleGeometry({
-        rectangle,
-        vertexFormat: Cesium.EllipsoidSurfaceAppearance.VERTEX_FORMAT,
+  const max = Math.max(Number(grid.max_value) || 0, 1e-18);
+  const instances = [];
+  for (const cell of hexes) {
+    const ring = cell.boundary || [];
+    const positions = [];
+    for (let i = 0; i + 1 < ring.length; i += 2) {
+      positions.push(Cesium.Cartesian3.fromDegrees(ring[i], ring[i + 1], 0));
+    }
+    // Same ramp as the old raster: faint tails stay transparent.
+    const t = Math.pow(Math.max(Number(cell.value) || 0, 0) / max, 0.55);
+    if (t < 0.008) continue;
+    const color = Cesium.Color.fromBytes(
+      Math.min(255, Math.round(40 + 280 * t)),
+      Math.min(255, Math.round(220 * Math.max(0, 1 - t) + 40 * t)),
+      Math.min(255, Math.round(30 + 40 * (1 - t))),
+      Math.round(70 + 185 * t),
+    );
+    instances.push(new Cesium.GeometryInstance({
+      geometry: new Cesium.PolygonGeometry({
+        polygonHierarchy: new Cesium.PolygonHierarchy(positions),
         height: 0,
+        vertexFormat: Cesium.PerInstanceColorAppearance.VERTEX_FORMAT,
       }),
+      attributes: {
+        color: Cesium.ColorGeometryInstanceAttribute.fromColor(color),
+      },
+    }));
+  }
+  if (!instances.length) {
+    requestRender();
+    return;
+  }
+  kdePrim = viewer.scene.primitives.add(new Cesium.Primitive({
+    geometryInstances: instances,
+    appearance: new Cesium.PerInstanceColorAppearance({
+      translucent: true,
+      closed: false,
     }),
-    appearance: new Cesium.EllipsoidSurfaceAppearance({
-      aboveGround: false,
-      material,
-    }),
-    asynchronous: false,
+    asynchronous: true,
     allowPicking: false,
   }));
   kdePrim.show = true;
@@ -1178,33 +1201,6 @@ function clearKde() {
     viewer.scene.primitives.remove(kdePrim);
     kdePrim = null;
   }
-  lastKdeCanvas = null;
-}
-
-function densityCanvas(grid) {
-  const canvas = document.createElement("canvas");
-  canvas.width = grid.nx;
-  canvas.height = grid.ny;
-  const ctx = canvas.getContext("2d");
-  const img = ctx.createImageData(grid.nx, grid.ny);
-  const max = Math.max(grid.max_value, 1e-18);
-  for (let i = 0; i < grid.values.length; i++) {
-    const t = Math.pow(Math.max(grid.values[i], 0) / max, 0.55);
-    const o = i * 4;
-    if (t < 0.008) {
-      img.data[o + 3] = 0;
-      continue;
-    }
-    const r = Math.min(255, Math.round(40 + 280 * t));
-    const g = Math.min(255, Math.round(220 * Math.max(0, 1 - t) + 40 * t));
-    const b = Math.min(255, Math.round(30 + 40 * (1 - t)));
-    img.data[o] = r;
-    img.data[o + 1] = g;
-    img.data[o + 2] = b;
-    img.data[o + 3] = Math.round(70 + 185 * t);
-  }
-  ctx.putImageData(img, 0, 0);
-  return canvas;
 }
 
 function travelDirection(Cesium, positions) {
