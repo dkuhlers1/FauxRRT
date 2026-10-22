@@ -14,19 +14,22 @@
 //! used. When the impact sample has no measurable spread, the risk matrix is
 //! left unchanged because a bandwidth is not identifiable.
 //!
-//! Isolines are only a display of that smoothed `Risk(g)` field. Default
-//! levels are the powers of ten that fall in the risk values actually
-//! present (`10^-1`, `10^-2`, `10^-3`, …). They are not linear steps, and
-//! drawing them does not change cell risk, collective risk, or per-boat
-//! individual risk.
+//! Isolines are only a display of that smoothed `Risk(g)` field. They are
+//! traced on the fine rectangular density, so the contours stay smooth
+//! instead of stepping along hex edges. Default levels are the powers of
+//! ten that fall in the risk values actually present (`10^-1`, `10^-2`,
+//! `10^-3`, …). They are not linear steps, and drawing them does not change
+//! cell risk, collective risk, or per-boat individual risk.
 //!
-//! The smoothed field is sampled back onto H3 cells around each impact.
-//! That disk does not cover the whole density. A boat the density still
-//! covers is scored from the value at the boat, and a boat outside the
-//! density keeps the cell value it already had.
+//! The smoothed field is sampled onto every resolution-8 cell that meets
+//! the density bounds. The cell value is the continuous density at the hex
+//! center. A boat in one of those cells reads that cell. A boat the density
+//! still covers whose hex was not painted is scored from the value at the
+//! boat, and a boat outside the density keeps the cell value it already had.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
+use h3o::geom::{ContainmentMode, PolyfillConfig, Rect as H3Rect, ToCells};
 use h3o::{CellIndex, LatLng, Resolution};
 use rustfft::num_complex::Complex;
 use rustfft::FftPlanner;
@@ -214,6 +217,75 @@ pub fn cell_index(lon: f64, lat: f64) -> Option<CellIndex> {
     Some(ll.to_cell(H3_RES))
 }
 
+/// Resolution-8 cells whose footprint meets the lon/lat rectangle.
+///
+/// The rectangle is the KDE bounds. Callers keep a cell only when the
+/// continuous density at its center is positive, so a center that falls
+/// outside the density does not become a drawn hex.
+pub(crate) fn cells_covering_bounds(west: f64, south: f64, east: f64, north: f64) -> Vec<CellIndex> {
+    if ![west, south, east, north].iter().all(|v| v.is_finite()) {
+        return Vec::new();
+    }
+    let south = south.clamp(-90.0, 90.0);
+    let north = north.clamp(-90.0, 90.0);
+    if north <= south {
+        return Vec::new();
+    }
+    let span = east - west;
+    if span <= 0.0 || span >= 360.0 {
+        return Vec::new();
+    }
+    let west_n = wrap_lon_180(west);
+    let east_n = wrap_lon_180(west + span);
+    if east_n < west_n {
+        let mut cells = polyfill_rect(west_n, south, 180.0, north);
+        cells.extend(polyfill_rect(-180.0, south, east_n, north));
+        cells.sort_unstable();
+        cells.dedup();
+        cells
+    } else {
+        polyfill_rect(west_n, south, east_n, north)
+    }
+}
+
+fn wrap_lon_180(mut lon: f64) -> f64 {
+    while lon > 180.0 {
+        lon -= 360.0;
+    }
+    while lon < -180.0 {
+        lon += 360.0;
+    }
+    lon
+}
+
+fn polyfill_rect(west: f64, south: f64, east: f64, north: f64) -> Vec<CellIndex> {
+    if !(east > west && north > south) {
+        return Vec::new();
+    }
+    let rect = geo::Rect::new(geo::Coord { x: west, y: south }, geo::Coord { x: east, y: north });
+    let Ok(rect) = H3Rect::from_degrees(rect) else {
+        return Vec::new();
+    };
+    // Covers keeps every cell that intersects the rectangle, including a
+    // cell that only clips an edge. Centers outside the density are dropped
+    // by the caller when the sample is not positive.
+    let config = PolyfillConfig::new(H3_RES).containment_mode(ContainmentMode::Covers);
+    let mut cells: Vec<CellIndex> = rect.to_cells(config).collect();
+    cells.sort_unstable();
+    cells.dedup();
+    cells
+}
+
+fn align_lon_to(lon0: f64, mut lon: f64) -> f64 {
+    while lon - lon0 > 180.0 {
+        lon -= 360.0;
+    }
+    while lon - lon0 < -180.0 {
+        lon += 360.0;
+    }
+    lon
+}
+
 /// Trajectory weights on one object. Negative weights and a non-positive sum
 /// are rejected. Any other positive set that does not already sum to 1 is
 /// divided by its sum. That normalization is the explicit behavior.
@@ -377,9 +449,11 @@ pub fn compute_vessel_risk(objects: &[ObjectInput], params: &VesselParams, boats
     let cap = params.max_trials.clamp(1, MAX_TRIALS) as usize;
     let mut notes = Vec::new();
     let mut object_fields = Vec::new();
+    let mut fine_objects: Vec<Vec<FinePart>> = Vec::new();
     let mut bw_e = None;
     let mut bw_n = None;
     let mut smoothed = false;
+    let mut saw_density = false;
 
     for object in objects {
         let weights: Vec<f64> = object.trajectories.iter().map(|t| t.weight).collect();
@@ -391,6 +465,7 @@ pub fn compute_vessel_risk(objects: &[ObjectInput], params: &VesselParams, boats
             ));
         }
         let mut weighted = Vec::new();
+        let mut fine_parts = Vec::new();
         for (traj, p) in object.trajectories.iter().zip(probs) {
             let (mut field, bw, density) = trajectory_risk(traj, &params, a_g, cap);
             if let Some((east, north)) = bw {
@@ -399,21 +474,40 @@ pub fn compute_vessel_risk(objects: &[ObjectInput], params: &VesselParams, boats
                 bw_n = Some(bw_n.map(|v: f64| v.max(north)).unwrap_or(north));
             }
             if let Some(density) = density.as_ref() {
-                // The H3 disk around impacts stops short of the density.
-                // Write the overlap onto a boat cell the disk left empty.
+                // A boat inside the density whose hex center fell outside the
+                // raster still takes the value at the boat. Painted hexes are
+                // left alone, so the boat reads that hex.
                 paint_boat_overlaps(&mut field, density, boats);
             }
+            let raw_cells = if density.is_none() {
+                field.clone()
+            } else {
+                HashMap::new()
+            };
+            if density.is_some() {
+                saw_density = true;
+            }
+            fine_parts.push(FinePart {
+                weight: p,
+                density,
+                cells: raw_cells,
+            });
             weighted.push((p, field));
         }
+        fine_objects.push(fine_parts);
         object_fields.push(combine_trajectories(&weighted));
     }
 
     let risk = combine_objects(&object_fields);
     let (boat_scores, collective) = score_boats(&risk, boats);
     let cells = draw_cells(&risk);
-    // Contours read the finished field. They are built here so the work stays
-    // on the blocking pool with the rest of the risk run.
-    let isolines = risk_isolines(&risk);
+    // Contours read the fine rectangular density when the field was smoothed,
+    // so they do not follow hex edges. Unsmoothed risk has no density grid.
+    let isolines = if saw_density {
+        isolines_from_fine(&fine_objects)
+    } else {
+        risk_isolines(&risk)
+    };
 
     Ok(VesselRisk {
         cells,
@@ -492,7 +586,7 @@ impl DensityGrid {
     }
 }
 
-/// Fill boat cells the impact disk did not paint, using the density at the
+/// Fill boat cells the footprint did not paint, using the density at the
 /// boat. Cells that already have a risk are left alone, and a boat outside
 /// the density is not given a strike from it.
 fn paint_boat_overlaps(field: &mut HashMap<u64, f64>, density: &DensityGrid, boats: &[BoatQuery]) {
@@ -525,27 +619,18 @@ fn smooth_risk(field: &HashMap<u64, f64>, lonlat: &[[f64; 2]]) -> Option<(HashMa
     let botev = botev_bandwidth(&metres)?;
     let raster = rasterize_field(field, &frame, &botev);
     let diffused = diffuse_field(&raster, BOTEV_N, botev.t_x, botev.t_y);
-    let edge = H3_RES.edge_length_m().max(1.0);
-    let reach = 4.0 * botev.bandwidth_x.max(botev.bandwidth_y);
-    let k = ((reach / edge).ceil() as u32).clamp(1, 24);
-    let mut seen: HashSet<u64> = HashSet::new();
+    let (west, south, east, north) = band_bounds(&frame, &botev);
     let mut out = HashMap::new();
-    for &cell_raw in field.keys() {
-        let Ok(cell) = CellIndex::try_from(cell_raw) else {
+    for cell in cells_covering_bounds(west, south, east, north) {
+        let center = LatLng::from(cell);
+        let lon = align_lon_to(frame.lon0, center.lng());
+        let [east_m, north_m] = frame.to_metres(lon, center.lat());
+        let Some(value) = sample_inside(&diffused, BOTEV_N, &botev, east_m, north_m) else {
             continue;
         };
-        let disk: Vec<CellIndex> = cell.grid_disk(k);
-        for neighbor in disk {
-            let key = u64::from(neighbor);
-            if !seen.insert(key) {
-                continue;
-            }
-            let center = LatLng::from(neighbor);
-            let [east, north] = frame.to_metres(center.lng(), center.lat());
-            let value = sample_grid(&diffused, BOTEV_N, &botev, east, north).clamp(0.0, 1.0);
-            if value > 0.0 {
-                out.insert(key, value);
-            }
+        let value = value.clamp(0.0, 1.0);
+        if value > 0.0 {
+            out.insert(u64::from(cell), value);
         }
     }
     Some((
@@ -557,6 +642,59 @@ fn smooth_risk(field: &HashMap<u64, f64>, lonlat: &[[f64; 2]]) -> Option<(HashMa
             band: botev,
         },
     ))
+}
+
+/// One trajectory's contribution to the continuous risk field.
+struct FinePart {
+    weight: f64,
+    density: Option<DensityGrid>,
+    /// Unsmoothed cell risk. Empty when `density` is present, so isolines
+    /// read the rectangular grid instead of a hex step.
+    cells: HashMap<u64, f64>,
+}
+
+fn band_corners(frame: &LocalFrame, band: &BotevBand) -> [(f64, f64); 4] {
+    [
+        frame.to_lonlat(band.min_x, band.min_y),
+        frame.to_lonlat(band.min_x + band.scale_x, band.min_y),
+        frame.to_lonlat(band.min_x, band.min_y + band.scale_y),
+        frame.to_lonlat(band.min_x + band.scale_x, band.min_y + band.scale_y),
+    ]
+}
+
+fn band_bounds(frame: &LocalFrame, band: &BotevBand) -> (f64, f64, f64, f64) {
+    let corners = band_corners(frame, band);
+    let west = corners.iter().map(|p| p.0).fold(f64::INFINITY, f64::min);
+    let east = corners.iter().map(|p| p.0).fold(f64::NEG_INFINITY, f64::max);
+    let south = corners.iter().map(|p| p.1).fold(f64::INFINITY, f64::min);
+    let north = corners.iter().map(|p| p.1).fold(f64::NEG_INFINITY, f64::max);
+    (west, south, east, north)
+}
+
+fn part_risk(part: &FinePart, lon: f64, lat: f64) -> f64 {
+    let value = if let Some(density) = &part.density {
+        density.sample(lon, lat).unwrap_or(0.0)
+    } else if let Some(cell) = cell_index(lon, lat) {
+        part.cells.get(&u64::from(cell)).copied().unwrap_or(0.0)
+    } else {
+        0.0
+    };
+    value.clamp(0.0, 1.0)
+}
+
+fn combined_risk_at(objects: &[Vec<FinePart>], lon: f64, lat: f64) -> f64 {
+    let mut miss = 1.0;
+    for parts in objects {
+        let mut risk = 0.0;
+        for part in parts {
+            if part.weight <= 0.0 {
+                continue;
+            }
+            risk += part.weight * part_risk(part, lon, lat);
+        }
+        miss *= 1.0 - risk.clamp(0.0, 1.0);
+    }
+    (1.0 - miss).clamp(0.0, 1.0)
 }
 
 fn rasterize_field(field: &HashMap<u64, f64>, frame: &LocalFrame, botev: &BotevBand) -> Vec<f64> {
@@ -575,15 +713,6 @@ fn rasterize_field(field: &HashMap<u64, f64>, frame: &LocalFrame, botev: &BotevB
         }
     }
     grid
-}
-
-fn sample_grid(grid: &[f64], n: usize, botev: &BotevBand, east: f64, north: f64) -> f64 {
-    if botev.scale_x <= 0.0 || botev.scale_y <= 0.0 || n == 0 {
-        return 0.0;
-    }
-    let fx = ((east - botev.min_x) / botev.scale_x * n as f64 - 0.5).clamp(0.0, (n - 1) as f64);
-    let fy = ((north - botev.min_y) / botev.scale_y * n as f64 - 0.5).clamp(0.0, (n - 1) as f64);
-    interp_grid(grid, n, fx, fy)
 }
 
 /// Bilinear sample. `None` outside the density extent — callers must not
@@ -942,22 +1071,26 @@ fn path_length(path: &[[f64; 2]]) -> f64 {
         .sum()
 }
 
-/// Contours of the smoothed `Risk(g)` map. Levels are one order of magnitude
-/// apart and cover only the risk values present in `risk`.
+/// Contours of an unsmoothed cell map. Smoothed fields use
+/// [`isolines_from_fine`] so the line follows the rectangular density.
 fn risk_isolines(risk: &HashMap<u64, f64>) -> Vec<RiskIsoline> {
     let Some((min_r, max_r)) = present_risk_range(risk) else {
         return Vec::new();
     };
+    let Some(raster) = rasterize_risk(risk) else {
+        return Vec::new();
+    };
+    contours_of(&raster, min_r, max_r)
+}
+
+fn contours_of(raster: &RiskRaster, min_r: f64, max_r: f64) -> Vec<RiskIsoline> {
     let levels = decade_levels(min_r, max_r);
     if levels.is_empty() {
         return Vec::new();
     }
-    let Some(raster) = rasterize_risk(risk) else {
-        return Vec::new();
-    };
     let mut lines = Vec::new();
     for level in levels {
-        let segs = contour_segments(&raster, level);
+        let segs = contour_segments(raster, level);
         for path in stitch_segments(&segs) {
             if path_length(&path) < raster.spacing * 2.0 {
                 continue;
@@ -976,6 +1109,103 @@ fn risk_isolines(risk: &HashMap<u64, f64>) -> Vec<RiskIsoline> {
         }
     }
     lines
+}
+
+/// Order-of-magnitude contours of the continuous risk field. Samples come
+/// from each trajectory's rectangular density, not from the hex values.
+fn isolines_from_fine(objects: &[Vec<FinePart>]) -> Vec<RiskIsoline> {
+    let mut pts: Vec<[f64; 2]> = Vec::new();
+    let mut fine = f64::INFINITY;
+    for parts in objects {
+        for part in parts {
+            if let Some(density) = &part.density {
+                let spacing = density.band.scale_x.min(density.band.scale_y) / density.n.max(1) as f64;
+                if spacing.is_finite() && spacing > 0.0 {
+                    fine = fine.min(spacing);
+                }
+                for (lon, lat) in band_corners(&density.frame, &density.band) {
+                    pts.push([lon, lat]);
+                }
+            } else {
+                for key in part.cells.keys() {
+                    let Ok(cell) = CellIndex::try_from(*key) else {
+                        continue;
+                    };
+                    let ll = LatLng::from(cell);
+                    pts.push([ll.lng(), ll.lat()]);
+                }
+            }
+        }
+    }
+    if pts.is_empty() {
+        return Vec::new();
+    }
+    let Some(frame) = LocalFrame::from_lonlat(&pts) else {
+        return Vec::new();
+    };
+    let mut min_e = f64::INFINITY;
+    let mut max_e = f64::NEG_INFINITY;
+    let mut min_n = f64::INFINITY;
+    let mut max_n = f64::NEG_INFINITY;
+    for p in &pts {
+        let [east, north] = frame.to_metres(p[0], p[1]);
+        min_e = min_e.min(east);
+        max_e = max_e.max(east);
+        min_n = min_n.min(north);
+        max_n = max_n.max(north);
+    }
+    let edge = H3_RES.edge_length_m().max(1.0);
+    let pad = edge;
+    min_e -= pad;
+    max_e += pad;
+    min_n -= pad;
+    max_n += pad;
+    let span_e = (max_e - min_e).max(edge);
+    let span_n = (max_n - min_n).max(edge);
+    let mut spacing = if fine.is_finite() {
+        fine.max(1.0)
+    } else {
+        (edge * 0.5).max(1.0)
+    };
+    let mut nx = ((span_e / spacing).ceil() as usize) + 1;
+    let mut ny = ((span_n / spacing).ceil() as usize) + 1;
+    if nx > ISOLINE_MAX_N || ny > ISOLINE_MAX_N {
+        let need = (span_e / (ISOLINE_MAX_N - 1) as f64).max(span_n / (ISOLINE_MAX_N - 1) as f64);
+        spacing = need.max(spacing);
+        nx = (((span_e / spacing).ceil() as usize) + 1).clamp(2, ISOLINE_MAX_N);
+        ny = (((span_n / spacing).ceil() as usize) + 1).clamp(2, ISOLINE_MAX_N);
+    }
+    let mut grid = vec![0.0; nx * ny];
+    let mut min_r = f64::INFINITY;
+    let mut max_r = 0.0_f64;
+    for x in 0..nx {
+        let east = min_e + x as f64 * spacing;
+        for y in 0..ny {
+            let north = min_n + y as f64 * spacing;
+            let (lon, lat) = frame.to_lonlat(east, north);
+            let value = combined_risk_at(objects, lon, lat);
+            grid[y * nx + x] = value;
+            if value.is_finite() && value > 0.0 {
+                min_r = min_r.min(value);
+                max_r = max_r.max(value);
+            }
+        }
+    }
+    if !min_r.is_finite() || max_r < min_r {
+        return Vec::new();
+    }
+    contours_of(
+        &RiskRaster {
+            frame,
+            grid,
+            nx,
+            ny,
+            spacing,
+            origin: [min_e, min_n],
+        },
+        min_r,
+        max_r,
+    )
 }
 
 struct LocalFrame {
@@ -2032,5 +2262,200 @@ mod tests {
             result.boats[1].strike
         );
         assert!(result.boats[1].individual.unwrap().abs() < 1e-12);
+        let hot_cell: CellIndex = hot.h3.parse().expect("boat h3");
+        assert_eq!(hot_cell.resolution(), H3_RES);
+        assert_eq!(hot_cell.resolution().area_m2(), cell_area_m2());
+    }
+
+    #[test]
+    fn cells_covering_bounds_meet_the_rectangle() {
+        let cells = cells_covering_bounds(-90.2, 28.9, -89.8, 29.2);
+        assert!(!cells.is_empty());
+        let inside = cell_index(-90.0, 29.0).unwrap();
+        assert!(cells.contains(&inside), "the cell under an interior point is covered");
+        let outside = cell_index(-70.0, 10.0).unwrap();
+        assert!(!cells.contains(&outside));
+        let area = cell_area_m2();
+        for cell in &cells {
+            assert_eq!(cell.resolution(), H3_RES);
+            assert_eq!(cell.resolution().area_m2(), area);
+        }
+    }
+
+    #[test]
+    fn footprint_hexes_share_res8_area_and_score_the_boat() {
+        let a_g = cell_area_m2();
+        let params = VesselParams {
+            ke_threshold_j: 0.0,
+            a_proj_m2: 0.5 * a_g,
+            p_proj_m: 0.0,
+            max_trials: 8,
+            default_mass_kg: 20.0,
+            default_radius_m: 0.0,
+        };
+        let mut pieces = Vec::new();
+        let mut impact_cells = Vec::new();
+        for i in 0..40 {
+            let t = i as f64;
+            let lon = -91.0 + (t / 39.0) * 2.0;
+            let lat = 29.0 + (t * 0.35).sin() * 0.12;
+            pieces.push(vertical(lon, lat, 40.0, 0.0, 100.0));
+            impact_cells.push(cell_index(lon, lat).unwrap());
+        }
+        let (field, bw, density) = trajectory_risk(
+            &TrajectoryInput {
+                weight: 1.0,
+                trials: vec![pieces],
+            },
+            &params,
+            a_g,
+            8,
+        );
+        let density = density.expect("spread field has a rectangular density");
+        assert!(bw.is_some());
+        assert!(field.len() > 24, "the footprint is more than one impact ring, {}", field.len());
+        let area = cell_area_m2();
+        let mut max_exact = 0.0_f64;
+        let mut min_exact = f64::INFINITY;
+        for (key, risk) in &field {
+            let cell = CellIndex::try_from(*key).unwrap();
+            assert_eq!(cell.resolution(), H3_RES);
+            assert_eq!(cell.resolution().area_m2(), area);
+            if !cell.is_pentagon() {
+                assert_eq!(cell.boundary().len(), 6, "a res-8 hex has six corners");
+            }
+            let exact = cell.area_m2();
+            max_exact = max_exact.max(exact);
+            min_exact = min_exact.min(exact);
+            let center = LatLng::from(cell);
+            let sampled = density
+                .sample(center.lng(), center.lat())
+                .expect("painted center is inside the density");
+            assert!(
+                (sampled.clamp(0.0, 1.0) - risk).abs() < 1e-9,
+                "hex value is the density at its center"
+            );
+        }
+        assert!(max_exact / min_exact < 1.05, "local hex areas {min_exact}..{max_exact}");
+
+        let mut far_cell = None;
+        for (key, risk) in &field {
+            let cell = CellIndex::try_from(*key).unwrap();
+            let mut nearest = i32::MAX;
+            let mut ok = true;
+            for impact in &impact_cells {
+                match cell.grid_distance(*impact) {
+                    Ok(d) => nearest = nearest.min(d),
+                    Err(_) => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if ok && nearest > 24 && *risk > 0.0 {
+                far_cell = Some((cell, *risk, nearest));
+                break;
+            }
+        }
+        let (cell, risk, nearest) = far_cell.expect("a positive hex sits outside the old 24-ring disk");
+        assert!(nearest > 24);
+        let center = LatLng::from(cell);
+        let boat = BoatQuery {
+            id: 1,
+            name: "In the hex".into(),
+            lon: center.lng(),
+            lat: center.lat(),
+            people: Some(4),
+        };
+        let outside = BoatQuery {
+            id: 2,
+            name: "Outside the density".into(),
+            lon: -40.0,
+            lat: 10.0,
+            people: Some(2),
+        };
+        let (scores, _) = score_boats(&field, &[boat, outside]);
+        assert_eq!(scores[0].h3, cell.to_string());
+        assert!(scores[0].strike.is_finite() && scores[0].strike > 0.0);
+        assert!((scores[0].strike - risk).abs() < 1e-12, "boat reads the hex, not a second sample");
+        assert!((scores[0].individual.unwrap() - scores[0].strike * 4.0).abs() < 1e-12);
+        assert!(scores[1].strike.abs() < 1e-12);
+
+        let neighbors: Vec<CellIndex> = cell.grid_disk(1);
+        let others: Vec<CellIndex> = neighbors.into_iter().filter(|n| *n != cell).collect();
+        assert_eq!(others.len(), 6, "six neighbors");
+        let origin = LatLng::from(cell);
+        let mut spacing = Vec::new();
+        for neighbor in &others {
+            assert_eq!(cell.grid_distance(*neighbor).unwrap(), 1);
+            spacing.push(origin.distance_rads(LatLng::from(*neighbor)));
+        }
+        let step = spacing.iter().sum::<f64>() / spacing.len() as f64;
+        for d in &spacing {
+            assert!((d - step).abs() / step < 0.08, "neighbor spacing {d} vs {step}");
+        }
+    }
+
+    #[test]
+    fn isolines_read_the_fine_grid_inside_one_hex() {
+        let frame = LocalFrame::from_lonlat(&[[-90.0, 29.0], [-89.8, 29.2]]).unwrap();
+        let n = 32;
+        let scale = 40_000.0;
+        let mut values = vec![0.0; n * n];
+        for x in 0..n {
+            let v = x as f64 / (n - 1) as f64;
+            for y in 0..n {
+                values[x * n + y] = v;
+            }
+        }
+        let density = DensityGrid {
+            frame,
+            values,
+            n,
+            band: BotevBand {
+                t_x: 0.01,
+                t_y: 0.01,
+                min_x: -20_000.0,
+                min_y: -20_000.0,
+                scale_x: scale,
+                scale_y: scale,
+                bandwidth_x: 5_000.0,
+                bandwidth_y: 5_000.0,
+            },
+        };
+        let cell = cell_index(-89.9, 29.1).unwrap();
+        assert_eq!(cell.resolution(), H3_RES);
+        let center = LatLng::from(cell);
+        let center_v = density.sample(center.lng(), center.lat()).expect("center inside the ramp");
+        let boundary = cell.boundary();
+        let mut lo = f64::INFINITY;
+        let mut hi = 0.0_f64;
+        let mut edge_lon = center.lng();
+        let mut edge_lat = center.lat();
+        let mut best = 0.0_f64;
+        for ll in boundary.iter() {
+            let v = density.sample(ll.lng(), ll.lat()).expect("hex corner inside the ramp");
+            lo = lo.min(v);
+            hi = hi.max(v);
+            let delta = (v - center_v).abs();
+            if delta > best {
+                best = delta;
+                edge_lon = ll.lng();
+                edge_lat = ll.lat();
+            }
+        }
+        assert!(hi - lo > 1e-3, "the rectangular density changes inside one hex: {lo}..{hi}");
+        let objects = vec![vec![FinePart {
+            weight: 1.0,
+            density: Some(density),
+            cells: HashMap::new(),
+        }]];
+        let at_edge = combined_risk_at(&objects, edge_lon, edge_lat);
+        assert!(
+            (at_edge - center_v).abs() > 1e-3,
+            "isoline sample {at_edge} collapsed to the hex center {center_v}"
+        );
+        let lines = isolines_from_fine(&objects);
+        assert!(!lines.is_empty(), "the ramp crosses more than one decade");
     }
 }

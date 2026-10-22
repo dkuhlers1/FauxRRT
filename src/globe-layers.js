@@ -34,6 +34,15 @@ export function kdeGridOnGlobe(grid) {
   return Boolean(grid && grid.values?.length && Number(grid.max_value) > 0);
 }
 
+/** Res-8 hexes to draw for a KDE that has a positive peak. */
+export function kdeHexesToDraw(grid) {
+  if (!kdeGridOnGlobe(grid)) return [];
+  return (grid.cells || []).filter((cell) => {
+    const ring = cell?.boundary || [];
+    return ring.length >= 6 && Number(cell.value) > 0;
+  });
+}
+
 export function vesselCellOnGlobe(cell) {
   return (cell?.boundary || []).length >= 6;
 }

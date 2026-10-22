@@ -20,7 +20,8 @@ rfd = "0.15"
 rayon = "1"
 walkdir = "2"
 rustfft = "6"
-h3o = "0.6"
+h3o = { version = "0.6", features = ["geo"] }
+geo = "0.28"
 ureq = { version = "2.12", features = ["json"] }
 
 [target.'cfg(windows)'.dependencies]

@@ -7,6 +7,7 @@ import {
   globeLayersToShow,
   isolineOnGlobe,
   kdeGridOnGlobe,
+  kdeHexesToDraw,
   layerPresenceFromCounts,
   trackDrawsOnGlobe,
   vesselCellOnGlobe,
@@ -42,6 +43,10 @@ test("an empty layer is omitted and a layer with data is shown", () => {
   assert.equal(windFieldOnGlobe({ kind: "constant" }), true);
   assert.equal(kdeGridOnGlobe({ values: [0], max_value: 0 }), false);
   assert.equal(kdeGridOnGlobe({ values: [1], max_value: 0.2 }), true);
+  assert.deepEqual(kdeHexesToDraw({ values: [1], max_value: 0, cells: [{ value: 1, boundary: [1, 2, 3, 4, 5, 6] }] }), []);
+  const hex = { value: 0.2, boundary: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12] };
+  assert.deepEqual(kdeHexesToDraw({ values: [1], max_value: 0.2, cells: [hex, { value: 0, boundary: hex.boundary }] }), [hex]);
+  assert.deepEqual(kdeHexesToDraw({ values: [1], max_value: 0.2 }), []);
   assert.equal(isolineOnGlobe({ line: [1, 2] }), false);
   assert.equal(isolineOnGlobe({ line: [1, 2, 3, 4] }), true);
   assert.equal(vesselCellOnGlobe({ boundary: [1, 2, 3] }), false);
@@ -70,6 +75,16 @@ test("the layer list overlays the globe at the bottom right", () => {
   assert.match(globe, /class="globe-layer hidden" data-layer="trajectories"/);
   assert.match(globe, /class="globe-layer hidden" data-layer="wind"/);
   assert.match(globe, /class="globe-layer hidden" data-layer="kde"/);
+
+  const draw = fs.readFileSync(new URL("./globe.js", import.meta.url), "utf8");
+  const kdeStart = draw.indexOf("export async function setKdeGrid");
+  const kdeEnd = draw.indexOf("export function setKdeVisible");
+  assert.ok(kdeStart >= 0 && kdeEnd > kdeStart);
+  const kdeDraw = draw.slice(kdeStart, kdeEnd);
+  assert.match(kdeDraw, /kdeHexesToDraw/);
+  assert.match(kdeDraw, /PolygonGeometry/);
+  assert.doesNotMatch(kdeDraw, /RectangleGeometry/);
+  assert.doesNotMatch(kdeDraw, /densityCanvas/);
   assert.match(globe, /class="globe-layer hidden" data-layer="isolines"/);
   assert.match(globe, /class="globe-layer hidden" data-layer="boats"/);
 
